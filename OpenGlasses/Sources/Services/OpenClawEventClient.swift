@@ -36,12 +36,22 @@ class OpenClawEventClient {
     // MARK: - Private
 
     private func establishConnection() {
-        // WebSocket always connects via LAN — tunnel proxies (Tailscale serve,
-        // Cloudflare Tunnel) typically don't support WebSocket upgrade.
-        // Only fall back to tunnel WSS if no LAN host is configured.
-        let lanURL = Self.lanWebSocketURL()
-        let hasLAN = !Config.openClawLanHost.isEmpty
-        let wsURL = hasLAN ? lanURL : Self.tunnelWebSocketURL()
+        let mode = Config.openClawConnectionMode
+        let wsURL: String
+        switch mode {
+        case .tunnel:
+            wsURL = Self.tunnelWebSocketURL()
+        case .lan:
+            wsURL = Self.lanWebSocketURL()
+        case .auto:
+            // Prefer LAN if configured, otherwise tunnel
+            let lanHost = Config.openClawLanHost
+            if !lanHost.isEmpty {
+                wsURL = Self.lanWebSocketURL()
+            } else {
+                wsURL = Self.tunnelWebSocketURL()
+            }
+        }
 
         guard let url = URL(string: wsURL) else {
             NSLog("[OpenClawWS] Invalid URL: %@", wsURL)
@@ -54,7 +64,7 @@ class OpenClawEventClient {
         webSocketTask = session?.webSocketTask(with: url)
         webSocketTask?.resume()
 
-        NSLog("[OpenClawWS] Connecting to %@", url.absoluteString)
+        NSLog("[OpenClawWS] Connecting to %@ (mode: %@)", url.absoluteString, "\(mode)")
         startReceiving()
     }
 
@@ -112,7 +122,8 @@ class OpenClawEventClient {
             } else {
                 let error = json["error"] as? [String: Any]
                 let msg = error?["message"] as? String ?? "unknown"
-                NSLog("[OpenClawWS] Connect failed: %@", msg)
+                let code = error?["code"] as? Int
+                NSLog("[OpenClawWS] Connect failed: %@ (code: %@, full response: %@)", msg, code.map { "\($0)" } ?? "nil", text)
             }
         }
     }
