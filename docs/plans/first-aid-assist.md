@@ -1,7 +1,25 @@
 # Plan — First-Aid / Emergency Assist
 
-**Status: 📋 Planned (not built).** Runs on the engines we already ship. Accessibility/Medical-tier,
-life-safety.
+**Status: ✅ shipped (on-device behaviour device-pending).** Runs on the engines we already ship.
+Accessibility/Medical-tier, life-safety. The tested core is in
+[`Sources/Services/FirstAid/`](../../OpenGlasses/Sources/Services/FirstAid/):
+- [CPRMetronome.swift](../../OpenGlasses/Sources/Services/FirstAid/CPRMetronome.swift) — the pure pacing
+  model (100–120 bpm clamp, 30:2 cycle, compression count, clock-injected events). Unit-tested.
+- [FirstAidProtocol.swift](../../OpenGlasses/Sources/Services/FirstAid/FirstAidProtocol.swift) — the
+  catalog (CPR/AED, choking, bleeding, recovery, MARCH) + runner; **every protocol opens with the
+  call-emergency-services gate**. Unit-tested.
+- [AEDFinder.swift](../../OpenGlasses/Sources/Services/FirstAid/AEDFinder.swift) — Overpass
+  (`emergency=defibrillator`) query build + parse + nearest-by-haversine; injected fetcher. Unit-tested.
+- [FirstAidAssistService.swift](../../OpenGlasses/Sources/Services/FirstAid/FirstAidAssistService.swift) —
+  the `@MainActor` coach: speaks each step (urgency-high TTS), mirrors to the HUD, drives the CPR
+  metronome (a click per compression, "two breaths" cue per cycle), and finds + routes to the nearest AED.
+- [FirstAidTool.swift](../../OpenGlasses/Sources/Services/NativeTools/FirstAidTool.swift) — `first_aid`
+  (`start <protocol>` / `next` / `back` / `aed` / `stop`), registered + described to the LLM + Gemini
+  Live; wired in `AppState`. 23 headless tests; Debug + Release green.
+
+**Deferred (device-validated):** metronome timing precision + AED spoken/HUD interplay on hardware; the
+live Overpass query; a richer on-lens AED route (today it opens an Apple Maps walking route); a dedicated
+phone view; and tying into a Field Assist session.
 
 **Strategic fit:** A hands-free **bystander first-aid coach** for the seconds that matter — paces CPR,
 walks a responder through a structured emergency protocol, and routes them to the nearest defibrillator,
