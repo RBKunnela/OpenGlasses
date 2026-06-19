@@ -21,6 +21,9 @@ final class SafetyAssessmentService: ObservableObject {
     /// fresh one so they don't drive the host-app's real HUD/Wearables.
     var structuredVision: StructuredVisionService = .shared
 
+    /// Where reports are persisted — defaults to the shared store; tests inject a temp-dir store.
+    var store: SafetyAssessmentStore = .shared
+
     /// (systemPrompt, jpeg, jsonSchema, toolName) → JSON object. Set by `configure(...)`; tests inject a fake.
     var analyze: ((String, Data, [String: Any], String) async -> [String: Any]?)?
 
@@ -47,6 +50,7 @@ final class SafetyAssessmentService: ObservableObject {
         }
         let report = try schema.report(from: json)
         latest = report
+        store.save(report)
         structuredVision.present(schema.card(for: report))
         return report
     }

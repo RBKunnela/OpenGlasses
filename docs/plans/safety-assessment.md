@@ -16,9 +16,11 @@ Plan refined 2026-06-18 (structured-output + catalog); revised + built 2026-06-1
 > 3. a thin **`SafetyAssessmentService`** (returns the rich `SafetyReport`, publishes the generic card
 >    via `StructuredVisionService.present(_:)`) + a Field-Assist-gated **`safety_assessment`** tool.
 >
-> **PR 1 (this branch):** items 1–3 + tests + the gated tool, end-to-end via the substrate.
-> **Deferred to follow-ups:** the rich `SafetyAssessmentReportView` + box overlay *view*, persistence/history,
-> PDF export via `SessionExporter`, the Field-Assist session-step hook, and the image-seeded advisor chat.
+> **PR 1 (`feat/safety-assessment-heca`, merged):** items 1–3 + tests + the gated tool, end-to-end via the substrate.
+> **PR 2 (`feat/heca-report-history`):** `SafetyAssessmentStore` (persist + history) + `score`/`history` tool
+> actions + `SafetyAssessmentReportView` + `SafetyAssessmentOverlay` views.
+> **Still deferred:** PDF export via `SessionExporter`, the Field-Assist session-step hook, the image-seeded
+> advisor chat, and wiring a tap-to-open entry point to the report view.
 
 **Strategic fit:** A B2B safety capability that slots into the **Field Assist** line: a technician glances at a job site and gets a structured, audited assessment of the **high-energy hazards** present and whether each is safeguarded by a *direct* control. Grounded in the published EEI / Construction Safety Research Alliance (CSRA) energy-based "Serious Injury & Fatality (SIF) prevention" methodology — the same vault/procedure/audit shape we already ship, applied to safety. Utilities and construction are exactly the verticals Field Assist targets, and SIF-prevention is a budgeted, regulated spend.
 

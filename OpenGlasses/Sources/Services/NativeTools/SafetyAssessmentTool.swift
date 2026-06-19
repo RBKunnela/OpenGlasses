@@ -12,8 +12,8 @@ struct SafetyAssessmentTool: NativeTool {
     Run a High-Energy Control Assessment (HECA) on the current job-site view from the glasses camera — \
     detects the 13 high-energy serious-injury/fatality hazards and whether each is safeguarded by a DIRECT \
     control, and returns a summary plus a HECA score. Use for "assess this site", "is this safe?", "safety \
-    check". Actions: run (assess now), last (repeat the latest result). Advisory only — verify on site; not \
-    a certified inspection.
+    check". Actions: run (assess now), last (repeat the latest result), score (just the latest HECA score), \
+    history (recent assessments). Advisory only — verify on site; not a certified inspection.
     """
 
     var parametersSchema: [String: Any] {
@@ -22,8 +22,8 @@ struct SafetyAssessmentTool: NativeTool {
             "properties": [
                 "action": [
                     "type": "string",
-                    "enum": ["run", "last"],
-                    "description": "run a new assessment on the current view, or repeat the last result."
+                    "enum": ["run", "last", "score", "history"],
+                    "description": "run a new assessment, repeat the last result, report just the latest score, or list recent assessments."
                 ]
             ],
             "required": [] as [String]
@@ -38,6 +38,20 @@ struct SafetyAssessmentTool: NativeTool {
                 return "No safety assessment yet. Say \"assess this site\" to run one."
             }
             return SafetyAssessmentService.summaryText(report)
+        case "score":
+            guard let report = service.latest else {
+                return "No safety assessment yet. Say \"assess this site\" to run one."
+            }
+            guard let score = report.score else { return "No high-energy hazards detected in the last assessment." }
+            return "HECA score \(Int((score * 100).rounded()))% — \(report.uncontrolled.count) of \(report.present.count) present hazards lack a direct control."
+        case "history":
+            let recent = service.store.history.prefix(5)
+            guard !recent.isEmpty else { return "No saved safety assessments yet." }
+            let lines = recent.map { r -> String in
+                let s = r.score.map { "\(Int(($0 * 100).rounded()))%" } ?? "n/a"
+                return "• HECA \(s) — \(r.present.count) hazard(s): \(r.summary)"
+            }
+            return "Recent safety assessments:\n" + lines.joined(separator: "\n")
         default:
             do {
                 let report = try await service.assessCurrentFrame()
