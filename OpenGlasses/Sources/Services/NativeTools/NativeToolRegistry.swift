@@ -78,6 +78,7 @@ final class NativeToolRegistry {
 
         // Tier 3 tools
         register(FitnessCoachingTool())
+        register(FirstAidTool())
         if let bridge = openClawBridge, Config.isOpenClawConfigured {
             var skillsTool = OpenClawSkillsTool()
             skillsTool.openClawBridge = bridge

@@ -369,6 +369,11 @@ class TextToSpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         playTone(frequency: 440, duration: 0.12)
     }
 
+    /// Short, crisp click that paces CPR compressions (First-Aid / Emergency Assist).
+    func playMetronomeTick() {
+        playTone(frequency: 1000, duration: 0.045)
+    }
+
     /// Descending two-note tone — conversation ended, back to wake word
     func playDisconnectTone() {
         do {

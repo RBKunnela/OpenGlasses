@@ -885,6 +885,9 @@ class AppState: ObservableObject, AppStateProtocol {
         NavigationAssistService.shared.configure(camera: cameraService, llm: llmService, tts: speechService)
         NavigationAssistService.shared.glassesDisplay = glassesDisplay
 
+        // First-Aid / Emergency Assist (Additional Capabilities) — spoken protocol coach + CPR metronome.
+        FirstAidAssistService.shared.configure(tts: speechService, glassesDisplay: glassesDisplay, location: locationService)
+
         // Field Assist Phase 5 (Plan K2): expert stream bridge for escalations. Transport
         // (MJPEG / WebRTC) is selected in Settings; MJPEG is the working default.
         EscalationCoordinator.shared.bridge = ExpertStreamBridge(
