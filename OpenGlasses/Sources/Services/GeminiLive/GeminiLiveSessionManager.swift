@@ -502,6 +502,7 @@ class GeminiLiveSessionManager: ObservableObject {
             - first_aid: Hands-free first-aid coaching — speaks steps and paces CPR. Actions: start (cpr/choking/bleeding/recovery/march), next, back, aed (nearest defibrillator), stop. Advisory only; always reminds to call emergency services.
             - identify_color: Name the dominant color of what the user sees (on-device). Use for "what color is this?".
             - identify_money: Identify a banknote's currency and denomination from the camera, for low-vision support. Use for "how much is this note?".
+            - vision_assess: Structured visual assessment with a typed result card (kind selects the type). Use kind 'instrument_reading' to read a number off a gauge, thermometer, refractometer, scale, or meter. Optional note adds context.
             - photo_log: Capture a glasses-camera photo, attach it to the session audit log with a caption, and return it for analysis. Use to document gauge readings and evidence.
             - escalate_to_expert: Escalate the active session to a human expert when you can't safely resolve it or the technician asks for a person. Actions: request (reason), status, resolve, cancel. Live video is Phase 5 — for now it's logged and the expert pool is notified.
             """

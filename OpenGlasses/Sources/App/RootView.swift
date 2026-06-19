@@ -8,6 +8,10 @@ struct RootView: View {
         ZStack {
             MainView()
 
+            // Structured-vision result card (vision_assess), presented over the main UI.
+            AssessmentCardOverlay()
+                .zIndex(0.5)
+
             if showLaunchScreen {
                 LaunchScreen()
                     .transition(.opacity)

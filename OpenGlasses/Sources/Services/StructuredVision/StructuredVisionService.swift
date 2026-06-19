@@ -1,0 +1,111 @@
+import Foundation
+import UIKit
+import Combine
+
+/// Errors surfaced by `StructuredVisionService`.
+enum StructuredVisionError: Error, LocalizedError {
+    case unknownKind(String)
+    case noFrame
+    case analysisFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .unknownKind(let k): return "No assessment schema registered for '\(k)'."
+        case .noFrame: return "No camera frame available."
+        case .analysisFailed: return "The structured vision call returned no usable result."
+        }
+    }
+}
+
+/// Runs a structured-vision assessment end to end (structured-vision plan, Phase 3): grabs a camera
+/// frame, calls the active provider's forced structured-output path, decodes against the chosen
+/// schema, applies the deterministic backstop, and publishes the resulting `AssessmentCard` for the
+/// card view + HUD. Configured by `AppState`, exactly like `NavigationAssistService` / `LiveCoachService`.
+///
+/// The LLM call is a settable `analyze` seam so the core (`assess(kind:imageData:note:)`) is unit-testable
+/// without a network or a device. The `registry` is likewise injectable for tests.
+@MainActor
+final class StructuredVisionService: ObservableObject {
+    static let shared = StructuredVisionService()
+
+    @Published private(set) var latest: AssessmentCard?
+    @Published private(set) var isAnalyzing = false
+
+    /// Schema lookup — defaults to the shared registry; tests may swap in a fresh one.
+    var registry: AssessmentSchemaRegistry = .shared
+
+    /// The structured-vision call seam: (systemPrompt, userText, jpeg, jsonSchema, toolName) → JSON object.
+    /// Set by `configure(...)` to call `LLMService.analyzeFrameStructured`; tests inject a fake.
+    var analyze: ((String, String, Data, [String: Any], String) async -> [String: Any]?)?
+
+    private weak var camera: CameraService?
+    weak var glassesDisplay: GlassesDisplayService?
+
+    init() {}
+
+    /// Wire the live dependencies (called once at app launch).
+    func configure(camera: CameraService, llm: LLMService, tts: TextToSpeechService) {
+        self.camera = camera
+        self.analyze = { [weak llm] systemPrompt, userText, imageData, jsonSchema, toolName in
+            await llm?.analyzeFrameStructured(systemPrompt: systemPrompt, userText: userText,
+                                              imageData: imageData, jsonSchema: jsonSchema, toolName: toolName)
+        }
+        registerBuiltinSchemas()
+    }
+
+    /// Register the built-in, domain-free schemas. Idempotent.
+    func registerBuiltinSchemas() {
+        if !registry.contains("instrument_reading") { registry.register(InstrumentReadingSchema()) }
+    }
+
+    /// Dismiss the currently presented card.
+    func dismiss() { latest = nil }
+
+    // MARK: - Core (testable)
+
+    /// Assess a specific JPEG against `kind`. Decodes, backstops, publishes, and mirrors to the HUD.
+    func assess(kind: String, imageData: Data, note: String?) async throws -> AssessmentCard {
+        guard let schema = registry.schema(for: kind) else { throw StructuredVisionError.unknownKind(kind) }
+        guard let analyze else { throw StructuredVisionError.analysisFailed }
+        isAnalyzing = true
+        defer { isAnalyzing = false }
+
+        let userText = note.map { "Assess the scene. Context: \($0)" } ?? "Assess the scene."
+        guard let json = await analyze(schema.systemPrompt, userText, imageData, schema.jsonSchema, "assessment") else {
+            throw StructuredVisionError.analysisFailed
+        }
+        var card = try schema.makeCard(from: json, context: note)
+        card = schema.backstop(card)
+        latest = card
+        mirrorToHUD(card)
+        return card
+    }
+
+    // MARK: - Convenience (uses the live camera)
+
+    /// Grab the current camera frame and assess it.
+    func assessCurrentFrame(kind: String, note: String?) async throws -> AssessmentCard {
+        guard let camera else { throw StructuredVisionError.noFrame }
+        let data: Data
+        if let frame = camera.latestFrame, let jpeg = frame.jpegData(compressionQuality: 0.7) {
+            data = jpeg
+        } else if let captured = try? await camera.capturePhoto() {
+            data = captured
+        } else {
+            throw StructuredVisionError.noFrame
+        }
+        return try await assess(kind: kind, imageData: data, note: note)
+    }
+
+    // MARK: - HUD
+
+    private func mirrorToHUD(_ card: AssessmentCard) {
+        let icon: GlassesDisplayService.HUDIcon
+        switch card.tier {
+        case .ok: icon = .success
+        case .caution: icon = .warning
+        case .critical: icon = .hazard
+        }
+        glassesDisplay?.showNavigation("\(card.title): \(card.summary)", icon: icon)
+    }
+}

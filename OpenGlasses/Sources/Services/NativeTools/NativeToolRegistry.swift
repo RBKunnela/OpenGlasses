@@ -101,6 +101,7 @@ final class NativeToolRegistry {
             register(CapturePhotoTool(cameraService: camera))
             register(QRContextTool(cameraService: camera))
             register(SmartCaptureTool(cameraService: camera))
+            register(VisionAssessTool())   // structured vision (read the instrument, etc.) via StructuredVisionService.shared
             if let recorder = videoRecorder {
                 register(VideoRecordingTool(cameraService: camera, videoRecorder: recorder,
                                             medicalExportService: medicalExportService))

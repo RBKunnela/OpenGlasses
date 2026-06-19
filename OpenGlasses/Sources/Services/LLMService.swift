@@ -280,6 +280,7 @@ class LLMService: ObservableObject {
             - medical_export: Export clinical transcripts to medical platforms or share manually. Actions: export_fhir (upload to FHIR server), export_file (create file), share (open share sheet), status (check config). Params: format (text/pdf/fhir_json/hl7), transcript (optional, uses latest recording). Use when the user says 'export the transcript', 'send to the EMR', 'share the notes', or 'upload to the health record'.
             - qr_context: Scan a QR code and load its content as context (museum exhibits, venue info, procedures). Use at museums, venues, or workplaces. Can also load context from a URL directly.
             - smart_capture: Capture a business card, receipt, or event flyer and extract structured details (mode: contact/receipt/event). Then chain to contacts/calendar/notes_vault to act. Use for "save this card", "log this receipt", "add this event from the flyer".
+            - vision_assess: Run a structured visual assessment of what the glasses camera sees and show a typed result card (kind selects the assessment). Use kind 'instrument_reading' to read a number off a gauge, thermometer, refractometer, scale, or meter ("what does this gauge read?", "read the thermometer"). Optional note adds context.
             - golf_mode: Golf caddy assistant — track shots with GPS, get club recommendations, log scores, view round summary, and get course strategy. Actions: start_round, track_shot, club_recommendation, log_score, round_summary, strategy.
             - live_translate: Start/stop continuous live translation. Listens to spoken foreign language and translates in real-time. Actions: start, stop, status, set_language.
             - field_session: Start, pause, resume, end, or query a Field Assist session for grounded, domain-specific technical support (refrigeration, IT, electrical, automotive). Sessions load a domain knowledge vault and emit an audit log. Use 'start' when the technician begins work, 'end' when they finish, 'export' to generate a work-order PDF + audit JSON. Actions: start, pause, resume, end, status, list, escalate, export. Params: vault (e.g. 'refrigeration'), asset_id, mode ('ai_only' default), outcome, reason, format ('pdf'/'json'/'both').
@@ -936,6 +937,108 @@ class LLMService: ObservableObject {
             }
         } catch {
             NSLog("[LLM] analyzeFrame request failed: %@", error.localizedDescription)
+            return nil
+        }
+    }
+
+    /// Stateless one-shot STRUCTURED vision analysis (structured-vision plan, Phase 2): like
+    /// `analyzeFrame`, but forces the active provider to return a JSON object matching `jsonSchema` —
+    /// Anthropic forced `tool_choice`, OpenAI-compatible forced function, Gemini JSON response. The
+    /// pure `StructuredVisionParser` extracts the object and also falls back to tolerant parsing of any
+    /// returned text, so a model that answers with prose JSON still yields a result. Does NOT mutate
+    /// conversation history. Returns the JSON object, or nil on failure / unsupported provider
+    /// (local, appleOnDevice). The caller decodes/validates against its schema.
+    func analyzeFrameStructured(systemPrompt: String, userText: String, imageData: Data,
+                                jsonSchema: [String: Any], toolName: String = "assessment",
+                                maxTokens: Int = 1024) async -> [String: Any]? {
+        guard let modelConfig = Config.activeModel else { return nil }
+        let base64 = imageData.base64EncodedString()
+        let provider = modelConfig.llmProvider
+        let toolDescription = "Return the structured assessment for the image."
+
+        do {
+            switch provider {
+            case .anthropic:
+                var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue(modelConfig.apiKey, forHTTPHeaderField: "x-api-key")
+                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                request.timeoutInterval = 30
+                let body: [String: Any] = [
+                    "model": modelConfig.model,
+                    "max_tokens": maxTokens,
+                    "system": systemPrompt,
+                    "tools": [["name": toolName, "description": toolDescription, "input_schema": jsonSchema]],
+                    "tool_choice": ["type": "tool", "name": toolName],
+                    "messages": [["role": "user", "content": [
+                        ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": base64]],
+                        ["type": "text", "text": userText]
+                    ]]]
+                ]
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+                return StructuredVisionParser.anthropic(data, toolName: toolName)
+
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+                var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !baseURL.hasSuffix("/chat/completions") {
+                    baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
+                }
+                guard let url = URL(string: baseURL) else { return nil }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue("Bearer \(modelConfig.apiKey)", forHTTPHeaderField: "Authorization")
+                request.timeoutInterval = 30
+                let body: [String: Any] = [
+                    "model": modelConfig.model,
+                    "max_tokens": maxTokens,
+                    "messages": [
+                        ["role": "system", "content": systemPrompt],
+                        ["role": "user", "content": [
+                            ["type": "text", "text": userText],
+                            ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(base64)"]]
+                        ]]
+                    ],
+                    "tools": [["type": "function", "function": [
+                        "name": toolName, "description": toolDescription, "parameters": jsonSchema]]],
+                    "tool_choice": ["type": "function", "function": ["name": toolName]]
+                ]
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+                return StructuredVisionParser.openAI(data)
+
+            case .gemini:
+                guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(modelConfig.model):generateContent?key=\(modelConfig.apiKey)") else { return nil }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.timeoutInterval = 30
+                // `responseMimeType` enforces a JSON object; the exact shape is conveyed by the schema's
+                // system prompt. (Translating a generic JSON Schema to Gemini `responseSchema` is a
+                // future refinement — the parser already handles a `functionCall` channel if added.)
+                let body: [String: Any] = [
+                    "system_instruction": ["parts": [["text": systemPrompt]]],
+                    "contents": [["role": "user", "parts": [
+                        ["text": userText],
+                        ["inlineData": ["mimeType": "image/jpeg", "data": base64]]
+                    ]]],
+                    "generationConfig": ["maxOutputTokens": maxTokens, "responseMimeType": "application/json"]
+                ]
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+                return StructuredVisionParser.gemini(data)
+
+            case .local, .appleOnDevice:
+                // On-device structured vision isn't supported here; the caller may fall back.
+                return nil
+            }
+        } catch {
+            NSLog("[LLM] analyzeFrameStructured request failed: %@", error.localizedDescription)
             return nil
         }
     }
