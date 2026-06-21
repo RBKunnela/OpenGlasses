@@ -993,6 +993,18 @@ struct HardwarePrivacyView: View {
                 } label: {
                     Label("HUD Mirror (phone preview)", systemImage: "eyeglasses")
                 }
+                NavigationLink {
+                    TeleprompterSettingsView(service: appState.teleprompterService,
+                                             store: appState.teleprompterStore)
+                } label: {
+                    HStack {
+                        Label("Teleprompter", systemImage: "text.alignleft")
+                        Spacer()
+                        if appState.teleprompterService.isActive {
+                            Text("Running").foregroundStyle(.secondary)
+                        }
+                    }
+                }
                 InfoToggle(
                     title: "Use Phone Mic for Translation",
                     isOn: Binding(

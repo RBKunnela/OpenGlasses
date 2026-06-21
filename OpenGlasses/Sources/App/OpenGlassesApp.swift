@@ -499,6 +499,10 @@ class AppState: ObservableObject, AppStateProtocol {
     lazy var procedureHUDSource = ProcedureHUDTaskSource()
     /// Band-navigable launcher on the lens (Display Phase 4 / Plan Y).
     lazy var hudLauncher = HUDLauncher(router: hudRouter)
+    /// Audio-paced HUD teleprompter (Teleprompter Phase 2): streams recognized speech into
+    /// the `ScriptAligner` to keep your place, owns the display while active.
+    let teleprompterStore = TeleprompterScriptStore()
+    lazy var teleprompterService = TeleprompterService(store: teleprompterStore)
     let hipaaService = HIPAAComplianceService()
     let medicalExportService = MedicalExportService()
 
@@ -670,6 +674,9 @@ class AppState: ObservableObject, AppStateProtocol {
         // Wire Tier 1 services
         ambientCaptions.wakeWordService = wakeWordService
         ambientCaptions.glassesDisplay = glassesDisplay
+        // Teleprompter (Phase 2): shared audio engine for live recognition + the in-lens HUD.
+        teleprompterService.wakeWordService = wakeWordService
+        teleprompterService.glassesDisplay = glassesDisplay
         memoryRewind.wakeWordService = wakeWordService
         videoRecorder.wakeWordService = wakeWordService
         videoRecorder.ambientCaptionService = ambientCaptions
@@ -762,6 +769,9 @@ class AppState: ObservableObject, AppStateProtocol {
         var translationTool = LiveTranslationTool()
         translationTool.translationService = liveTranslation
         nativeToolRegistry.register(translationTool)
+
+        // Teleprompter tool (Phase 2): registered after the lazy service is available.
+        nativeToolRegistry.register(TeleprompterTool(service: teleprompterService))
 
         // Wire translation output to TTS
         liveTranslation.onTranslation = { [weak self] translation in
@@ -2300,6 +2310,20 @@ class AppState: ObservableObject, AppStateProtocol {
         errorMessage = nil
         speechService.playEndListeningTone()
         print("📝 Transcription: \(text)")
+
+        // Teleprompter (Phase 2): while a session is running it owns the display, so
+        // "next/back/pause/resume/restart/faster/slower/stop" drive the prompter rather than
+        // the LLM. Checked first since it's a focused, full-screen mode.
+        if teleprompterService.isActive, teleprompterService.handleVoiceCommand(text) {
+            print("📜 Teleprompter command handled: \(text)")
+            if inConversation {
+                isListening = true
+                transcriptionService.startRecording()
+            } else {
+                await returnToWakeWord()
+            }
+            return
+        }
 
         // HUD task control (Display Phase 3 / Plan X): while a Now/Next card is on the
         // glasses, "next/done/skip/back" drive the task instead of going to the LLM.
