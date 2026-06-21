@@ -2283,6 +2283,42 @@ struct Config {
         UserDefaults.standard.set(enabled, forKey: "glassesDisplayEnabled")
     }
 
+    // MARK: - Teleprompter
+
+    /// Default pacing mode for new teleprompter sessions.
+    static var teleprompterMode: PacingMode {
+        if let raw = UserDefaults.standard.string(forKey: "teleprompterMode"),
+           let mode = PacingMode(rawValue: raw) {
+            return mode
+        }
+        return .audioPaced
+    }
+
+    static func setTeleprompterMode(_ mode: PacingMode) {
+        UserDefaults.standard.set(mode.rawValue, forKey: "teleprompterMode")
+    }
+
+    /// Auto-scroll words-per-minute (also the live "faster/slower" baseline).
+    static var teleprompterWPM: Int {
+        let stored = UserDefaults.standard.integer(forKey: "teleprompterWPM")
+        return PacingSpeed.wpmRange.contains(stored) ? stored : 130
+    }
+
+    static func setTeleprompterWPM(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "teleprompterWPM")
+    }
+
+    /// How many lines ahead of the spoken word the active line sits (audio-paced lead).
+    static var teleprompterLead: Int {
+        if UserDefaults.standard.object(forKey: "teleprompterLead") == nil { return 1 }
+        let stored = UserDefaults.standard.integer(forKey: "teleprompterLead")
+        return PacingSpeed.leadRange.contains(stored) ? stored : 1
+    }
+
+    static func setTeleprompterLead(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "teleprompterLead")
+    }
+
     // MARK: - WebRTC Streaming
 
     static var webRTCSignalingURL: String {
