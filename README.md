@@ -54,7 +54,7 @@ OpenGlasses ships App Intents + Siri Shortcuts, so you can drive it straight fro
 | "Hey Siri, OpenGlasses take a photo" | Captures via the glasses and describes the scene |
 | "Hey Siri, OpenGlasses describe surroundings" | Accessibility scene description |
 
-The first time, iOS surfaces these in the **Shortcuts** app and the Siri phrase picker (you can rename the phrase to anything you like). Because Siri carries the spoken text as a parameter, the conversational intent runs in the background and speaks the result — no need to bring the app forward.
+The first time, iOS surfaces these in the **Shortcuts** app and the Siri phrase picker (you can rename the phrase to anything you like). Because Siri carries the spoken text as a parameter, the conversational intent runs in the background and speaks the result — no need to bring the app forward. If Siri ever says OpenGlasses isn't running, enable **Settings → Voice → Open App for Siri Questions** to have it launch the app first.
 
 ### On-Device Local LLM
 

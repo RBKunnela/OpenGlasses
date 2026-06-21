@@ -143,15 +143,6 @@ struct OpenGlassesShortcuts: AppShortcutsProvider {
             systemImageName: "eyeglasses"
         )
         AppShortcut(
-            intent: StartMuseumModeIntent(),
-            phrases: [
-                "\(.applicationName) museum mode",
-                "Start museum guide with \(.applicationName)"
-            ],
-            shortTitle: "Museum Guide",
-            systemImageName: "building.columns"
-        )
-        AppShortcut(
             intent: DisableListeningIntent(),
             phrases: [
                 "Turn off \(.applicationName)",

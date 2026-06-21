@@ -21,10 +21,11 @@ struct AskQuestionIntent: AppIntent {
         "Ask OpenGlasses anything by voice and hear the answer, without the wake word"
     )
 
-    // Run in the background so Siri can speak the answer without forcing the app
-    // to the foreground. The app must have been launched at least once so that
-    // `AppStateProvider.shared` is populated.
-    static var openAppWhenRun: Bool = false
+    // By default, run in the background so Siri can speak the answer without forcing
+    // the app to the foreground (OpenGlasses normally stays running for wake words,
+    // so `AppStateProvider.shared` is populated). Users who'd rather guarantee it
+    // launches can flip "Open app for Siri questions" in Settings.
+    static var openAppWhenRun: Bool { Config.siriAskOpensApp }
     static var isDiscoverable: Bool { true }
 
     @Parameter(
