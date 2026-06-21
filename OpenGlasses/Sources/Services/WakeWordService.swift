@@ -131,6 +131,7 @@ class WakeWordService: NSObject, ObservableObject {
             [.bluetoothHFP, .bluetoothA2DP, .bluetoothLE].contains($0.portType)
         }
         if !onBluetooth { try? session.overrideOutputAudioPort(.speaker) }
+        preferGlassesMicIfAvailable(session)
         let outRoute = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
         print("🎤 Pausing other audio for active listening — output route: \(outRoute)")
     }
@@ -166,6 +167,28 @@ class WakeWordService: NSObject, ObservableObject {
         resumeOtherAudio()
     }
 
+    /// When "use glasses mic" is on, explicitly prefer a Bluetooth input belonging to the
+    /// glasses (port name contains "Meta"/"Ray-Ban"). On iOS 26 Ray-Ban audio rides
+    /// Bluetooth LE Audio (LC3), so the glasses mic can surface as `.bluetoothLE` rather
+    /// than `.bluetoothHFP`, and the system default input may otherwise stay on the iPhone.
+    /// No-op when the option is off or no such input is present, so the iPhone-mic fallback
+    /// path is never affected. (Recipe from glassbridge's iOS 26 audio learnings; can't be
+    /// verified without Ray-Ban hardware, so it's deliberately additive and guarded.)
+    private func preferGlassesMicIfAvailable(_ session: AVAudioSession) {
+        guard Config.useGlassesMicForWakeWord, let inputs = session.availableInputs else { return }
+        let glassesPortTypes: [AVAudioSession.Port] = [.bluetoothHFP, .bluetoothLE, .headsetMic]
+        guard let glassesInput = inputs.first(where: { port in
+            glassesPortTypes.contains(port.portType) &&
+            ["meta", "ray-ban", "rayban"].contains { port.portName.lowercased().contains($0) }
+        }) else { return }
+        do {
+            try session.setPreferredInput(glassesInput)
+            print("🎤 Preferred glasses mic input: \(glassesInput.portName) (\(glassesInput.portType.rawValue))")
+        } catch {
+            print("🎤 Could not set glasses mic as preferred input: \(error.localizedDescription)")
+        }
+    }
+
     /// Configure the shared audio session once — call before first use
     func configureAudioSession() {
         guard !audioSessionConfigured else { return }
@@ -189,6 +212,7 @@ class WakeWordService: NSObject, ObservableObject {
                 // always-on listener — see resumeOtherAudio for the same rationale.
                 try audioSession.setCategory(.playAndRecord, mode: .default, options: options)
                 try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+                preferGlassesMicIfAvailable(audioSession)
                 audioSessionConfigured = true
                 print("🎤 Mic source: \(useGlassesMic ? "glasses (Bluetooth)" : "phone (built-in)")")
             }

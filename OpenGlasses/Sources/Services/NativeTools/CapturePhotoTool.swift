@@ -25,7 +25,8 @@ struct CapturePhotoTool: NativeTool {
     func execute(args: [String: Any]) async throws -> String {
         // First check if we have a recent frame already available
         if let latestFrame = await MainActor.run(body: { cameraService.latestFrame }),
-           let data = latestFrame.jpegData(compressionQuality: 0.8) {
+           let raw = latestFrame.jpegData(compressionQuality: 0.8) {
+            let data = LLMImagePreparer.prepared(raw)   // keep under Anthropic's 5 MB inline cap
             let base64 = data.base64EncodedString()
             let sizeKB = data.count / 1024
             NSLog("[CapturePhoto] Using latest frame (%d KB)", sizeKB)
@@ -34,7 +35,7 @@ struct CapturePhotoTool: NativeTool {
 
         // Fall back to explicit photo capture
         do {
-            let photoData = try await cameraService.capturePhoto()
+            let photoData = LLMImagePreparer.prepared(try await cameraService.capturePhoto())
             let base64 = photoData.base64EncodedString()
             let sizeKB = photoData.count / 1024
             NSLog("[CapturePhoto] Captured photo (%d KB)", sizeKB)

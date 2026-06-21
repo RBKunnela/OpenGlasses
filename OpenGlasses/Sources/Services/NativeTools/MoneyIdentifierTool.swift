@@ -31,6 +31,6 @@ final class MoneyIdentifierTool: NativeTool {
         let directive = "Identify this banknote for a low-vision user: state the currency and " +
             "denomination in one short sentence (e.g. 'This is a US 20 dollar bill'). If it isn't a " +
             "clearly visible banknote, say so — do not guess."
-        return "[IMAGE_CAPTURED:\(data.base64EncodedString())] \(directive)"
+        return "[IMAGE_CAPTURED:\(LLMImagePreparer.prepared(data).base64EncodedString())] \(directive)"
     }
 }

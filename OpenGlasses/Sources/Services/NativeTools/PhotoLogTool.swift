@@ -58,7 +58,8 @@ final class PhotoLogTool: NativeTool {
         }
 
         let sizeKB = imageData.count / 1024
-        let base64 = imageData.base64EncodedString()
+        // Archive the full-res original (attachPhoto above); cap only the copy bound for the LLM.
+        let base64 = LLMImagePreparer.prepared(imageData).base64EncodedString()
         let captionNote = caption.map { " Caption: \($0)." } ?? ""
         return "[IMAGE_CAPTURED:\(base64)] Photo logged to the session (\(sizeKB) KB).\(captionNote) Analyze the image to read any values, then continue."
     }

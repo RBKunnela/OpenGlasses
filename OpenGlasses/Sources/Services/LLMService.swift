@@ -850,7 +850,7 @@ class LLMService: ObservableObject {
     /// Returns the raw model text, or nil on failure / unsupported provider (local, appleOnDevice).
     func analyzeFrame(systemPrompt: String, userText: String, imageData: Data, maxTokens: Int = 200) async -> String? {
         guard let modelConfig = Config.activeModel else { return nil }
-        let base64 = imageData.base64EncodedString()
+        let base64 = LLMImagePreparer.prepared(imageData).base64EncodedString()
         let provider = modelConfig.llmProvider
 
         do {
@@ -954,7 +954,7 @@ class LLMService: ObservableObject {
                                 jsonSchema: [String: Any], toolName: String = "assessment",
                                 maxTokens: Int = 1024) async -> [String: Any]? {
         guard let modelConfig = Config.activeModel else { return nil }
-        let base64 = imageData.base64EncodedString()
+        let base64 = LLMImagePreparer.prepared(imageData).base64EncodedString()
         let provider = modelConfig.llmProvider
         let toolDescription = "Return the structured assessment for the image."
 
@@ -1166,7 +1166,7 @@ class LLMService: ObservableObject {
 
         // Add user message to history
         if let imageData = imageData {
-            let base64String = imageData.base64EncodedString()
+            let base64String = LLMImagePreparer.prepared(imageData).base64EncodedString()
             let content: [[String: Any]] = [
                 [
                     "type": "image",
@@ -1357,7 +1357,7 @@ class LLMService: ObservableObject {
         let supportsVision = config.visionEnabled
         
         if let imageData = imageData, supportsVision {
-            let base64String = imageData.base64EncodedString()
+            let base64String = LLMImagePreparer.prepared(imageData).base64EncodedString()
             // Custom providers proxying to Anthropic API need type:image with base64 source,
             // not OpenAI's type:image_url format.
             let isAnthropicProxy = provider == .custom && config.model.lowercased().contains("claude")
@@ -1557,7 +1557,7 @@ class LLMService: ObservableObject {
 
         // Add user message to history
         if let imageData = imageData {
-            let base64String = imageData.base64EncodedString()
+            let base64String = LLMImagePreparer.prepared(imageData).base64EncodedString()
             let parts: [[String: Any]] = [
                 ["text": text],
                 ["inlineData": ["mimeType": "image/jpeg", "data": base64String]]
