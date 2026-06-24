@@ -12,7 +12,7 @@ import UIKit
 struct LogoIcon: View {
     var size: CGFloat = 24
     var body: some View {
-        Image("OpenGlassesLogo")
+        Image("iMetaClawLogo")
             .renderingMode(.template)
             .resizable()
             .scaledToFit()

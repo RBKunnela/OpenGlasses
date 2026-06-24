@@ -464,18 +464,56 @@ struct Config {
         !hasCompletedOnboarding && savedModels.allSatisfy { $0.apiKey.isEmpty }
     }
 
-    // MARK: - Wake Word
+    // MARK: - Agent & Wake Word (iMetaClaw)
 
-    /// The primary wake word phrase (user-configurable)
+    /// User's OpenClaw agent / bot name (e.g. "Maia"). Drives the "Oi {name}" wake phrase.
+    static var agentName: String {
+        if let name = UserDefaults.standard.string(forKey: "agentName"),
+           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return name.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return AppBranding.defaultAgentName
+    }
+
+    static func setAgentName(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        UserDefaults.standard.set(trimmed, forKey: "agentName")
+        setWakePhrase(AppBranding.wakePhrase(for: trimmed))
+        setAlternativeWakePhrases(defaultAlternativesForPhrase(wakePhrase))
+    }
+
+    /// The primary wake phrase — defaults to "oi {agentName}" (e.g. "oi maia").
     static var wakePhrase: String {
         if let phrase = UserDefaults.standard.string(forKey: "wakePhrase"), !phrase.isEmpty {
             return phrase.lowercased()
         }
-        return "hey openglasses"
+        return AppBranding.wakePhrase(for: agentName)
     }
 
     static func setWakePhrase(_ phrase: String) {
         UserDefaults.standard.set(phrase.lowercased(), forKey: "wakePhrase")
+    }
+
+    /// Re-sync wake phrase from the current agent name (call after first launch migration).
+    static func syncWakePhraseFromAgentName() {
+        setWakePhrase(AppBranding.wakePhrase(for: agentName))
+        setAlternativeWakePhrases(defaultAlternativesForPhrase(wakePhrase))
+    }
+
+    private static let iMetaClawWakeMigrationKey = "iMetaClawWakeMigrated_v1"
+
+    /// One-time migration from legacy "hey openglasses" to "oi {agentName}".
+    static func migrateToIMetaClawWakePhraseIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: iMetaClawWakeMigrationKey) else { return }
+        let legacyPhrases: Set<String> = ["hey openglasses", "hey open glasses", ""]
+        if let stored = UserDefaults.standard.string(forKey: "wakePhrase"),
+           !legacyPhrases.contains(stored.lowercased()) {
+            UserDefaults.standard.set(true, forKey: iMetaClawWakeMigrationKey)
+            return
+        }
+        syncWakePhraseFromAgentName()
+        UserDefaults.standard.set(true, forKey: iMetaClawWakeMigrationKey)
     }
 
     /// Alternative spellings / misrecognitions of the wake phrase
@@ -506,6 +544,17 @@ struct Config {
         case "hey openglasses":
             return ["hey open glasses", "hey open glass", "hey openclass", "hey open class", "hey openglass"]
         default:
+            if phrase.hasPrefix("oi ") {
+                let name = String(phrase.dropFirst(3))
+                return [
+                    "oi \(name)",
+                    "oy \(name)",
+                    "oí \(name)",
+                    "oi, \(name)",
+                    "hoy \(name)",
+                    "oi \(name) ",
+                ]
+            }
             return []
         }
     }

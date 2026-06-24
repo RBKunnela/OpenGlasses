@@ -20,7 +20,7 @@ struct OnboardingOverlay: View {
                     LogoIcon(size: 56)
                         .foregroundStyle(accent)
 
-                    Text("Welcome to OpenGlasses")
+                    Text("Bem-vindo ao \(AppBranding.name)")
                         .font(.title2.weight(.semibold))
                         .foregroundStyle(.white)
                 }
@@ -29,7 +29,7 @@ struct OnboardingOverlay: View {
                 VStack(alignment: .leading, spacing: 20) {
                     stepRow(
                         number: 1,
-                        icon: "OpenGlassesLogo",
+                        icon: "iMetaClawLogo",
                         title: "Connect Your Glasses",
                         subtitle: "Pair your Ray-Ban Meta glasses via the Meta AI app."
                     )
@@ -45,7 +45,7 @@ struct OnboardingOverlay: View {
                         number: 3,
                         icon: "mic",
                         title: "Say Your Wake Word",
-                        subtitle: "Say \"Hey OpenGlasses\" to start a conversation."
+                        subtitle: "Diga \"\(AppBranding.wakePhraseDisplay(for: Config.agentName))\" para começar."
                     )
                 }
                 .padding(.horizontal, 24)
@@ -79,7 +79,7 @@ struct OnboardingOverlay: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Welcome to OpenGlasses. Three setup steps.")
+        .accessibilityLabel("Bem-vindo ao \(AppBranding.name). Três passos de configuração.")
     }
 
     private func stepRow(number: Int, icon: String, title: String, subtitle: String) -> some View {
@@ -88,7 +88,7 @@ struct OnboardingOverlay: View {
                 Circle()
                     .fill(accent.opacity(0.15))
                     .frame(width: 44, height: 44)
-                if icon == "OpenGlassesLogo" {
+                if icon == "iMetaClawLogo" {
                     LogoIcon(size: 22)
                         .foregroundStyle(accent)
                 } else {

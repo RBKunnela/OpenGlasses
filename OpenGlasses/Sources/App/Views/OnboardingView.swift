@@ -33,6 +33,9 @@ struct OnboardingView: View {
     @State private var elevenLabsKey = ""
     @State private var perplexityKey = ""
 
+    // iMetaClaw agent name (drives "Oi {name}" wake phrase)
+    @State private var agentNameInput = Config.agentName
+
     // Permissions state
     @State private var micGranted = false
     @State private var locationGranted = false
@@ -46,7 +49,7 @@ struct OnboardingView: View {
     @State private var registrationStatus = ""
     @State private var isRegistering = false
 
-    private let totalPages = 7
+    private let totalPages = 8
 
     var body: some View {
         ZStack {
@@ -73,12 +76,13 @@ struct OnboardingView: View {
                 Group {
                     switch page {
                     case 0: welcomePage
-                    case 1: providerPage
-                    case 2: apiKeyPage
-                    case 3: servicesPage
-                    case 4: permissionsPage
-                    case 5: connectGlassesPage
-                    case 6: readyPage
+                    case 1: agentPage
+                    case 2: providerPage
+                    case 3: apiKeyPage
+                    case 4: servicesPage
+                    case 5: permissionsPage
+                    case 6: connectGlassesPage
+                    case 7: readyPage
                     default: EmptyView()
                     }
                 }
@@ -99,13 +103,15 @@ struct OnboardingView: View {
                 LogoIcon(size: 80)
                     .foregroundStyle(.white)
 
-                Text("OpenGlasses")
+                Text(AppBranding.name)
                     .font(.largeTitle.weight(.bold))
                     .foregroundStyle(.white)
 
-                Text("AI assistant for your smart glasses")
+                Text(AppBranding.tagline)
                     .font(.title3)
                     .foregroundStyle(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
             }
 
             Spacer()
@@ -140,7 +146,61 @@ struct OnboardingView: View {
         .padding(.bottom, 20)
     }
 
-    // MARK: - Page 2: Choose Provider
+    // MARK: - Page 2: Your Agent
+
+    private var agentPage: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 8) {
+                Text("Seu agente")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(.white)
+                Text("Como se chama seu bot OpenClaw?")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 28)
+            }
+            .padding(.top, 8)
+
+            Spacer()
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Nome do agente")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.5))
+
+                TextField("Maia", text: $agentNameInput)
+                    .font(.title2.weight(.semibold))
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.words)
+                    .foregroundStyle(.white)
+                    .padding(14)
+                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+
+                HStack(spacing: 8) {
+                    Image(systemName: "mic.fill")
+                        .foregroundStyle(.green)
+                    Text("Você vai dizer: \"\(AppBranding.wakePhraseDisplay(for: agentNameInput))\"")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                .padding(.top, 8)
+            }
+            .padding(.horizontal, 28)
+
+            Spacer()
+
+            primaryButton("Continuar") {
+                Config.setAgentName(agentNameInput)
+                withAnimation { page = 2 }
+            }
+            .disabled(agentNameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .opacity(agentNameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.4 : 1)
+            .padding(.bottom, 20)
+        }
+    }
+
+    // MARK: - Page 3: Choose Provider
 
     private var providerPage: some View {
         VStack(spacing: 0) {
@@ -227,14 +287,14 @@ struct OnboardingView: View {
             if selectedProvider != nil {
                 primaryButton("Continue") {
                     configureDefaults()
-                    withAnimation { page = 2 }
+                    withAnimation { page = 3 }
                 }
                 .padding(.bottom, 20)
             }
         }
     }
 
-    // MARK: - Page 3: Access Key
+    // MARK: - Page 4: Access Key
 
     private var apiKeyPage: some View {
         let provider = selectedProvider ?? .anthropic
@@ -405,7 +465,7 @@ struct OnboardingView: View {
                 if keyValid {
                     primaryButton("Continue") {
                         saveModel()
-                        withAnimation { page = 3 }
+                        withAnimation { page = 4 }
                     }
                 } else {
                     primaryButton(isValidating ? "Validating..." : "Validate Key") {
@@ -418,7 +478,7 @@ struct OnboardingView: View {
                     if !apiKey.trimmingCharacters(in: .whitespaces).isEmpty {
                         saveModel()
                     }
-                    withAnimation { page = 3 }
+                    withAnimation { page = 4 }
                 } label: {
                     Text(keyValid ? "Skip model selection" : "I'll add it later")
                         .font(.subheadline)
@@ -429,7 +489,7 @@ struct OnboardingView: View {
             } else {
                 primaryButton("Continue") {
                     saveModel()
-                    withAnimation { page = 3 }
+                    withAnimation { page = 4 }
                 }
                 .padding(.bottom, 20)
             }
@@ -577,7 +637,7 @@ struct OnboardingView: View {
                 if !perplexityKey.isEmpty {
                     Config.setPerplexityAPIKey(perplexityKey)
                 }
-                withAnimation { page = 4 }
+                withAnimation { page = 5 }
             }
             .padding(.bottom, 4)
 
@@ -665,7 +725,7 @@ struct OnboardingView: View {
             Spacer()
 
             primaryButton("Continue") {
-                withAnimation { page = 5 }
+                withAnimation { page = 6 }
             }
             .opacity(micGranted ? 1 : 0.4)
             .disabled(!micGranted)
@@ -857,12 +917,12 @@ struct OnboardingView: View {
             Spacer()
 
             primaryButton("Continue") {
-                withAnimation { page = 6 }
+                withAnimation { page = 7 }
             }
             .padding(.bottom, 4)
 
             Button {
-                withAnimation { page = 6 }
+                withAnimation { page = 7 }
             } label: {
                 Text("Skip — no glasses yet")
                     .font(.subheadline)
@@ -915,7 +975,7 @@ struct OnboardingView: View {
                     .font(.title.weight(.bold))
                     .foregroundStyle(.white)
 
-                Text("Say \"Hey OpenGlasses\" or tap the mic to start a conversation.")
+                Text("Diga \"\(AppBranding.wakePhraseDisplay(for: Config.agentName))\" ou toque no microfone para começar.")
                     .font(.subheadline)
                     .foregroundStyle(.white.opacity(0.6))
                     .multilineTextAlignment(.center)

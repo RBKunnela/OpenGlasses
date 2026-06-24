@@ -41,21 +41,34 @@ struct SettingsView: View {
             // MARK: — Core
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+            // MARK: iMetaClaw Agent
+            Section {
+                NavigationLink {
+                    AgentSettingsView(appState: appState)
+                } label: {
+                    HStack {
+                        Label("Seu agente", systemImage: "person.crop.circle.badge.checkmark")
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(Config.agentName)
+                                .foregroundStyle(.secondary)
+                            Text(AppBranding.wakePhraseDisplay(for: Config.agentName))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } header: {
+                Text(AppBranding.name)
+            } footer: {
+                Text("O nome do seu bot define a frase de ativação: \"Oi {nome}\" — por exemplo, Oi Maia.")
+            }
+
             // MARK: Wake Word
             Section {
-                Picker("Wake Phrase", selection: Binding(
-                    get: { Config.wakePhrase },
-                    set: { newValue in
-                        Config.setWakePhrase(newValue)
-                        Config.setAlternativeWakePhrases(Config.defaultAlternativesForPhrase(newValue))
-                    }
-                )) {
-                    Text("Hey OpenGlasses").tag("hey openglasses")
-                    Text("Hey Claude").tag("hey claude")
-                    Text("Hey Jarvis").tag("hey jarvis")
-                    Text("Hey Computer").tag("hey computer")
-                    Text("Hey Assistant").tag("hey assistant")
-                    Text("Hey Rayban").tag("hey rayban")
+                LabeledContent("Frase de ativação") {
+                    Text(AppBranding.wakePhraseDisplay(for: Config.agentName))
+                        .font(.body.weight(.medium))
                 }
 
                 InfoToggle(
