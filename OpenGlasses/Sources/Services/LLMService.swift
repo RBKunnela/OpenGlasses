@@ -118,6 +118,36 @@ enum LLMProvider: String, CaseIterable {
         }
     }
 
+    /// Whether this provider uses a browser-based OAuth login flow (ASWebAuthenticationSession)
+    /// instead of a raw API key paste.
+    var isOAuthProvider: Bool {
+        switch self {
+        case .anthropic: return true  // claude.ai subscription uses OAuth
+        default: return false
+        }
+    }
+
+    /// The OAuth authorization URL to open in ASWebAuthenticationSession.
+    /// Returns nil for providers that don't use OAuth.
+    var oauthAuthURL: URL? {
+        switch self {
+        case .anthropic:
+            // Claude.ai subscription OAuth — opens the sign-in page.
+            // The redirect URI is clawglasses://oauth/callback
+            return URL(string: "https://claude.ai/login?return_to=%2Fauth%2Fapp-token&utm_source=app")
+        default:
+            return nil
+        }
+    }
+
+    /// The label shown on the OAuth sign-in button.
+    var oauthButtonLabel: String {
+        switch self {
+        case .anthropic: return "Sign in with Claude"
+        default: return "Sign in"
+        }
+    }
+
     /// Whether this provider supports listing models via API
     var supportsModelListing: Bool {
         switch self {

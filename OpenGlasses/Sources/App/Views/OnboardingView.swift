@@ -265,10 +265,11 @@ struct OnboardingView: View {
                             .foregroundStyle(.white.opacity(0.5))
 
                         HStack {
-                            SecureField("sk-...", text: $apiKey)
+                            TextField("sk-...", text: $apiKey)
                                 .font(.system(.body, design: .monospaced))
                                 .autocorrectionDisabled()
                                 .textInputAutocapitalization(.never)
+                                .textContentType(.oneTimeCode)
                                 .foregroundStyle(.white)
                                 .onChange(of: apiKey) { _, _ in
                                     validationError = nil
@@ -464,10 +465,11 @@ struct OnboardingView: View {
                             .foregroundStyle(.white)
                     }
 
-                    SecureField("ElevenLabs API Key", text: $elevenLabsKey)
+                    TextField("ElevenLabs API Key", text: $elevenLabsKey)
                         .font(.system(.body, design: .monospaced))
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+                        .textContentType(.oneTimeCode)
                         .foregroundStyle(.white)
                         .padding(14)
                         .contentShape(Rectangle())
@@ -505,10 +507,11 @@ struct OnboardingView: View {
                             .foregroundStyle(.white)
                     }
 
-                    SecureField("Perplexity API Key", text: $perplexityKey)
+                    TextField("Perplexity API Key", text: $perplexityKey)
                         .font(.system(.body, design: .monospaced))
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+                        .textContentType(.oneTimeCode)
                         .foregroundStyle(.white)
                         .padding(14)
                         .contentShape(Rectangle())

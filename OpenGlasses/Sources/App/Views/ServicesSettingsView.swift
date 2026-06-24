@@ -69,9 +69,10 @@ struct ServicesSettingsView: View {
 
             // MARK: Text-to-Speech
             Section {
-                SecureField("API Key", text: $elevenLabsKeyInput)
+                TextField("API Key", text: $elevenLabsKeyInput)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
+                    .textContentType(.oneTimeCode)
 
                 if elevenLabsKeyInput.isEmpty {
                     Link(destination: URL(string: "https://elevenlabs.io/app/settings/api-keys")!) {
@@ -254,9 +255,10 @@ struct ServicesSettingsView: View {
 
             // MARK: Web Search
             Section {
-                SecureField("API Key", text: $perplexityKeyInput)
+                TextField("API Key", text: $perplexityKeyInput)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
+                    .textContentType(.oneTimeCode)
 
                 if perplexityKeyInput.isEmpty {
                     Link(destination: URL(string: "https://www.perplexity.ai/settings/api")!) {
@@ -370,9 +372,10 @@ struct ServicesSettingsView: View {
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
 
-                SecureField("Stream Key", text: $broadcastStreamKey)
+                TextField("Stream Key", text: $broadcastStreamKey)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
+                    .textContentType(.oneTimeCode)
             } header: {
                 Text("Live Streaming")
             } footer: {
@@ -393,9 +396,10 @@ struct ServicesSettingsView: View {
                         Config.setHomeAssistantURL(newValue)
                     }
 
-                SecureField("Long-Lived Access Token", text: $haToken)
+                TextField("Long-Lived Access Token", text: $haToken)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
+                    .textContentType(.oneTimeCode)
                     .onChange(of: haToken) { _, newValue in
                         Config.setHomeAssistantToken(newValue)
                     }

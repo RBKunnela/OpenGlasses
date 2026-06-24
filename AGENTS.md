@@ -44,7 +44,9 @@ OpenGlasses/
 │   └── Entitlements/
 │       └── Personal/               # Entitlements files for each target
 ├── OpenGlasses/                    # Main iOS app source
-│   └── Sources/App/Views/          # All SwiftUI views
+│   └── Sources/
+│       ├── App/Views/              # All SwiftUI views
+│       └── Services/               # LLMService, ModelFetcher, etc.
 ├── OpenGlassesWatch/               # Apple Watch app source
 │   └── Info.plist                  # Watch app Info.plist — WKCompanionAppBundleIdentifier fixed
 ├── OpenGlassesWatchWidget/         # Watch widget
@@ -69,7 +71,6 @@ OpenGlasses/
 | Watch app bundle ID | `com.clawglasses.app.watchapp` |
 | Watch widget bundle ID | `com.clawglasses.app.watchapp.watchwidget` |
 | iPhone device ID (for build) | `40727801-12A2-5B70-9568-308A977E681F` |
-| Build keychain | `~/Library/Keychains/openglasses-build.keychain-db` (no password) |
 | Login keychain | `~/Library/Keychains/login.keychain-db` (no password — reset during session) |
 
 ---
@@ -79,17 +80,23 @@ OpenGlasses/
 ### Prerequisites
 - macOS with Xcode installed
 - iPhone connected via USB and trusted
-- Apple Developer account active (paid, $99/year) for `renatbk@gmail.com`
+- Apple Developer account active (paid, €99/year) for `renatbk@gmail.com`
 - XcodeGen installed: `brew install xcodegen`
 
-### Step 1 — Regenerate the Xcode project (after any yml change)
+### Step 1 — Fix keychain partition list (do this before every build)
+```bash
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" \
+  ~/Library/Keychains/login.keychain-db 2>/dev/null
+```
+
+### Step 2 — Regenerate the Xcode project (after any yml change)
 ```bash
 cd /Volumes/aiagents2TB/Dev/GITHUB/OpenGlasses
 ./Scripts/generate-xcodeproj.sh
 ```
 **Never run `xcodegen` directly** — always use this script, which merges `project.base.yml`, `project.local.yml`, `project.watch.yml`, and `project.tests.yml` correctly.
 
-### Step 2 — Resolve Swift packages (required after clearing DerivedData)
+### Step 3 — Resolve Swift packages (required after clearing DerivedData)
 ```bash
 cd /Volumes/aiagents2TB/Dev/GITHUB/OpenGlasses
 xcodebuild -resolvePackageDependencies \
@@ -101,68 +108,91 @@ xcodebuild -resolvePackageDependencies \
   -scheme OpenGlasses 2>/dev/null
 ```
 
-### Step 3 — Build and install
+### Step 4 — Build and install
 ```bash
 xcodebuild \
   -project OpenGlasses.xcodeproj \
   -scheme OpenGlasses \
   -destination 'id=40727801-12A2-5B70-9568-308A977E681F' \
   -allowProvisioningUpdates \
+  -allowProvisioningDeviceRegistration \
   CODE_SIGN_STYLE=Automatic \
-  DEVELOPMENT_TEAM=VF88UK56C3 \
-  > /tmp/xcodebuild_build.log 2>&1
+  DEVELOPMENT_TEAM=VF88UK56C3
 ```
 
-### Step 4 — Install on device (if not auto-installed by xcodebuild)
+### Step 5 — Install on device (if not auto-installed by xcodebuild)
 ```bash
-APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData/OpenGlasses-*/Build/Products/Debug-iphoneos/ -name "OpenGlasses.app" -maxdepth 1 2>/dev/null | head -1)
+APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData/OpenGlasses-*/Build/Products/Debug-iphoneos/ \
+  -name "OpenGlasses.app" -maxdepth 1 2>/dev/null | head -1)
 xcrun devicectl device install app \
   --device 40727801-12A2-5B70-9568-308A977E681F \
   "$APP_PATH"
 ```
 
-### Step 5 — Trust the app on iPhone
+### Step 6 — Trust the app on iPhone
 On the iPhone: **Settings → General → VPN & Device Management → renatbk@gmail.com → Trust**
 
 ---
 
-## 5. Known Issues and Fixes Applied in This Session (Jun 24, 2026)
+## 5. LLMProvider Enum — All Cases
 
-### 5.1 Login Keychain Password Mismatch (FIXED)
+The `LLMProvider` enum is defined in `OpenGlasses/Sources/Services/LLMService.swift`. As of Jun 24, 2026, the full set of cases is:
+
+```swift
+enum LLMProvider: String, CaseIterable {
+    case anthropic     // Anthropic Claude — uses its own API format
+    case openai        // OpenAI GPT — OpenAI-compatible
+    case gemini        // Google Gemini — uses its own API format
+    case groq          // Groq — OpenAI-compatible
+    case zai           // Z.ai GLM (subscription) — OpenAI-compatible
+    case qwen          // Alibaba Qwen (subscription) — OpenAI-compatible
+    case minimax       // MiniMax (subscription) — OpenAI-compatible
+    case xai           // xAI Grok (subscription or API key) — OpenAI-compatible
+    case openrouter    // OpenRouter 500+ models — OpenAI-compatible
+    case custom        // Any OpenAI-compatible endpoint — OpenAI-compatible
+    case local         // Local MLX on-device — NOT OpenAI-compatible (local only)
+    case appleOnDevice // Apple Foundation Models — NOT OpenAI-compatible (local only)
+}
+```
+
+**IMPORTANT:** Whenever a new case is added to `LLMProvider`, it MUST be added to **every** switch statement in these files:
+- `LLMService.swift` — 7 switch statements (lines ~512, ~577, ~804, ~898, ~1002, ~1096, ~1172)
+- `ModelFetcher.swift` — 1 switch statement (line ~73)
+- `Config.swift` — 1 switch statement in `inferredSupportsVision` (line ~247)
+- `OnboardingView.swift` — 2 switch statements (lines ~1168, ~1184) — these use `default:` so they are not exhaustive errors, but should be updated for completeness
+- `ModelFormView.swift` — uses `isSubscriptionBased`, `isOpenAICompatible`, etc. properties, not raw switches — update those properties instead
+
+OpenAI-compatible providers share the same `sendOpenAICompatible()` path and should be grouped together in every switch.
+
+---
+
+## 6. Known Issues and Fixes Applied
+
+### 6.1 Login Keychain Password Mismatch (FIXED)
 **Problem:** The macOS login keychain was locked with an old password that no longer matched the Mac login password. This caused `errSecInternalComponent` errors during code signing.
 
 **Fix applied:**
 ```bash
-# Backup old keychain
 cp ~/Library/Keychains/login.keychain-db ~/Desktop/login.keychain-db.backup
-# Delete and recreate with no password
 rm ~/Library/Keychains/login.keychain-db
 security create-keychain -p "" ~/Library/Keychains/login.keychain-db
 security set-keychain-settings -u ~/Library/Keychains/login.keychain-db
 security list-keychains -d user -s ~/Library/Keychains/login.keychain-db
 ```
 
-### 5.2 New Certificates Landing in iCloud Keychain (FIXED)
-**Problem:** When `xcodebuild -allowProvisioningUpdates` creates a new certificate, the private key is stored in the macOS Data Protection keychain (iCloud keychain, UUID `2A3922B1-F925-5742-B67F-7E441DFEF1AA`), not the login keychain. This keychain requires the Mac login password to unlock, causing `errSecInternalComponent` on every new cert.
+### 6.2 New Certificates Landing in iCloud Keychain (FIXED)
+**Problem:** When `xcodebuild -allowProvisioningUpdates` creates a new certificate, the private key may land in the iCloud keychain (UUID `2A3922B1-F925-5742-B67F-7E441DFEF1AA`), which requires the Mac login password to unlock — causing `errSecInternalComponent`.
 
-**Fix applied:** Created a dedicated build keychain with no password and set it as the default:
+**Fix:** Before every build, run:
 ```bash
-security create-keychain -p "" ~/Library/Keychains/openglasses-build.keychain-db
-security set-keychain-settings -u ~/Library/Keychains/openglasses-build.keychain-db
-security default-keychain -s ~/Library/Keychains/openglasses-build.keychain-db
-security list-keychains -d user -s \
-  ~/Library/Keychains/openglasses-build.keychain-db \
-  ~/Library/Keychains/login.keychain-db \
-  ~/Library/Keychains/2A3922B1-F925-5742-B67F-7E441DFEF1AA/keychain-2.db \
-  /Library/Keychains/System.keychain
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" \
+  ~/Library/Keychains/login.keychain-db 2>/dev/null
 ```
 
-**Also:** A background watcher script was used during the session to immediately fix the partition list on any new cert. This is no longer needed with the build keychain approach, but the script is at `/tmp/cert_watcher3.sh` for reference.
+### 6.3 Watch Widget Bundle ID Prefix Error (FIXED)
+**Problem:** `OpenGlassesWatchWidget` had bundle ID `com.clawglasses.app.watchwidget` instead of `com.clawglasses.app.watchapp.watchwidget`.
 
-### 5.3 Watch Widget Bundle ID Prefix Error (FIXED)
-**Problem:** `OpenGlassesWatchWidget` had bundle ID `com.clawglasses.app.watchwidget` instead of `com.clawglasses.app.watchapp.watchwidget`. Apple requires Watch widget bundle IDs to be prefixed with the Watch app bundle ID.
-
-**Fix applied in `project.local.yml`:**
+**Fix in `project.local.yml`:**
 ```yaml
 OpenGlassesWatchWidget:
   settings:
@@ -170,28 +200,28 @@ OpenGlassesWatchWidget:
       PRODUCT_BUNDLE_IDENTIFIER: com.clawglasses.app.watchapp.watchwidget
 ```
 
-### 5.4 WKCompanionAppBundleIdentifier Wrong Value (FIXED)
-**Problem:** `OpenGlassesWatch/Info.plist` had `WKCompanionAppBundleIdentifier` set to `com.openglasses.app` (the original upstream value) instead of `com.clawglasses.app`. This caused the app installation to fail with `InvalidCompanionAppBundleIdentifier`.
+### 6.4 WKCompanionAppBundleIdentifier Wrong Value (FIXED)
+**Problem:** `OpenGlassesWatch/Info.plist` had `WKCompanionAppBundleIdentifier` = `com.openglasses.app` (upstream default) instead of `com.clawglasses.app`.
 
-**Fix applied in `OpenGlassesWatch/Info.plist` line 28:**
+**Fix in `OpenGlassesWatch/Info.plist`:**
 ```xml
 <key>WKCompanionAppBundleIdentifier</key>
-<string>com.clawglasses.app</string>  <!-- was: com.openglasses.app -->
+<string>com.clawglasses.app</string>
 ```
 
-### 5.5 Info.personal.plist Missing Required Keys (FIXED)
-**Problem:** `Config/Info/Info.personal.plist` only contained MWDAT (Meta Wearables DAT) credentials and was missing all standard `CFBundle*` keys. This caused `AppIntentsSSUTraining` to fail with "missing bundle identifier".
+### 6.5 Info.personal.plist Missing Required Keys (FIXED)
+**Problem:** `Config/Info/Info.personal.plist` only contained MWDAT credentials and was missing all standard `CFBundle*` keys. This caused `AppIntentsSSUTraining` to fail with "missing bundle identifier".
 
-**Fix applied:** Recreated `Info.personal.plist` by merging the base `Info.plist` keys with the MWDAT credentials. The file must contain both standard bundle keys AND the MWDAT section.
+**Fix:** Recreated `Info.personal.plist` by merging the base `Info.plist` keys with the MWDAT credentials. The file must contain both standard bundle keys AND the MWDAT section.
 
-### 5.6 All API Key Fields Blocked Paste (FIXED — Jun 24, 2026)
-**Problem:** Every API key input field in the app used SwiftUI's `SecureField`, which hides characters and **blocks paste on iOS**. Users could not paste long API keys (OpenAI, ElevenLabs, Perplexity, etc.).
+### 6.6 All API Key Fields Blocked Paste — SecureField (FIXED — Jun 24, 2026)
+**Problem:** Every API key input field used SwiftUI's `SecureField`, which hides characters and **blocks paste on iOS**.
 
-**Fix applied:** Replaced all 13 `SecureField` instances with `TextField` across 8 files:
+**Fix:** Replaced all 13 `SecureField` instances with `TextField` across 8 files:
 
 | File | Fields fixed |
 |---|---|
-| `OnboardingView.swift` | OpenAI key (`sk-...`), ElevenLabs key, Perplexity key |
+| `OnboardingView.swift` | OpenAI key, ElevenLabs key, Perplexity key |
 | `ServicesSettingsView.swift` | ElevenLabs key, Perplexity key, Stream key, Home Assistant token |
 | `ModelFormView.swift` | API key (all providers) |
 | `MCPServersView.swift` | Auth header value (Bearer token) |
@@ -202,16 +232,65 @@ OpenGlassesWatchWidget:
 
 All replacement fields retain `.autocorrectionDisabled()` and `.textInputAutocapitalization(.never)`.
 
-### 5.7 Swift Package Resolution Fails After Clearing DerivedData (KNOWN QUIRK)
+**NOTE (Jun 24, 2026 — second session):** Despite the SecureField → TextField replacement, paste is still not working in some fields. Root cause under investigation — may be related to `.textContentType(.password)` or a custom `UIViewRepresentable` wrapper elsewhere in the codebase. See section 7.1 for the ongoing fix.
+
+### 6.7 xAI/Grok Provider Added (DONE — Jun 24, 2026)
+**What was done:**
+- Added `case xai = "xai"` to the `LLMProvider` enum in `LLMService.swift`
+- Added `displayName`, `consoleURL`, `defaultBaseURL`, `defaultModel`, `showBaseURL`, `isSubscriptionBased`, `isOpenAICompatible` for `.xai`
+- Updated `ModelFormView.swift` to show "Subscription Token" label for subscription providers (`.xai`, `.zai`, `.qwen`, `.minimax`)
+
+**Bug introduced and fixed:** The new `.xai` case was missing from 9 switch statements across 3 files, causing "switch must be exhaustive" Swift compiler errors. Fixed in commit `88e8d19`:
+- `LLMService.swift`: 7 switch statements
+- `ModelFetcher.swift`: 1 switch statement
+- `Config.swift`: 1 switch statement (`inferredSupportsVision`)
+
+### 6.8 Swift Package Resolution Fails After Clearing DerivedData (KNOWN QUIRK)
 **Problem:** After deleting DerivedData, the first `xcodebuild -resolvePackageDependencies` call fails for the local `SherpaOnnx` binary package. The second call succeeds.
 
-**Workaround:** Always run package resolution **twice** after clearing DerivedData (see Step 2 above).
+**Workaround:** Always run package resolution **twice** after clearing DerivedData.
 
 ---
 
-## 6. What Still Needs to Be Done
+## 7. Work In Progress (Jun 24, 2026 — Second Session)
 
-### 6.1 Connect Naia Agent (HIGH PRIORITY)
+### 7.1 Paste Still Not Working in API Key Fields (IN PROGRESS)
+Despite replacing all `SecureField` with `TextField`, paste is still blocked in some API key fields. The root cause is being investigated. Possible causes:
+- A `.textContentType(.password)` modifier somewhere that iOS treats as a password field
+- A custom `UIViewRepresentable` wrapper that intercepts the paste action
+- A SwiftUI bug where `TextField` in a `Form` inside a `NavigationStack` blocks paste in certain iOS versions
+
+**Fix approach:** Add explicit `.textContentType(.oneTimeCode)` or `.textContentType(.URL)` to all API key fields to prevent iOS from treating them as password fields. Also add a "Paste" button next to each field as a fallback.
+
+### 7.2 OAuth / Subscription Login Flow (PLANNED)
+Some AI providers (notably Anthropic Claude via claude.ai subscription, and others) use a browser-based OAuth flow instead of a raw API key:
+1. User taps "Sign in with Claude" (or similar)
+2. App opens a `SFSafariViewController` or `ASWebAuthenticationSession` to the provider's auth URL
+3. User logs in and authorizes the app
+4. Provider redirects back with an auth code
+5. App exchanges the code for a token and stores it
+
+**Plan:**
+- Add `isOAuthProvider: Bool` property to `LLMProvider`
+- Add `oauthAuthURL: URL?` property to `LLMProvider`
+- Create `OAuthLoginView.swift` — a sheet that opens `ASWebAuthenticationSession`
+- Handle the callback URL scheme (`clawglasses://oauth/callback`)
+- Store the resulting token in the same `apiKey` field (transparent to the rest of the code)
+- Register the URL scheme in `Info.personal.plist`
+
+### 7.3 Brazilian Portuguese (pt-BR) Localization (PLANNED)
+The app is currently English-only. To support Brazilian Portuguese:
+- Create `OpenGlasses/pt-BR.lproj/Localizable.strings` with all UI strings translated
+- Create `OpenGlasses/pt-BR.lproj/InfoPlist.strings` for system-level strings
+- Add `pt-BR` to the project's known regions in `project.local.yml`
+- The app will automatically use Portuguese when the iPhone is set to Portuguese (Brazil)
+- All user-facing strings in SwiftUI views use `Text("...")` — these need to be wrapped with `NSLocalizedString` or use SwiftUI's built-in localization via `String(localized:)`
+
+---
+
+## 8. What Still Needs to Be Done
+
+### 8.1 Connect Naia Agent (HIGH PRIORITY)
 The app is installed but not yet connected to the Naia OpenClaw agent on the Hostinger VPS. The connection requires:
 - VPS endpoint URL (HTTP/WebSocket)
 - API key or Bearer token for the agent
@@ -222,14 +301,14 @@ The Naia agent already handles Telegram — the same agent should handle glasses
 Ray-Ban Meta Glasses → (Bluetooth) → OpenGlasses iOS app → (HTTPS/WebSocket) → VPS → Naia (OpenClaw) → response back
 ```
 
-### 6.2 TestFlight Distribution Setup
+### 8.2 TestFlight Distribution Setup
 To distribute to other users (not just install locally via USB):
 1. Archive the app: `xcodebuild archive -scheme OpenGlasses -archivePath /tmp/OpenGlasses.xcarchive`
 2. Export for App Store / TestFlight: requires an `ExportOptions.plist`
 3. Upload via `xcrun altool` or Transporter
 4. Add testers in App Store Connect
 
-### 6.3 Meta App and Wearables Developer Registration
+### 8.3 Meta App and Wearables Developer Registration
 The Meta Wearables DAT (Data Access Toolkit) integration requires:
 1. Create a Meta for Developers app at `developers.facebook.com`
 2. Add the **Wearables** product to the app
@@ -237,7 +316,7 @@ The Meta Wearables DAT (Data Access Toolkit) integration requires:
 4. Submit the app for Meta review (required for production use)
 5. Update `Config/Info/Info.personal.plist` with the real Meta App ID and App Secret
 
-### 6.4 Android Version (ROADMAP)
+### 8.4 Android Version (ROADMAP)
 The current app is iOS-only. A future version should be a thin cross-platform companion app that:
 - Receives audio from glasses via Bluetooth
 - Streams audio to the VPS
@@ -246,7 +325,7 @@ The current app is iOS-only. A future version should be a thin cross-platform co
 
 This approach moves all AI logic to the VPS (Naia), making the phone app a dumb terminal.
 
-### 6.5 Business Infrastructure
+### 8.5 Business Infrastructure
 - Set up TestFlight beta group for paying customers
 - Build the "glasses bridge" module for OpenClaw (the VPS-side endpoint)
 - Create a one-line VPS install script: `openclaw install glasses-bridge`
@@ -255,24 +334,24 @@ This approach moves all AI logic to the VPS (Naia), making the phone app a dumb 
 
 ---
 
-## 7. Business Context
+## 9. Business Context
 
 **Owner:** Renata Baldissara-Kunnela, based in Finland  
 **Business type:** Kevytyrittäjyys (light entrepreneurship), Finnish VAT registered  
 **Agent name:** Naia (OpenClaw agent on Hostinger VPS)  
 **Telegram bot:** Already operational — same Naia agent  
-**Apple Developer account:** Paid ($99/year), enrolled Jun 24, 2026, Enrollment ID `5PKWYJHJGM`
+**Apple Developer account:** Paid (€99/year), enrolled Jun 24, 2026, receipt W1520237259
 
 **Three sales scenarios:**
 1. **Direct to VPS owners** — people who already have VPS + OpenClaw + Telegram, want to add glasses. Deliver via TestFlight + a bridge module install command.
 2. **Resellers** — OpenClaw resellers who want to add glasses to their offering. Monthly per-seat licensing (not one-time), white-label app option.
 3. **Full stack** — sell VPS + agent + Telegram + glasses as a complete package.
 
-**Key pricing principle:** Never give a perpetual license. The app must connect to infrastructure you control (TestFlight distribution, relay server) so non-payment = service stops.
+**Key pricing principle:** Never give a perpetual license. The app must connect to infrastructure you control (TestFlight distribution, relay server) so non-payment = service stops. Target pricing: ~€20/seat/month + optional hosted relay ~€12/client/month.
 
 ---
 
-## 8. External Dependencies and Accounts
+## 10. External Dependencies and Accounts
 
 | Service | Account | Status |
 |---|---|---|
@@ -280,19 +359,33 @@ This approach moves all AI logic to the VPS (Naia), making the phone app a dumb 
 | OpenAI | renatbk@gmail.com | API key needed in app |
 | ElevenLabs | renatbk@gmail.com | API key needed in app (optional, for voice) |
 | Perplexity | renatbk@gmail.com | API key needed in app (optional, for web search) |
+| xAI (Grok) | renatbk@gmail.com | Subscription or API key — provider added to app |
 | Meta for Developers | renatbk@gmail.com | App not yet created |
 | Meta Wearables Developer Center | renatbk@gmail.com | Not yet registered |
 | Hostinger VPS | renatbk@gmail.com | Active — Naia agent running |
 
 ---
 
-## 9. Important Notes for Future AI Assistants
+## 11. Important Notes for Future AI Assistants
 
 - **Never run `xcodegen` directly.** Always use `./Scripts/generate-xcodeproj.sh` which merges all yml files correctly.
 - **The login keychain has no password.** Use `""` (empty string) for any `security` commands that ask for the keychain password.
-- **The build keychain** (`openglasses-build.keychain-db`) also has no password and is set as the default keychain for this user.
-- **If you see `errSecInternalComponent`** during code signing, a new certificate was created whose private key landed in the iCloud keychain. Fix with: `security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" ~/Library/Keychains/openglasses-build.keychain-db`
-- **If you see "already have a current Development certificate"** from the portal, this is not an error — it means the existing cert will be reused. The build will proceed.
+- **Before every build**, run: `security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" ~/Library/Keychains/login.keychain-db 2>/dev/null`
+- **If you see `errSecInternalComponent`** during code signing, run the partition list command above and rebuild.
+- **If you see "already have a current Development certificate"** — this is fine, it means the existing cert is being reused.
 - **Package resolution must run twice** after clearing DerivedData due to the local SherpaOnnx binary package.
 - **The `Info.personal.plist`** must contain ALL standard `CFBundle*` keys plus the MWDAT section. It is NOT just a MWDAT-only file.
 - **`WKCompanionAppBundleIdentifier`** in `OpenGlassesWatch/Info.plist` must be `com.clawglasses.app` (not `com.openglasses.app`).
+- **When adding a new `LLMProvider` case**, update ALL switch statements in `LLMService.swift` (7 switches), `ModelFetcher.swift` (1 switch), and `Config.swift` (1 switch). The Swift compiler will catch missing cases as "switch must be exhaustive" errors.
+- **Use `-project OpenGlasses.xcodeproj`** (NOT `-workspace`) in all xcodebuild commands. The workspace file is inside the .xcodeproj bundle and is not a separate .xcworkspace.
+- **The app is localized for pt-BR (Brazilian Portuguese)** — all new UI strings added to SwiftUI views must also be added to `OpenGlasses/pt-BR.lproj/Localizable.strings`.
+
+---
+
+## 12. Session History Summary
+
+| Date | What was done |
+|---|---|
+| Jun 24, 2026 (Session 1) | Fixed login keychain, fixed all broken Apple Development certs, fixed Info.personal.plist, fixed Watch Widget bundle ID, fixed WKCompanionAppBundleIdentifier, built and installed app on iPhone, replaced all 13 SecureField with TextField |
+| Jun 24, 2026 (Session 2) | Added xAI/Grok provider (LLMProvider.xai), updated ModelFormView for subscription labels, fixed 9 "switch must be exhaustive" errors across LLMService.swift + ModelFetcher.swift + Config.swift, rebuilt and installed app (BUILD SUCCEEDED), committed as `88e8d19` |
+| Jun 24, 2026 (Session 3) | Investigating paste-still-blocked issue, planning OAuth/subscription login flow, planning pt-BR localization |

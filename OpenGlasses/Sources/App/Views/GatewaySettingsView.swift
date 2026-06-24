@@ -268,9 +268,10 @@ struct EditGatewaySheet: View {
                 }
 
                 Section {
-                    SecureField("Token", text: $gateway.token)
-                        .textContentType(.password)
+                    TextField("Token", text: $gateway.token)
                         .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .textContentType(.oneTimeCode)
                 } header: {
                     Text("Authentication")
                 } footer: {

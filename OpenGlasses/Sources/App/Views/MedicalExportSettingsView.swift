@@ -67,7 +67,10 @@ struct MedicalExportSettingsView: View {
                         Text("Bearer Token")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        SecureField("Pre-obtained OAuth token", text: $fhirConfig.bearerToken)
+                        TextField("Pre-obtained OAuth token", text: $fhirConfig.bearerToken)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .textContentType(.oneTimeCode)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {

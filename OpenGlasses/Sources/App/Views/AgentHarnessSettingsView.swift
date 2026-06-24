@@ -40,9 +40,10 @@ struct AgentHarnessSettingsView: View {
                 TextField("Header name", text: $config.authHeader)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
-                SecureField("Header value (e.g. Bearer …)", text: $config.authValue)
+                TextField("Header value (e.g. Bearer …)", text: $config.authValue)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
+                    .textContentType(.oneTimeCode)
             }
 
             Section {
