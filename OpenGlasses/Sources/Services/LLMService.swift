@@ -12,6 +12,7 @@ enum LLMProvider: String, CaseIterable {
     case zai = "zai"
     case qwen = "qwen"
     case minimax = "minimax"
+    case xai = "xai"
     case openrouter = "openrouter"
     case custom = "custom"
     case local = "local"
@@ -23,7 +24,8 @@ enum LLMProvider: String, CaseIterable {
         case .openai: return "OpenAI (GPT)"
         case .gemini: return "Google (Gemini)"
         case .groq: return "Groq"
-        case .zai: return "Z.ai (Subscription)"
+        case .xai: return "xAI Grok (Subscription)"
+        case .zai: return "Z.ai GLM (Subscription)"
         case .qwen: return "Qwen (Subscription)"
         case .minimax: return "MiniMax (Subscription)"
         case .openrouter: return "OpenRouter (500+ models)"
@@ -40,6 +42,7 @@ enum LLMProvider: String, CaseIterable {
         case .openai: return URL(string: "https://platform.openai.com/api-keys")
         case .gemini: return URL(string: "https://aistudio.google.com/apikey")
         case .groq: return URL(string: "https://console.groq.com/keys")
+        case .xai: return URL(string: "https://console.x.ai")
         case .minimax: return URL(string: "https://platform.minimaxi.com")
         case .openrouter: return URL(string: "https://openrouter.ai/keys")
         case .qwen: return URL(string: "https://dashscope.console.aliyun.com/apiKey")
@@ -51,7 +54,7 @@ enum LLMProvider: String, CaseIterable {
     var isOpenAICompatible: Bool {
         switch self {
         case .anthropic, .gemini, .local, .appleOnDevice: return false
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom: return true
+        case .openai, .groq, .xai, .zai, .qwen, .minimax, .openrouter, .custom: return true
         }
     }
 
@@ -62,6 +65,7 @@ enum LLMProvider: String, CaseIterable {
         case .openai: return "https://api.openai.com/v1/chat/completions"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
         case .groq: return "https://api.groq.com/openai/v1/chat/completions"
+        case .xai: return "https://api.x.ai/v1/chat/completions"
         case .zai: return "https://api.z.ai/api/coding/paas/v4/chat/completions"
         case .qwen: return "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions"
         case .minimax: return "https://api.minimax.io/v1/chat/completions"
@@ -79,6 +83,7 @@ enum LLMProvider: String, CaseIterable {
         case .openai: return "gpt-4o"
         case .gemini: return "gemini-2.0-flash"
         case .groq: return "llama-3.3-70b-versatile"
+        case .xai: return "grok-3-mini"
         case .zai: return "glm-4.5"
         case .qwen: return "qwen3.5-plus"
         case .minimax: return "MiniMax-M2.7"
@@ -92,7 +97,7 @@ enum LLMProvider: String, CaseIterable {
     /// Whether the base URL field should be shown (editable endpoint)
     var showBaseURL: Bool {
         switch self {
-        case .custom, .zai, .qwen, .minimax: return true
+        case .custom, .zai, .qwen, .minimax, .xai: return true
         default: return false
         }
     }
@@ -102,6 +107,14 @@ enum LLMProvider: String, CaseIterable {
         switch self {
         case .local, .appleOnDevice: return false
         default: return true
+        }
+    }
+
+    /// Whether this provider uses a subscription token instead of a raw API key
+    var isSubscriptionBased: Bool {
+        switch self {
+        case .xai, .zai, .qwen, .minimax: return true
+        default: return false
         }
     }
 
@@ -496,7 +509,7 @@ class LLMService: ObservableObject {
             rawResponse = try await sendLocal(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
         case .appleOnDevice:
             rawResponse = try await sendAppleOnDevice(text, systemPrompt: fullPrompt)
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai:
             rawResponse = try await sendOpenAICompatible(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
         }
 
@@ -561,7 +574,7 @@ class LLMService: ObservableObject {
             return try await sendLocal(text, systemPrompt: system, config: config, includeTools: false, imageData: nil)
         case .appleOnDevice:
             return try await sendAppleOnDevice(text, systemPrompt: system)
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai:
             return try await sendOpenAICompatible(text, systemPrompt: system, config: config, includeTools: false, imageData: nil)
         }
     }
@@ -788,7 +801,7 @@ class LLMService: ObservableObject {
                       let text = content.first?["text"] as? String else { return nil }
                 return text
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -882,7 +895,7 @@ class LLMService: ObservableObject {
                       let text = content.first?["text"] as? String else { return nil }
                 return text
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -986,7 +999,7 @@ class LLMService: ObservableObject {
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
                 return StructuredVisionParser.anthropic(data, toolName: toolName)
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -1080,7 +1093,7 @@ class LLMService: ObservableObject {
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
                 return StructuredVisionParser.anthropic(data, toolName: toolName)
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -1156,7 +1169,7 @@ class LLMService: ObservableObject {
             return try await sendGemini(text, systemPrompt: systemPrompt, config: config, includeTools: includeTools, imageData: nil)
         case .local, .appleOnDevice:
             throw LLMError.missingAPIKey("Local providers cannot be used as cloud agent")
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai:
             return try await sendOpenAICompatible(text, systemPrompt: systemPrompt, config: config, includeTools: includeTools, imageData: nil)
         }
     }

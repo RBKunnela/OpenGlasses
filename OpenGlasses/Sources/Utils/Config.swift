@@ -244,7 +244,7 @@ struct ModelConfig: Codable, Identifiable, Equatable {
             // OpenRouter supports vision for many models
             let lowerModel = model.lowercased()
             return lowerModel.contains("claude") || lowerModel.contains("gpt-4") || lowerModel.contains("gemini") || lowerModel.contains("vision") || lowerModel.contains("llava")
-        case .zai, .minimax, .custom:
+        case .zai, .minimax, .custom, .xai:
             let lowerModel = model.lowercased()
             let lowerBaseURL = baseURL.lowercased()
 
