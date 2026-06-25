@@ -83,7 +83,10 @@ class OpenClawBridge: ObservableObject {
 
     private var isConnecting = false
     private var keepaliveTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
     private var lastConnectionAttempt = Date.distantPast
+    private var reconnectBackoffSeconds: TimeInterval = 1.0
+    private var lastSuccessfulSend = Date()
 
     /// WebSocket for chat (`chat.send`)
     private var webSocketTask: URLSessionWebSocketTask?
@@ -348,8 +351,10 @@ class OpenClawBridge: ObservableObject {
             lastCheckedURL = nil
             return
         }
-        if isConnecting || (wsConnected && webSocketTask != nil) {
-            return // already good or connecting
+        // In iMetaClaw exclusive mode prioritize one persistent socket.
+        // Only allow a new check if we don't have a healthy live task.
+        if isConnecting || (wsConnected && webSocketTask != nil && webSocketTask?.closeCode == .invalid) {
+            return
         }
         connectionState = .checking
         let endpoint = await resolveEndpoint()
@@ -496,11 +501,15 @@ class OpenClawBridge: ObservableObject {
 
     /// Ensure WebSocket is connected and authenticated
     private func ensureWebSocket() async throws {
-        if wsConnected, webSocketTask != nil { return }
+        // Strong guard: if we have a live task that is not closed, trust it
+        if let task = webSocketTask, task.closeCode == .invalid, wsConnected {
+            return
+        }
         if isConnecting { return }
 
-        // Simple backoff to avoid storm of reconnects
-        if Date().timeIntervalSince(lastConnectionAttempt) < 3 {
+        // Exponential-ish backoff to avoid reconnect storm (6s drops were causing rapid attempts)
+        let sinceLast = Date().timeIntervalSince(lastConnectionAttempt)
+        if sinceLast < reconnectBackoffSeconds {
             return
         }
         lastConnectionAttempt = Date()
@@ -578,16 +587,35 @@ class OpenClawBridge: ObservableObject {
 
     private func startKeepalive() {
         keepaliveTask?.cancel()
+        reconnectBackoffSeconds = 1.0
         keepaliveTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 15_000_000_000) // 15s
+                try? await Task.sleep(nanoseconds: 10_000_000_000) // 10s — more frequent to beat proxy idle (~6s symptoms)
                 guard let self = self,
                       !Task.isCancelled,
-                      self.wsConnected,
                       let task = self.webSocketTask else { break }
-                task.sendPing { error in
+
+                // Control frame ping
+                task.sendPing { [weak self] error in
                     if let error = error {
                         NSLog("[OpenClaw] WS ping failed: %@", error.localizedDescription)
+                    } else {
+                        self?.lastSuccessfulSend = Date()
+                    }
+                }
+
+                // Lightweight application-level activity to keep Caddy/Maia WS happy (proxies often ignore pure pings)
+                if self.wsConnected {
+                    let hb: [String: Any] = [
+                        "type": "req",
+                        "id": UUID().uuidString,
+                        "method": "sessions.ping",
+                        "params": ["t": Int(Date().timeIntervalSince1970)]
+                    ]
+                    if let data = try? JSONSerialization.data(withJSONObject: hb),
+                       let str = String(data: data, encoding: .utf8) {
+                        try? await task.send(.string(str))
+                        self.lastSuccessfulSend = Date()
                     }
                 }
             }
@@ -783,31 +811,36 @@ class OpenClawBridge: ObservableObject {
                         }
                     }
                 } catch {
-                    NSLog("[OpenClaw] WS receive error: %@", error.localizedDescription)
-                    // Do not immediately kill the connection on transient receive errors.
-                    // Let upper layers / next ensure decide.
-                    // Only clear pending if we are truly disconnected.
+                    NSLog("[OpenClaw] WS receive error/close: %@", error.localizedDescription)
+                    // The server (or Caddy) closed us — common for idle ~6s or proxy timeouts.
+                    // Force the task dead so next ensure creates a fresh one.
+                    let wasTask = self.webSocketTask
+                    self.webSocketTask = nil
+                    self.wsConnected = false
+                    self.webSocketReady = false
+
                     await MainActor.run {
-                        if !self.wsConnected || self.webSocketTask == nil {
-                            for (_, cont) in self.pendingResponses {
-                                cont.resume(throwing: error)
-                            }
-                            self.pendingResponses.removeAll()
-                            for (_, cont) in self.pendingRunCompletions {
-                                cont.resume(throwing: error)
-                            }
-                            self.pendingRunCompletions.removeAll()
-                            self.pendingRunText.removeAll()
+                        for (_, cont) in self.pendingResponses {
+                            cont.resume(throwing: error)
                         }
+                        self.pendingResponses.removeAll()
+                        for (_, cont) in self.pendingRunCompletions {
+                            cont.resume(throwing: error)
+                        }
+                        self.pendingRunCompletions.removeAll()
+                        self.pendingRunText.removeAll()
                     }
-                    // For persistent connection: on receive error, wait a bit and let ensure reconnect if needed.
-                    // Do not break if we can recover.
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                    if self.webSocketTask == nil {
-                        // attempt to re-establish
-                        Task { [weak self] in
-                            try? await self?.ensureWebSocket()
-                        }
+
+                    // Increase backoff (cap at 30s) with jitter to avoid thundering herd
+                    self.reconnectBackoffSeconds = min(30.0, self.reconnectBackoffSeconds * 1.6 + Double.random(in: 0...0.8))
+                    NSLog("[OpenClaw] Scheduling reconnect in %.1fs (backoff)", self.reconnectBackoffSeconds)
+
+                    // Schedule a single reconnect attempt (cancels previous)
+                    self.reconnectTask?.cancel()
+                    self.reconnectTask = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64(self?.reconnectBackoffSeconds ?? 3 * 1_000_000_000))
+                        guard let self = self, !Task.isCancelled else { return }
+                        try? await self.ensureWebSocket()
                     }
                     continue
                 }
@@ -879,10 +912,13 @@ class OpenClawBridge: ObservableObject {
         connectChallengeNonce = nil
         connectChallengeWaiter?.resume(throwing: NSError(domain: "OpenClaw", code: -5, userInfo: [NSLocalizedDescriptionKey: "Disconnected"]))
         connectChallengeWaiter = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         webSocketTask = nil
         wsSession?.invalidateAndCancel()
         wsSession = nil
+        reconnectBackoffSeconds = 1.0
         let disconnectError = NSError(domain: "OpenClaw", code: -5, userInfo: [NSLocalizedDescriptionKey: "Disconnected"])
         for (_, cont) in pendingResponses {
             cont.resume(throwing: disconnectError)
