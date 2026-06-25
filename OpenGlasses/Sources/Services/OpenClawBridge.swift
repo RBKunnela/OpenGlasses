@@ -38,11 +38,13 @@ enum ResolvedConnection: Equatable {
 // MARK: - OpenClaw Bridge
 
 /// Client for the OpenClaw gateway. Uses /health for status checks and
-/// WebSocket protocol v3 (sessions.send) for chat / task delegation.
+/// WebSocket protocol v3/v4 (`chat.send` + `agent.wait`) for chat / task delegation.
 @MainActor
 class OpenClawBridge: ObservableObject {
     @Published var lastToolCallStatus: ToolCallStatus = .idle
     @Published var connectionState: OpenClawConnectionState = .notConfigured
+    /// True only after a successful WebSocket handshake (what voice/chat actually needs).
+    @Published var webSocketReady = false
     @Published var resolvedConnection: ResolvedConnection?
     /// Which gateway we're currently connected to (nil = legacy single config).
     @Published var activeGatewayName: String?
@@ -50,6 +52,12 @@ class OpenClawBridge: ObservableObject {
     @Published var availableGatewayTools: [[String: String]] = []
     /// Whether session compaction has occurred (gateway trimmed context).
     @Published var sessionCompacted: Bool = false
+    /// Last `/health` URL probed — shown in Settings when the gateway looks offline.
+    @Published var lastCheckedURL: String?
+    /// Human-readable result from the last full connection probe.
+    @Published var lastProbeSummary: String = ""
+    /// Detail from the last connection attempt (WebSocket / pairing / token errors).
+    @Published var lastConnectionDetail: String = ""
 
     private let pingSession: URLSession
     private let lanPingSession: URLSession
@@ -60,11 +68,18 @@ class OpenClawBridge: ObservableObject {
     /// The gateway config that resolved to the cached endpoint
     private var activeGateway: GatewayConfig?
 
-    /// WebSocket for chat (sessions.send)
+    /// WebSocket for chat (`chat.send`)
     private var webSocketTask: URLSessionWebSocketTask?
     private var wsSession: URLSession?
     private var wsConnected = false
+    private var receiveLoopRunning = false
     private var pendingResponses: [String: CheckedContinuation<String, Error>] = [:]
+    /// Accumulated assistant text per chat.run while waiting for completion.
+    private var pendingRunText: [String: String] = [:]
+    private var pendingRunCompletions: [String: CheckedContinuation<String, Error>] = [:]
+    private var connectChallengeReceived = false
+    private var connectChallengeNonce: String?
+    private var connectChallengeWaiter: CheckedContinuation<Void, Error>?
 
     /// Callback for streaming partial content chunks from long gateway tasks.
     /// Called on main actor with each text chunk as it arrives.
@@ -146,9 +161,9 @@ class OpenClawBridge: ObservableObject {
     /// Legacy: resolve from the single Config.openClaw* properties.
     private func resolveLegacyEndpoint() async -> String {
         let mode = Config.openClawConnectionMode
-        let lanHost = Config.openClawLanHost.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let lanURL = "\(lanHost):\(Config.openClawPort)"
-        let tunnelURL = Config.openClawTunnelHost.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let lanHost = Config.openClawLanHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lanURL = GatewayEndpoint.sanitize(lanHost.contains("://") ? lanHost : "\(lanHost):\(Config.openClawPort)")
+        let tunnelURL = GatewayEndpoint.sanitize(Config.openClawTunnelHost)
 
         switch mode {
         case .lan:
@@ -192,9 +207,9 @@ class OpenClawBridge: ObservableObject {
 
         // Legacy fallback
         guard Config.openClawConnectionMode == .auto else { return nil }
-        let lanHost = Config.openClawLanHost.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let lanURL = "\(lanHost):\(Config.openClawPort)"
-        let tunnelURL = Config.openClawTunnelHost.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let lanHost = Config.openClawLanHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lanURL = GatewayEndpoint.sanitize(lanHost.contains("://") ? lanHost : "\(lanHost):\(Config.openClawPort)")
+        let tunnelURL = GatewayEndpoint.sanitize(Config.openClawTunnelHost)
         if cachedEndpoint == lanURL, !tunnelURL.isEmpty { return tunnelURL }
         if cachedEndpoint == tunnelURL { return lanURL }
         return nil
@@ -213,25 +228,99 @@ class OpenClawBridge: ObservableObject {
         activeGateway?.token ?? Config.openClawGatewayToken
     }
 
-    /// Check reachability using /health endpoint
+    /// Check reachability using /health endpoint (tries multiple URL variants and auth styles).
     private func isReachable(baseURL: String, token: String? = nil, session: URLSession) async -> Bool {
-        let normalized = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
-        guard let url = URL(string: "\(normalized)/health") else { return false }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
         let authToken = token ?? activeToken
-        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-        do {
-            let (data, response) = try await session.data(for: request)
-            if let http = response as? HTTPURLResponse {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                NSLog("[OpenClaw] Health %@ → HTTP %d (%@)", url.absoluteString, http.statusCode, String(body.prefix(100)))
-                return (200...299).contains(http.statusCode)
-            }
-        } catch {
-            NSLog("[OpenClaw] Health %@ failed: %@", url.absoluteString, error.localizedDescription)
-        }
+        let probe = await performHealthProbe(endpoint: baseURL, token: authToken, session: session)
+        if case .success = probe { return true }
         return false
+    }
+
+    private enum HealthProbeResult {
+        case success(workingBase: String, lastURL: String)
+        /// Server answered (wrong path/token/nginx) — not a pure network failure.
+        case serverResponded(detail: String, lastURL: String, workingBase: String?)
+        case networkFailure(detail: String, lastURL: String)
+    }
+
+    private func performHealthProbe(
+        endpoint: String,
+        token: String,
+        session: URLSession = URLSession.shared
+    ) async -> HealthProbeResult {
+        let requests = GatewayEndpoint.healthProbeRequests(from: endpoint, token: token)
+        guard !requests.isEmpty else {
+            return .networkFailure(detail: "URL inválida", lastURL: endpoint)
+        }
+
+        var lastHTTPDetail = ""
+        var lastNetworkDetail = ""
+        var lastHTTPBase: String?
+        var gotHTTPResponse = false
+
+        for (url, style) in requests {
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            GatewayEndpoint.applyHealthAuth(style, token: token, to: &request)
+            do {
+                let (data, response) = try await session.data(for: request)
+                if let http = response as? HTTPURLResponse {
+                    gotHTTPResponse = true
+                    let body = String(data: data, encoding: .utf8) ?? ""
+                    let workingBase = url.deletingLastPathComponent().absoluteString
+                    NSLog(
+                        "[OpenClaw] Health %@ (%@) → HTTP %d (%@)",
+                        url.absoluteString,
+                        style.label,
+                        http.statusCode,
+                        String(body.prefix(100))
+                    )
+                    if (200...299).contains(http.statusCode) {
+                        return .success(workingBase: workingBase, lastURL: url.absoluteString)
+                    }
+                    lastHTTPDetail = "HTTP \(http.statusCode) (\(style.label)) em \(url.host ?? url.absoluteString)"
+                    lastHTTPBase = workingBase
+                }
+            } catch {
+                lastNetworkDetail = "\(url.host ?? url.absoluteString): \(friendlyNetworkError(error))"
+                NSLog("[OpenClaw] Health %@ (%@) failed: %@", url.absoluteString, style.label, error.localizedDescription)
+            }
+        }
+
+        if gotHTTPResponse {
+            return .serverResponded(
+                detail: lastHTTPDetail,
+                lastURL: requests.last?.url.absoluteString ?? endpoint,
+                workingBase: lastHTTPBase
+            )
+        }
+
+        let triedHosts = Set(GatewayEndpoint.candidateBases(from: endpoint)).joined(separator: ", ")
+        let detail = lastNetworkDetail.isEmpty
+            ? "Sem resposta do servidor. Tentou: \(triedHosts)"
+            : "\(lastNetworkDetail). Tentou: \(triedHosts)"
+        return .networkFailure(detail: detail, lastURL: requests.last?.url.absoluteString ?? endpoint)
+    }
+
+    private func friendlyNetworkError(_ error: Error) -> String {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorCannotFindHost: return "host não encontrado"
+            case NSURLErrorCannotConnectToHost: return "conexão recusada — gateway provavelmente só em 127.0.0.1 no VPS"
+            case NSURLErrorTimedOut: return "timeout — firewall ou porta 18789 fechada"
+            case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted:
+                return "falha TLS/SSL — certificado inválido ou HTTPS em porta errada"
+            case NSURLErrorNotConnectedToInternet: return "iPhone sem internet"
+            default: break
+            }
+        }
+        return error.localizedDescription
+    }
+
+    private func probeHealth(endpoint: String, token: String) async -> HealthProbeResult {
+        await performHealthProbe(endpoint: endpoint, token: token, session: pingSession)
     }
 
     // MARK: - Connection Check
@@ -239,36 +328,99 @@ class OpenClawBridge: ObservableObject {
     func checkConnection() async {
         guard Config.isAnyGatewayConfigured else {
             connectionState = .notConfigured
+            lastCheckedURL = nil
             return
         }
         connectionState = .checking
         let endpoint = await resolveEndpoint()
-        let normalized = endpoint.hasSuffix("/") ? String(endpoint.dropLast()) : endpoint
-
-        guard let url = URL(string: "\(normalized)/health") else {
-            connectionState = .unreachable("Invalid URL")
-            return
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("Bearer \(activeToken)", forHTTPHeaderField: "Authorization")
-        do {
-            let (data, response) = try await pingSession.data(for: request)
-            if let http = response as? HTTPURLResponse {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                NSLog("[OpenClaw] Health %@ → HTTP %d (%@)", url.absoluteString, http.statusCode, body)
-                if (200...299).contains(http.statusCode) {
-                    connectionState = .connected
-                    NSLog("[OpenClaw] Gateway connected via %@", resolvedConnection?.label ?? "unknown")
-                    return
-                }
-                connectionState = .unreachable("HTTP \(http.statusCode)")
-                return
+        let probe = await probeHealth(endpoint: endpoint, token: activeToken)
+        switch probe {
+        case .success(let workingBase, let lastURL):
+            lastCheckedURL = lastURL
+            cachedEndpoint = workingBase
+            await finishHTTPConnected(endpoint: endpoint, workingBase: workingBase)
+        case .serverResponded(let detail, let lastURL, let workingBase):
+            lastCheckedURL = lastURL
+            webSocketReady = false
+            if let workingBase {
+                cachedEndpoint = workingBase
+                connectionState = .connected
+                lastConnectionDetail = Self.authFailureHint(detail: detail)
+                NSLog("[OpenClaw] HTTP reachable but health rejected: %@", detail)
+            } else {
+                connectionState = .unreachable(Self.offlineHint(endpoint: endpoint, detail: detail))
+                lastConnectionDetail = detail
             }
-        } catch {
-            NSLog("[OpenClaw] Health check failed: %@", error.localizedDescription)
+        case .networkFailure(let detail, let lastURL):
+            lastCheckedURL = lastURL
+            webSocketReady = false
+            lastConnectionDetail = detail
+            connectionState = .unreachable(Self.offlineHint(endpoint: endpoint, detail: detail))
         }
-        connectionState = .unreachable("Gateway not responding")
+    }
+
+    private func finishHTTPConnected(endpoint: String, workingBase: String) async {
+        NSLog("[OpenClaw] HTTP health OK via %@ (%@)", workingBase, resolvedConnection?.label ?? "unknown")
+        connectionState = .connected
+        do {
+            try await ensureWebSocket()
+            webSocketReady = true
+            lastConnectionDetail = ""
+            NSLog("[OpenClaw] WebSocket handshake OK — pronto para voz")
+        } catch {
+            webSocketReady = false
+            lastConnectionDetail = Self.webSocketFailureHint(endpoint: workingBase, error: error)
+            NSLog("[OpenClaw] HTTP OK but WebSocket failed: %@", lastConnectionDetail)
+        }
+    }
+
+    private static func webSocketFailureHint(endpoint: String, error: Error) -> String {
+        let raw = error.localizedDescription
+        var lines = [raw]
+        if GatewayEndpoint.isMaiaHost(endpoint) {
+            lines.append("""
+            Maia (KVM2) connection issue.
+            See the current server contract: /opt/openclaw/SERVER-CONTRACT-FOR-GROK.md
+            - Token comes from OPENCLAW_TOKEN in /opt/maia/.env (not openclaw CLI)
+            - Caddy must proxy to 127.0.0.1:3600 (Maia Command Center), NOT 18789
+            - Test the exact WS URL the app uses.
+            """)
+        } else if raw.localizedCaseInsensitiveContains("403")
+            || raw.localizedCaseInsensitiveContains("401")
+            || raw.localizedCaseInsensitiveContains("rejected") {
+            lines.append("Verifique token do gateway e se Caddy expõe /ws com WebSocket upgrade.")
+        }
+        return lines.joined(separator: "\n\n")
+    }
+
+    private static func authFailureHint(detail: String) -> String {
+        """
+        Servidor alcançado, mas /health falhou: \(detail)
+
+        • Use the correct OPENCLAW_TOKEN from /opt/maia/.env (see SERVER-CONTRACT-FOR-GROK.md)
+        • Caddy on this deployment proxies to :3600 (Maia Command Center)
+        """
+    }
+
+    /// Drop cached routing and stale WebSocket before a voice/chat turn.
+    func refreshConnectionForChat() async {
+        clearCachedEndpoint()
+        disconnectWebSocket()
+        await checkConnection()
+    }
+
+    private static func offlineHint(endpoint: String, detail: String) -> String {
+        """
+        \(detail)
+
+        URL configurada: \(endpoint)
+
+        IMPORTANT: This deployment does NOT use a standard openclaw binary on :18789.
+        Current working path (per SERVER-CONTRACT-FOR-GROK.md):
+        - Caddy :443 → Maia Command Center on 127.0.0.1:3600
+        - Token = OPENCLAW_TOKEN from /opt/maia/.env
+        - Read /opt/openclaw/SERVER-CONTRACT-FOR-GROK.md for the exact contract.
+        """
     }
 
     // MARK: - Session Management
@@ -278,9 +430,43 @@ class OpenClawBridge: ObservableObject {
         NSLog("[OpenClaw] New session: %@", sessionKey)
     }
 
+    /// Stable glasses session — shares the main agent session (same Maia as Telegram).
     private static func newSessionKey() -> String {
-        let ts = ISO8601DateFormatter().string(from: Date())
-        return "agent:main:glass:\(ts)"
+        let storageKey = "openClawGlassesSessionKey"
+        if let existing = UserDefaults.standard.string(forKey: storageKey), !existing.isEmpty {
+            return existing
+        }
+        let key = "agent:main:main"
+        UserDefaults.standard.set(key, forKey: storageKey)
+        return key
+    }
+
+    private static func connectParams(token: String, challengeNonce: String?) -> [String: Any] {
+        var params: [String: Any] = [
+            "minProtocol": 3,
+            "maxProtocol": 4,
+            "role": "operator",
+            "scopes": ["operator.read", "operator.write"],
+            "caps": [] as [String],
+            "commands": [] as [String],
+            "permissions": [:] as [String: Any],
+            "client": [
+                "id": "cli",
+                "displayName": "OpenGlasses",
+                "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
+                "platform": "ios",
+                "mode": "ui"
+            ] as [String: Any],
+            "auth": ["token": token],
+            "locale": Locale.current.identifier,
+            "userAgent": "OpenGlasses/ios"
+        ]
+        if let nonce = challengeNonce, !nonce.isEmpty,
+           let device = OpenClawDeviceIdentity.connectDevice(token: token, nonce: nonce) {
+            params["device"] = device
+            NSLog("[OpenClaw] Connect includes device identity %@", OpenClawDeviceIdentity.loadOrCreate().deviceId)
+        }
+        return params
     }
 
     // MARK: - WebSocket Chat
@@ -288,95 +474,188 @@ class OpenClawBridge: ObservableObject {
     /// Ensure WebSocket is connected and authenticated
     private func ensureWebSocket() async throws {
         if wsConnected, webSocketTask != nil { return }
+        if webSocketTask != nil {
+            disconnectWebSocket()
+        }
 
         let endpoint = await resolveEndpoint()
-        let normalized = endpoint.hasSuffix("/") ? String(endpoint.dropLast()) : endpoint
-        let wsURL = normalized
-            .replacingOccurrences(of: "https://", with: "wss://")
-            .replacingOccurrences(of: "http://", with: "ws://")
         let token = activeToken
 
-        guard let url = URL(string: "\(wsURL)/ws?token=\(token)") else {
-            throw NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid WebSocket URL"])
+        guard let url = GatewayEndpoint.webSocketURL(from: endpoint, token: token) else {
+            throw NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "URL WebSocket inválida — verifique o host do gateway."])
         }
 
         NSLog("[OpenClaw] WS connecting to %@", url.absoluteString)
+        connectChallengeReceived = false
+        connectChallengeNonce = nil
+        connectChallengeWaiter = nil
+
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         wsSession = URLSession(configuration: config)
 
-        // Build request with X-Scopes header (OpenClaw protocol v3 requirement)
         var request = URLRequest(url: url)
-        request.setValue("chat,skills,sessions,config,tools", forHTTPHeaderField: "X-Scopes")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         webSocketTask = wsSession?.webSocketTask(with: request)
         webSocketTask?.resume()
+        startReceiveLoop()
 
-        // Wait for connect.challenge
-        let challengeMsg = try await receiveMessage()
-        NSLog("[OpenClaw] WS received: %@", String(challengeMsg.prefix(100)))
+        try await waitForConnectChallenge(endpoint: endpoint)
+        if GatewayEndpoint.isRemote(endpoint),
+           connectChallengeNonce == nil || connectChallengeNonce?.isEmpty == true {
+            disconnectWebSocket()
+            throw NSError(
+                domain: "OpenClaw",
+                code: -8,
+                userInfo: [NSLocalizedDescriptionKey: "O iPhone não alcançou o WebSocket do VPS em \(endpoint). Veja o contrato atual em /opt/openclaw/SERVER-CONTRACT-FOR-GROK.md — Caddy deve apontar para o Maia Command Center em :3600."]
+            )
+        }
+        let connectResponse = try await performConnectHandshake(token: token)
+        guard connectResponse["ok"] as? Bool == true else {
+            let message = Self.formatGatewayError(from: connectResponse)
+            NSLog("[OpenClaw] WS connect failed: %@", message)
+            disconnectWebSocket()
+            throw NSError(domain: "OpenClaw", code: -2, userInfo: [NSLocalizedDescriptionKey: message])
+        }
 
-        // Send connect handshake — register as "node" with device capabilities
+        wsConnected = true
+        webSocketReady = true
+        sessionCompacted = false
+        storeDeviceTokenIfPresent(from: connectResponse)
+        NSLog("[OpenClaw] WS connected as operator (chat.send ready)")
+
+        do {
+            let sub = try await sendRequest(method: "sessions.messages.subscribe", params: ["key": sessionKey])
+            if sub["ok"] as? Bool != true {
+                NSLog("[OpenClaw] sessions.messages.subscribe failed: %@", String(describing: sub))
+            }
+        } catch {
+            NSLog("[OpenClaw] sessions.messages.subscribe error: %@", error.localizedDescription)
+        }
+        Task { await queryAvailableTools() }
+        onGatewayConnected?()
+    }
+
+    private func waitForConnectChallenge(endpoint: String, timeoutSeconds: UInt64 = 20) async throws {
+        if connectChallengeReceived, connectChallengeNonce != nil { return }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connectChallengeWaiter = continuation
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+                guard let waiter = self.connectChallengeWaiter else { return }
+                self.connectChallengeWaiter = nil
+                if GatewayEndpoint.isRemote(endpoint), self.connectChallengeNonce == nil {
+                    waiter.resume(throwing: NSError(
+                        domain: "OpenClaw",
+                        code: -8,
+                        userInfo: [NSLocalizedDescriptionKey: "Timeout: VPS não respondeu ao WebSocket em \(endpoint)."]
+                    ))
+                    return
+                }
+                // Older LAN gateways may skip the challenge.
+                waiter.resume()
+            }
+        }
+    }
+
+    /// Full diagnostic: HTTP health + WebSocket handshake + device identity.
+    func probeConnection() async -> String {
+        clearCachedEndpoint()
+        disconnectWebSocket()
+        let deviceId = OpenClawDeviceIdentity.loadOrCreate().deviceId
+        var lines: [String] = [
+            "Device ID do iPhone: \(deviceId)",
+            "(deve aparecer em `openclaw devices list` no VPS após este teste)"
+        ]
+        await checkConnection()
+        if let health = lastCheckedURL {
+            lines.append("Health URL: \(health)")
+        }
+        switch connectionState {
+        case .connected:
+            lines.append("HTTP /health: OK")
+        case .unreachable(let reason):
+            lines.append("HTTP /health: FALHOU — \(reason)")
+        case .checking:
+            lines.append("HTTP /health: testando…")
+        case .notConfigured:
+            lines.append("Gateway não configurado no app.")
+            lastProbeSummary = lines.joined(separator: "\n")
+            return lastProbeSummary
+        }
+
+        do {
+            try await ensureWebSocket()
+            lines.append("WebSocket + handshake: OK — Maia pode receber mensagens dos óculos.")
+            lines.append("Check the server contract at /opt/openclaw/SERVER-CONTRACT-FOR-GROK.md (this deployment does not use openclaw CLI devices commands).")
+        } catch {
+            lines.append("WebSocket: FALHOU — \(error.localizedDescription)")
+            lines.append("Enquanto isso falhar, a Maia NÃO recebe nada pelos óculos (Telegram continua separado).")
+        }
+
+        lastProbeSummary = lines.joined(separator: "\n")
+        return lastProbeSummary
+    }
+
+    private func performConnectHandshake(token: String) async throws -> [String: Any] {
+        guard let task = webSocketTask else {
+            throw NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "WebSocket não iniciou — o servidor pode ter recusado a conexão."])
+        }
+
         let connectId = UUID().uuidString
         let connectMsg: [String: Any] = [
             "type": "req",
             "id": connectId,
             "method": "connect",
-            "params": [
-                "minProtocol": 3,
-                "maxProtocol": 3,
-                "client": [
-                    "id": "gateway-client",
-                    "displayName": "OpenGlasses",
-                    "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
-                    "platform": "ios",
-                    "mode": "node"
-                ] as [String: Any],
-                "auth": [
-                    "token": token
-                ]
-            ] as [String: Any]
+            "params": Self.connectParams(token: token, challengeNonce: connectChallengeNonce)
         ]
-
         let connectData = try JSONSerialization.data(withJSONObject: connectMsg)
-        let connectJSON = String(data: connectData, encoding: .utf8)!
+        guard let connectJSON = String(data: connectData, encoding: .utf8) else {
+            throw NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "Falha ao codificar handshake"])
+        }
+
         NSLog("[OpenClawWS] Sending connect: %@", String(connectJSON.prefix(500)))
-        try await webSocketTask!.send(.string(connectJSON))
-
-        // Wait for connect response
-        let response = try await receiveMessage()
-        if let data = response.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let ok = json["ok"] as? Bool, ok {
-            wsConnected = true
-            sessionCompacted = false
-            NSLog("[OpenClaw] WS connected as node with capabilities")
-            startReceiveLoop()
-
-            // Query available tools from gateway (fire-and-forget, non-blocking)
-            Task { await queryAvailableTools() }
-            onGatewayConnected?()
-        } else {
-            NSLog("[OpenClaw] WS connect failed: %@", String(response.prefix(300)))
-            throw NSError(domain: "OpenClaw", code: -2, userInfo: [NSLocalizedDescriptionKey: "WebSocket auth failed: \(String(response.prefix(200)))"])
+        let responseText: String = try await withCheckedThrowingContinuation { continuation in
+            pendingResponses[connectId] = continuation
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                if let cont = self.pendingResponses.removeValue(forKey: connectId) {
+                    cont.resume(throwing: NSError(
+                        domain: "OpenClaw",
+                        code: -2,
+                        userInfo: [NSLocalizedDescriptionKey: "Handshake com o gateway expirou."]
+                    ))
+                }
+            }
+            Task {
+                do {
+                    try await task.send(.string(connectJSON))
+                } catch {
+                    await MainActor.run {
+                        if let cont = self.pendingResponses.removeValue(forKey: connectId) {
+                            cont.resume(throwing: error)
+                        }
+                    }
+                }
+            }
         }
+
+        guard let responseData = responseText.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
+            throw NSError(domain: "OpenClaw", code: -4, userInfo: [NSLocalizedDescriptionKey: "Resposta inválida do gateway no handshake."])
+        }
+        return json
     }
 
-    private func receiveMessage() async throws -> String {
-        guard let task = webSocketTask else {
-            throw NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "No WebSocket"])
-        }
-        let msg = try await task.receive()
-        switch msg {
-        case .string(let text): return text
-        case .data(let data): return String(data: data, encoding: .utf8) ?? ""
-        @unknown default: return ""
-        }
-    }
-
-    /// Background receive loop — routes responses to pending continuations
+    /// Background receive loop — routes responses to pending continuations.
+    /// Runs during handshake (`wsConnected == false`) and after auth.
     private func startReceiveLoop() {
+        guard !receiveLoopRunning else { return }
+        receiveLoopRunning = true
         Task { [weak self] in
-            while let self, let task = self.webSocketTask, self.wsConnected {
+            guard let self else { return }
+            defer { self.receiveLoopRunning = false }
+            while let task = self.webSocketTask {
                 do {
                     let msg = try await task.receive()
                     let text: String
@@ -402,18 +681,24 @@ class OpenClawBridge: ObservableObject {
                         let event = json["event"] as? String ?? ""
                         let payload = json["payload"] as? [String: Any] ?? [:]
 
+                        if event == "connect.challenge" {
+                            await MainActor.run {
+                                self.connectChallengeNonce = payload["nonce"] as? String
+                                self.connectChallengeReceived = true
+                                self.connectChallengeWaiter?.resume()
+                                self.connectChallengeWaiter = nil
+                            }
+                        }
+
                         switch event {
                         case "session.compacted", "session.truncated":
                             await MainActor.run {
                                 self.sessionCompacted = true
                                 NSLog("[OpenClaw] Session compacted by gateway")
                             }
-                        case "session.chunk", "stream.chunk":
-                            // Streaming partial result — forward to TTS for early speech
-                            if let chunk = payload["content"] as? String, !chunk.isEmpty {
-                                await MainActor.run {
-                                    self.onStreamChunk?(chunk)
-                                }
+                        case "session.chunk", "stream.chunk", "chat", "agent", "session.message":
+                            await MainActor.run {
+                                self.handleStreamingChatPayload(event: event, payload: payload)
                             }
                         default:
                             break // Other events handled by OpenClawEventClient
@@ -423,11 +708,15 @@ class OpenClawBridge: ObservableObject {
                     NSLog("[OpenClaw] WS receive error: %@", error.localizedDescription)
                     await MainActor.run {
                         self.wsConnected = false
-                        // Fail all pending requests
                         for (_, cont) in self.pendingResponses {
                             cont.resume(throwing: error)
                         }
                         self.pendingResponses.removeAll()
+                        for (_, cont) in self.pendingRunCompletions {
+                            cont.resume(throwing: error)
+                        }
+                        self.pendingRunCompletions.removeAll()
+                        self.pendingRunText.removeAll()
                     }
                     break
                 }
@@ -458,7 +747,10 @@ class OpenClawBridge: ObservableObject {
         ]
 
         let data = try JSONSerialization.data(withJSONObject: msg)
-        try await task.send(.string(String(data: data, encoding: .utf8)!))
+        guard let payload = String(data: data, encoding: .utf8) else {
+            throw NSError(domain: "OpenClaw", code: -4, userInfo: [NSLocalizedDescriptionKey: "Invalid request encoding"])
+        }
+        try await task.send(.string(payload))
 
         // Wait for response with timeout
         let responseText: String = try await withCheckedThrowingContinuation { continuation in
@@ -480,19 +772,36 @@ class OpenClawBridge: ObservableObject {
             throw NSError(domain: "OpenClaw", code: -4, userInfo: [NSLocalizedDescriptionKey: "Invalid response"])
         }
 
+        if let ok = json["ok"] as? Bool, !ok {
+            let message = Self.formatGatewayError(from: json)
+            throw NSError(domain: "OpenClaw", code: -7, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
         return json
     }
 
     func disconnectWebSocket() {
         wsConnected = false
+        webSocketReady = false
+        receiveLoopRunning = false
+        connectChallengeReceived = false
+        connectChallengeNonce = nil
+        connectChallengeWaiter?.resume(throwing: NSError(domain: "OpenClaw", code: -5, userInfo: [NSLocalizedDescriptionKey: "Disconnected"]))
+        connectChallengeWaiter = nil
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         webSocketTask = nil
         wsSession?.invalidateAndCancel()
         wsSession = nil
+        let disconnectError = NSError(domain: "OpenClaw", code: -5, userInfo: [NSLocalizedDescriptionKey: "Disconnected"])
         for (_, cont) in pendingResponses {
-            cont.resume(throwing: NSError(domain: "OpenClaw", code: -5, userInfo: [NSLocalizedDescriptionKey: "Disconnected"]))
+            cont.resume(throwing: disconnectError)
         }
         pendingResponses.removeAll()
+        for (_, cont) in pendingRunCompletions {
+            cont.resume(throwing: disconnectError)
+        }
+        pendingRunCompletions.removeAll()
+        pendingRunText.removeAll()
     }
 
     // MARK: - Tool Visibility
@@ -683,65 +992,333 @@ class OpenClawBridge: ObservableObject {
 
     // MARK: - Task Delegation
 
-    /// Send a task to the OpenClaw gateway via WebSocket sessions.send.
-    /// Optionally includes an image (e.g. from glasses camera) as base64 JPEG.
+    /// Send a user message to the OpenClaw gateway via WebSocket `chat.send`
+    /// (same path as WebChat / Telegram). Optionally attaches a glasses camera JPEG.
     func delegateTask(
         task: String,
         toolName: String = "execute",
         imageData: Data? = nil
     ) async -> ToolResult {
         lastToolCallStatus = .executing(toolName)
+        NSLog("[OpenClaw] → Maia session=%@ (%d chars): %@", sessionKey, task.count, String(task.prefix(120)))
 
         do {
-            var params: [String: Any] = [
-                "agentId": "main",
-                "sessionKey": sessionKey,
-                "text": task
-            ]
-            if let imageData = imageData {
-                params["imageBase64"] = imageData.base64EncodedString()
-                params["imageMimeType"] = "image/jpeg"
-            }
-            let response = try await sendRequest(method: "sessions.send", params: params)
-
-            let ok = response["ok"] as? Bool ?? false
-            if ok {
-                // Extract result — sessions.send may return the run result directly
-                if let payload = response["payload"] as? [String: Any],
-                   let content = payload["content"] as? String {
-                    NSLog("[OpenClaw] Task result: %@", String(content.prefix(200)))
-                    lastToolCallStatus = .completed(toolName)
-                    return .success(content)
-                }
-                // Some responses just acknowledge the send — the actual result comes via events
-                if let payload = response["payload"] as? [String: Any],
-                   let runId = payload["runId"] as? String {
-                    NSLog("[OpenClaw] Task dispatched, runId: %@", runId)
-                    lastToolCallStatus = .completed(toolName)
-                    return .success("Task dispatched (runId: \(runId))")
-                }
-                lastToolCallStatus = .completed(toolName)
-                return .success("OK")
+            let attachments: [[String: Any]]
+            if let imageData {
+                attachments = [[
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "fileName": "glasses.jpg",
+                    "content": imageData.base64EncodedString()
+                ]]
             } else {
-                let error = response["error"] as? [String: Any]
-                let code = error?["code"] as? String ?? "unknown"
-                let message = error?["message"] as? String ?? "Unknown error"
-                NSLog("[OpenClaw] Task failed: %@ - %@", code, message)
-
-                if message.contains("missing scope") {
-                    lastToolCallStatus = .failed(toolName, "Token needs write permissions")
-                    return .failure("Gateway token needs operator.write scope. Update the token permissions in OpenClaw settings.")
-                }
-
-                lastToolCallStatus = .failed(toolName, message)
-                return .failure("Gateway error: \(message)")
+                attachments = []
             }
+
+            var response: [String: Any]
+            do {
+                response = try await sendAgentMessage(task: task, attachments: attachments)
+            } catch {
+                NSLog("[OpenClaw] agent RPC error: %@ — trying chat.send", error.localizedDescription)
+                response = try await sendChatMessage(task: task, attachments: attachments)
+            }
+            var ok = response["ok"] as? Bool ?? false
+            if !ok {
+                NSLog("[OpenClaw] agent RPC failed — trying chat.send")
+                response = try await sendChatMessage(task: task, attachments: attachments)
+                ok = response["ok"] as? Bool ?? false
+            }
+            guard ok else {
+                let message = Self.formatGatewayError(from: response)
+                NSLog("[OpenClaw] gateway send failed: %@", message)
+                lastToolCallStatus = .failed(toolName, message)
+                return .failure(message)
+            }
+
+            let payload = response["payload"] as? [String: Any] ?? [:]
+            if let inline = Self.extractAssistantText(from: payload), !inline.isEmpty {
+                NSLog("[OpenClaw] chat.send inline result: %@", String(inline.prefix(200)))
+                lastToolCallStatus = .completed(toolName)
+                return .success(inline)
+            }
+
+            guard let runId = payload["runId"] as? String, !runId.isEmpty else {
+                lastToolCallStatus = .failed(toolName, "No run id")
+                return .failure("Gateway accepted the message but did not start a run.")
+            }
+
+            NSLog("[OpenClaw] chat.send dispatched, runId: %@", runId)
+            let content = try await waitForRunCompletion(runId: runId)
+            NSLog("[OpenClaw] Run complete (%d chars): %@", content.count, String(content.prefix(200)))
+            lastToolCallStatus = .completed(toolName)
+            return .success(content)
         } catch {
             NSLog("[OpenClaw] Task error: %@", error.localizedDescription)
-            // Reconnect on next attempt
             disconnectWebSocket()
             lastToolCallStatus = .failed(toolName, error.localizedDescription)
-            return .failure("Gateway error: \(error.localizedDescription)")
+            return .failure(error.localizedDescription)
         }
+    }
+
+    // MARK: - Chat streaming + completion
+
+    private func waitForRunCompletion(runId: String, timeoutSeconds: UInt64 = 120) async throws -> String {
+        if let existing = pendingRunText[runId], !existing.isEmpty {
+            pendingRunText.removeValue(forKey: runId)
+            return existing
+        }
+
+        let text: String = try await withCheckedThrowingContinuation { continuation in
+            pendingRunCompletions[runId] = continuation
+
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+                guard let cont = self.pendingRunCompletions.removeValue(forKey: runId) else { return }
+
+                do {
+                    let fallback = try await self.fetchRunResultViaAgentWait(runId: runId)
+                    if !fallback.isEmpty {
+                        cont.resume(returning: fallback)
+                        return
+                    }
+                    let history = try await self.fetchLastAssistantMessage()
+                    if !history.isEmpty {
+                        cont.resume(returning: history)
+                        return
+                    }
+                } catch {
+                    NSLog("[OpenClaw] Run fallback failed: %@", error.localizedDescription)
+                }
+
+                let partial = self.pendingRunText.removeValue(forKey: runId) ?? ""
+                if !partial.isEmpty {
+                    cont.resume(returning: partial)
+                } else {
+                    cont.resume(throwing: NSError(
+                        domain: "OpenClaw",
+                        code: -3,
+                        userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for \(Config.agentName) to respond."]
+                    ))
+                }
+            }
+        }
+        pendingRunText.removeValue(forKey: runId)
+        return text
+    }
+
+    private func fetchRunResultViaAgentWait(runId: String) async throws -> String {
+        let response = try await sendRequest(method: "agent.wait", params: [
+            "runId": runId,
+            "timeoutMs": 5_000
+        ])
+        guard response["ok"] as? Bool == true else { return "" }
+        let payload = response["payload"] as? [String: Any] ?? [:]
+        return Self.extractAssistantText(from: payload) ?? pendingRunText[runId] ?? ""
+    }
+
+    private func fetchLastAssistantMessage() async throws -> String {
+        let response = try await sendRequest(method: "chat.history", params: [
+            "sessionKey": sessionKey,
+            "limit": 8
+        ])
+        guard response["ok"] as? Bool == true,
+              let payload = response["payload"] as? [String: Any],
+              let messages = payload["messages"] as? [[String: Any]] else {
+            return ""
+        }
+        for message in messages.reversed() {
+            guard (message["role"] as? String) == "assistant" else { continue }
+            if let text = Self.extractAssistantText(from: message), !text.isEmpty {
+                return text
+            }
+        }
+        return ""
+    }
+
+    private func handleStreamingChatPayload(event: String, payload: [String: Any]) {
+        if event == "session.message" {
+            guard (payload["role"] as? String) == "assistant" else { return }
+            if let text = Self.extractAssistantText(from: payload), !text.isEmpty {
+                let runId = payload["runId"] as? String ?? "session"
+                appendStreamDelta(runId: runId, delta: text)
+                if let cont = pendingRunCompletions[runId] {
+                    completeRun(runId: runId, text: pendingRunText[runId] ?? text)
+                }
+            }
+            return
+        }
+
+        if event == "agent" {
+            if let stream = payload["stream"] as? String, stream == "assistant",
+               let data = payload["data"] as? [String: Any] {
+                if let delta = data["delta"] as? String, !delta.isEmpty {
+                    appendStreamDelta(runId: payload["runId"] as? String, delta: delta)
+                } else if let text = data["text"] as? String, !text.isEmpty {
+                    appendStreamDelta(runId: payload["runId"] as? String, delta: text)
+                }
+            }
+            return
+        }
+
+        guard let runId = payload["runId"] as? String else { return }
+        let state = payload["state"] as? String ?? ""
+
+        switch state {
+        case "delta":
+            if let delta = payload["deltaText"] as? String, !delta.isEmpty {
+                appendStreamDelta(runId: runId, delta: delta)
+            } else if let message = payload["message"] as? [String: Any],
+                      let text = Self.extractAssistantText(from: message) {
+                appendStreamDelta(runId: runId, delta: text)
+            }
+        case "final":
+            let text = Self.extractAssistantText(from: payload["message"] as? [String: Any])
+                ?? pendingRunText[runId]
+                ?? ""
+            completeRun(runId: runId, text: text)
+        case "aborted":
+            let text = pendingRunText[runId] ?? Self.extractAssistantText(from: payload["message"] as? [String: Any]) ?? ""
+            completeRun(runId: runId, text: text)
+        case "error":
+            let message = payload["errorMessage"] as? String ?? "Agent run failed"
+            failRun(runId: runId, message: message)
+        default:
+            if let chunk = payload["text"] as? String ?? payload["content"] as? String {
+                appendStreamDelta(runId: runId, delta: chunk)
+            }
+        }
+    }
+
+    private func appendStreamDelta(runId: String?, delta: String) {
+        guard !delta.isEmpty else { return }
+        if let runId {
+            pendingRunText[runId, default: ""] += delta
+        }
+        onStreamChunk?(delta)
+    }
+
+    private func completeRun(runId: String, text: String) {
+        pendingRunText[runId] = text
+        if let cont = pendingRunCompletions.removeValue(forKey: runId) {
+            cont.resume(returning: text)
+        }
+    }
+
+    private func failRun(runId: String, message: String) {
+        pendingRunText.removeValue(forKey: runId)
+        if let cont = pendingRunCompletions.removeValue(forKey: runId) {
+            cont.resume(throwing: NSError(
+                domain: "OpenClaw",
+                code: -6,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            ))
+        }
+    }
+
+    private static func extractAssistantText(from value: Any?) -> String? {
+        switch value {
+        case let string as String:
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        case let dict as [String: Any]:
+            return extractAssistantText(from: dict)
+        case let array as [Any]:
+            let parts = array.compactMap { extractAssistantText(from: $0) }
+            let joined = parts.joined()
+            return joined.isEmpty ? nil : joined
+        default:
+            return nil
+        }
+    }
+
+    private static func extractAssistantText(from payload: [String: Any]) -> String? {
+        if let content = payload["content"] as? String {
+            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        if let text = payload["text"] as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        if let message = payload["message"] {
+            return extractAssistantText(from: message)
+        }
+        if let contentBlocks = payload["content"] as? [[String: Any]] {
+            let parts = contentBlocks.compactMap { block -> String? in
+                guard (block["type"] as? String) == "text" else { return nil }
+                return block["text"] as? String
+            }
+            let joined = parts.joined()
+            return joined.isEmpty ? nil : joined
+        }
+        if let result = payload["result"] {
+            return extractAssistantText(from: result)
+        }
+        return nil
+    }
+
+    private func sendChatMessage(task: String, attachments: [[String: Any]]) async throws -> [String: Any] {
+        var params: [String: Any] = [
+            "sessionKey": sessionKey,
+            "message": task,
+            "thinking": "off",
+            "timeoutMs": 120_000,
+            "idempotencyKey": UUID().uuidString
+        ]
+        if !attachments.isEmpty {
+            params["attachments"] = attachments
+        }
+        return try await sendRequest(method: "chat.send", params: params)
+    }
+
+    private func storeDeviceTokenIfPresent(from connectResponse: [String: Any]) {
+        let auth = (connectResponse["payload"] as? [String: Any])?["auth"] as? [String: Any]
+            ?? connectResponse["auth"] as? [String: Any]
+        guard let token = auth?["deviceToken"] as? String, !token.isEmpty else { return }
+        KeychainService.setString(token, for: "openClawDeviceToken")
+        NSLog("[OpenClaw] Stored device token for future handshakes")
+    }
+
+    private func sendAgentMessage(task: String, attachments: [[String: Any]]) async throws -> [String: Any] {
+        var params: [String: Any] = [
+            "message": task,
+            "sessionKey": sessionKey,
+            "deliver": true,
+            "timeout": 120,
+            "idempotencyKey": UUID().uuidString
+        ]
+        if !attachments.isEmpty {
+            params["attachments"] = attachments
+        }
+        return try await sendRequest(method: "agent", params: params)
+    }
+
+    private static func formatGatewayError(from response: [String: Any]) -> String {
+        let error = response["error"] as? [String: Any]
+        let code = error?["code"]
+        let message = (error?["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? "Unknown gateway error"
+        let codeText: String = {
+            switch code {
+            case let number as Int: return "\(number)"
+            case let text as String: return text
+            default: return ""
+            }
+        }()
+
+        let lower = message.lowercased()
+        if lower.contains("pairing") || lower.contains("device identity") || lower.contains("device required") {
+            return "iPhone precisa de aprovação no VPS. SSH no servidor e execute: openclaw devices list && openclaw devices approve --latest"
+        }
+        if lower.contains("missing scope") || lower.contains("operator.write") || lower.contains("scope") {
+            return "Gateway sem permissão operator.write. Aprove o iPhone no VPS: openclaw devices approve --latest"
+        }
+        if lower.contains("unauthorized") || lower.contains("invalid token") {
+            return "Token do gateway inválido ou expirado. Verifique em Configurações → Gateway."
+        }
+        if !codeText.isEmpty {
+            return "\(message) (código \(codeText))"
+        }
+        return message
     }
 }

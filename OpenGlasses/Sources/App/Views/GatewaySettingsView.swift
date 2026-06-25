@@ -56,29 +56,60 @@ struct GatewaySettingsView: View {
                 }
             }
 
-            // Active connection status
-            if let name = appState.openClawBridge.activeGatewayName {
-                Section {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(.green)
-                            .frame(width: 8, height: 8)
-                        Text("Connected to \(name)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        if let conn = appState.openClawBridge.resolvedConnection {
-                            Text(conn.label)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color(.tertiarySystemFill), in: Capsule())
-                        }
+            Section {
+                let bridge = appState.openClawBridge
+                let statusColor: Color = {
+                    switch bridge.connectionState {
+                    case .connected:
+                        return bridge.webSocketReady ? .green : .orange
+                    case .checking: return .orange
+                    case .unreachable: return .red
+                    case .notConfigured: return .gray
                     }
-                } header: {
-                    Text("Status")
+                }()
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 8, height: 8)
+                    switch bridge.connectionState {
+                    case .connected where bridge.webSocketReady:
+                        Text("Maia pronta — HTTP + WebSocket OK")
+                    case .connected:
+                        Text("HTTP OK — WebSocket pendente (aprovar device no VPS)")
+                    case .checking:
+                        Text("Testando conexão…")
+                    case .unreachable:
+                        Text("Gateway offline para o iPhone")
+                    case .notConfigured:
+                        Text("Gateway não configurado")
+                    }
                 }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                if !bridge.lastConnectionDetail.isEmpty {
+                    Text(bridge.lastConnectionDetail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                if !appState.openClawBridge.lastProbeSummary.isEmpty {
+                    Text(appState.openClawBridge.lastProbeSummary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                Button("Testar conexão completa (HTTP + WebSocket)") {
+                    Task {
+                        _ = await appState.openClawBridge.probeConnection()
+                    }
+                }
+            } header: {
+                Text("Diagnóstico Maia / VPS")
+            } footer: {
+                Text("Se `openclaw devices list` no VPS mostra nada, o iPhone não alcança o gateway. Use este teste — o Device ID deve aparecer no VPS depois.")
             }
 
             Section {
@@ -268,10 +299,7 @@ struct EditGatewaySheet: View {
                 }
 
                 Section {
-                    TextField("Token", text: $gateway.token)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .textContentType(.oneTimeCode)
+                    PasteableFormSecretField(title: "Token", text: $gateway.token, fieldKind: .token)
                 } header: {
                     Text("Authentication")
                 } footer: {
@@ -289,24 +317,42 @@ struct EditGatewaySheet: View {
                     }
 
                     if gateway.connectionModeEnum != .tunnel {
-                        TextField("LAN Host", text: $gateway.lanHost)
-                            .textContentType(.URL)
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
+                        PasteableURLInput(text: $gateway.lanHost, placeholder: "LAN Host")
                         TextField("Port", value: $gateway.port, format: .number)
                             .keyboardType(.numberPad)
                     }
 
                     if gateway.connectionModeEnum != .lan {
-                        TextField("Tunnel / Tailscale Host", text: $gateway.tunnelHost)
-                            .textContentType(.URL)
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
+                        PasteableURLInput(
+                            text: $gateway.tunnelHost,
+                            placeholder: AppBranding.defaultMaiaGatewayURL
+                        )
+                        if Config.simpleMode,
+                           let reason = GatewayEndpoint.hermesBlockReason(for: gateway.tunnelHost) {
+                            Text(reason)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                        let preview = GatewayEndpoint.previewLines(for: gateway.tunnelHost)
+                        LabeledContent("Health") {
+                            Text(preview.health)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        LabeledContent("WebSocket") {
+                            Text(preview.webSocket)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
                     }
                 } header: {
                     Text("Connection")
                 } footer: {
-                    Text("LAN for local network, Tunnel for Tailscale/remote access, Auto tries LAN first.")
+                    Text(Config.simpleMode
+                        ? "Maia = KVM2 (\(AppBranding.defaultMaiaGatewayURL)). Não use Hermes / aicontexteng.com (KVM4). Token = gateway.auth.token da Maia."
+                        : "VPS: https://seu-dominio.com com proxy de /health e /ws. Token = gateway.auth.token do OpenClaw (não o bot Telegram).")
                 }
 
                 Section {
@@ -332,9 +378,22 @@ struct EditGatewaySheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        onSave(gateway)
+                        var saved = gateway
+                        saved.tunnelHost = GatewayEndpoint.preferMaiaEndpoint(saved.tunnelHost)
+                        saved.lanHost = saved.lanHost.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if Config.simpleMode,
+                           GatewayEndpoint.isHermesHost(saved.lanHost) {
+                            saved.lanHost = ""
+                        }
+                        onSave(saved)
                         dismiss()
                     }
+                    .disabled(
+                        Config.simpleMode && (
+                            GatewayEndpoint.isHermesHost(gateway.tunnelHost)
+                            || GatewayEndpoint.isHermesHost(gateway.lanHost)
+                        )
+                    )
                 }
             }
         }
@@ -345,31 +404,38 @@ struct EditGatewaySheet: View {
         let host: String
         switch gateway.connectionModeEnum {
         case .lan: host = gateway.lanURL
-        case .tunnel: host = gateway.tunnelURL
-        case .auto: host = !gateway.lanURL.isEmpty ? gateway.lanURL : gateway.tunnelURL
+        case .tunnel: host = gateway.tunnelURL.isEmpty ? GatewayEndpoint.sanitize(gateway.tunnelHost) : gateway.tunnelURL
+        case .auto: host = !gateway.lanURL.isEmpty ? gateway.lanURL : (gateway.tunnelURL.isEmpty ? GatewayEndpoint.sanitize(gateway.tunnelHost) : gateway.tunnelURL)
         }
-        let normalized = host.hasSuffix("/") ? String(host.dropLast()) : host
-        guard let url = URL(string: "\(normalized)/health") else {
+        let candidates = GatewayEndpoint.healthURLCandidates(from: host)
+        guard !candidates.isEmpty else {
             testStatus = "Invalid URL"
             return
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 10
-        request.setValue("Bearer \(gateway.token)", forHTTPHeaderField: "Authorization")
 
-        URLSession.shared.dataTask(with: request) { _, response, error in
-            DispatchQueue.main.async {
-                if let error {
-                    testStatus = "Failed: \(error.localizedDescription)"
-                } else if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
-                    testStatus = "Connected (\(http.statusCode))"
-                } else if let http = response as? HTTPURLResponse {
-                    testStatus = "HTTP \(http.statusCode)"
-                } else {
-                    testStatus = "No response"
+        Task {
+            let requests = GatewayEndpoint.healthProbeRequests(from: host, token: gateway.token)
+            for (url, style) in requests {
+                var request = URLRequest(url: url)
+                request.httpMethod = "GET"
+                request.timeoutInterval = 12
+                request.setValue("application/json", forHTTPHeaderField: "Accept")
+                GatewayEndpoint.applyHealthAuth(style, token: gateway.token, to: &request)
+                do {
+                    let (_, response) = try await URLSession.shared.data(for: request)
+                    if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+                        testStatus = "Connected via \(url.absoluteString) (\(style.label))"
+                        return
+                    }
+                    if let http = response as? HTTPURLResponse {
+                        testStatus = "Server reached but HTTP \(http.statusCode) (\(style.label)) — check token/nginx"
+                        return
+                    }
+                } catch {
+                    continue
                 }
             }
-        }.resume()
+            testStatus = "Failed — tried \(requests.count) probe(s). See /opt/openclaw/SERVER-CONTRACT-FOR-GROK.md (current backend is on :3600)."
+        }
     }
 }

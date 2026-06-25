@@ -2783,21 +2783,19 @@ class AppState: ObservableObject, AppStateProtocol {
                 // Standard path: cloud LLM
                 var imageData = await smartCameraImageData(for: query)
 
-                // Glasses context for Maia/OpenClaw when in exclusive mode
-                var effectiveQuery = query
-                if Config.isOpenClawExclusive || Config.simpleMode {
-                    let glassesContext = " [Usuário com óculos Ray-Ban Meta conectados. Câmera e microfone dos óculos disponíveis via app. Use foto enviada para visão.] "
-                    if !effectiveQuery.lowercased().contains("óculos") && !effectiveQuery.lowercased().contains("glasses") {
-                        effectiveQuery = glassesContext + effectiveQuery
-                    }
-                    // Force glasses camera for visual queries in thin client mode
-                    if imageData == nil && VisionIntentDetector.classify(query) == .vision, isConnected {
-                        imageData = try? await cameraService.capturePhoto()
-                    }
+                // In iMetaClaw / exclusive mode we still auto-capture images for vision queries
+                // (using the PT-BR phrases in VisionIntentDetector), but send *clean* user text
+                // to the gateway to stay compatible with the original OpenClaw protocol.
+                // Describe glasses capabilities in Maia's system prompt on the VPS instead.
+                if (Config.isOpenClawExclusive || Config.simpleMode)
+                    && imageData == nil
+                    && VisionIntentDetector.classify(query) == .vision
+                    && isConnected {
+                    imageData = try? await cameraService.capturePhoto()
                 }
 
                 rawResponse = try await llmService.sendMessage(
-                    effectiveQuery,
+                    query,
                     locationContext: classification.relevantSections.contains(.location) ? locationService.locationContext : nil,
                     imageData: imageData,
                     memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
@@ -2849,15 +2847,21 @@ class AppState: ObservableObject, AppStateProtocol {
             }
         } catch {
             let msg = error.localizedDescription
-            errorMessage = "Failed to get response: \(msg)"
-            print("❌ Voice/LLM error: \(msg)")
-            let spoken: String
-            if Config.isOpenClawExclusive {
-                spoken = "\(Config.agentName) está offline. Conecte o OpenClaw no VPS — o iPhone não responde sozinho."
+            let lower = msg.lowercased()
+            if lower.contains("not active") || lower.contains("não ativa") || lower.contains("maia is not active") {
+                errorMessage = "Maia não está ativa no VPS. Ative a Maia no Command Center (veja o contrato no VPS)."
+                print("❌ Maia not active on server")
+                await speechService.speak("Maia não está ativa no VPS. Ative-a no command center.")
+            } else if Config.isOpenClawExclusive {
+                errorMessage = "Failed to get response: \(msg)"
+                print("❌ Voice/LLM error: \(msg)")
+                await speechService.speak("\(Config.agentName) não respondeu. Verifique se a Maia está ativa no VPS.")
             } else {
-                spoken = msg.count > 200 ? String(msg.prefix(200)) : msg
+                errorMessage = "Failed to get response: \(msg)"
+                print("❌ Voice/LLM error: \(msg)")
+                let spoken = msg.count > 200 ? String(msg.prefix(200)) : msg
+                await speechService.speak(spoken)
             }
-            await speechService.speak(spoken)
         }
 
         // Restore original model if we switched for this request
@@ -2916,18 +2920,11 @@ class AppState: ObservableObject, AppStateProtocol {
                 image = await smartCameraImageData(for: query)
             }
 
-            // When talking to Maia / OpenClaw gateway, prepend glasses context so the agent
-            // knows it can use the connected Ray-Ban Meta glasses capabilities (camera + mic).
-            var effectiveQuery = query
-            if Config.isOpenClawExclusive || Config.simpleMode {
-                let glassesContext = " [Usuário com óculos Ray-Ban Meta conectados a este app. Câmera dos óculos e microfone disponíveis. Capturei foto se for visual. Responda em português do Brasil.] "
-                if !effectiveQuery.contains("óculos") && !effectiveQuery.contains("glasses") {
-                    effectiveQuery = glassesContext + effectiveQuery
-                }
-            }
-
+            // Send clean user text to the OpenClaw gateway (Maia).
+            // Glasses capabilities should be described in the agent prompt on the VPS side
+            // (not injected here, to keep compatibility with the original protocol).
             let rawResponse = try await llmService.sendMessage(
-                effectiveQuery,
+                query,
                 locationContext: locationService.locationContext,
                 imageData: image,
                 memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
@@ -2954,7 +2951,13 @@ class AppState: ObservableObject, AppStateProtocol {
                 stopStopListener()
             }
         } catch {
-            errorMessage = "Failed to get response: \(error.localizedDescription)"
+            let msg = error.localizedDescription
+            let lower = msg.lowercased()
+            if lower.contains("not active") || lower.contains("não ativa") {
+                errorMessage = "Maia não está ativa no VPS."
+            } else {
+                errorMessage = "Failed to get response: \(msg)"
+            }
             if speakResponse {
                 await speechService.speak("Sorry, I encountered an error.")
             }

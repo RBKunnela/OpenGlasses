@@ -13,6 +13,7 @@ struct VoiceTab: View {
     @EnvironmentObject var appState: AppState
     @State private var showPreview = false
     @State private var showModelPicker = false
+    @State private var showGatewaySettings = false
     @State private var showPersonaPicker = false
     @State private var showChatInput = false
 
@@ -38,6 +39,10 @@ struct VoiceTab: View {
                 )
                 .padding(.top, 8)
 
+                VoiceRoutingBanner(openClawBridge: appState.openClawBridge)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+
                 // Status card
                 StatusIndicator(session: session, openAISession: openAISession)
                     .padding(.top, 12)
@@ -56,7 +61,8 @@ struct VoiceTab: View {
 
                 // Load the on-device model on demand — only shown when the active
                 // model is local, so it's not lazy-loaded (slowly) on first query.
-                if let local = appState.llmService.localLLMService {
+                if !Config.isOpenClawExclusive,
+                   let local = appState.llmService.localLLMService {
                     LocalModelBar(service: local)
                         .padding(.horizontal, 16)
                         .padding(.bottom, 8)
@@ -76,6 +82,7 @@ struct VoiceTab: View {
                         openAISession: openAISession,
                         showPreview: $showPreview,
                         showModelPicker: $showModelPicker,
+                        showGatewaySettings: $showGatewaySettings,
                         showChatInput: $showChatInput
                     )
                 }
@@ -87,6 +94,17 @@ struct VoiceTab: View {
         }
         .sheet(isPresented: $showModelPicker) {
             ModelPickerSheet(appState: appState)
+        }
+        .sheet(isPresented: $showGatewaySettings) {
+            NavigationStack {
+                GatewaySettingsView(appState: appState)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showGatewaySettings = false }
+                        }
+                    }
+            }
+            .presentationDetents([.medium, .large])
         }
         .sheet(isPresented: $showPersonaPicker) {
             PersonaPickerSheet(appState: appState)
@@ -123,6 +141,7 @@ struct VoiceTab: View {
 private struct LocalModelBar: View {
     @ObservedObject var service: LocalLLMService
     @Environment(\.appAccent) private var accent
+    @State private var actionError: String?
 
     var body: some View {
         if let active = Config.activeModel, active.llmProvider == .local {
@@ -134,17 +153,29 @@ private struct LocalModelBar: View {
     private func content(_ active: ModelConfig) -> some View {
         let modelId = active.model
         let isLoaded = service.isModelLoaded && service.loadedModelId == modelId
+        let isDownloaded = service.isModelDownloaded(modelId)
+        let ramBlocked = !service.canLoadModel(modelId)
+        let ramMessage = service.ramRequirementMessage(for: modelId)
 
-        if service.isLoadingModel {
+        VStack(spacing: 6) {
+        if service.isDownloading && service.downloadingModelId == modelId {
             HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Loading \(active.name)…")
+                ProgressView(value: service.downloadProgress).controlSize(.small)
+                Text("Baixando \(active.name)…")
                     .font(.footnote.weight(.medium))
                     .foregroundStyle(.secondary)
-                if service.downloadProgress > 0, service.downloadProgress < 1 {
-                    Text("\(Int(service.downloadProgress * 100))%")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                Text("\(Int(service.downloadProgress * 100))%")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(.quaternary.opacity(0.4), in: Capsule())
+        } else if service.isLoadingModel {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Carregando \(active.name) (opcional)…")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
@@ -153,22 +184,22 @@ private struct LocalModelBar: View {
             Button { service.unloadModel() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("\(active.name) loaded")
+                    Text("\(active.name) pronto")
                         .font(.footnote.weight(.medium))
                         .foregroundStyle(Color(.label))
-                    Text("· Unload").font(.caption).foregroundStyle(.secondary)
+                    Text("· Liberar memória").font(.caption).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
                 .background(.green.opacity(0.12), in: Capsule())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(active.name) loaded. Tap to unload.")
-        } else {
-            Button { Task { try? await service.loadModel(modelId) } } label: {
+            .accessibilityLabel("\(active.name) carregado. Toque para liberar memória.")
+        } else if !isDownloaded {
+            Button { downloadModel(modelId) } label: {
                 HStack(spacing: 7) {
-                    Image(systemName: "cpu")
-                    Text("Load \(active.name)")
+                    Image(systemName: "arrow.down.circle")
+                    Text("Baixar \(active.name)")
                 }
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.white)
@@ -177,7 +208,77 @@ private struct LocalModelBar: View {
                 .background(accent, in: Capsule())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Load on-device model \(active.name)")
+            .disabled(ramBlocked)
+            .accessibilityLabel("Baixar modelo \(active.name)")
+        } else if ramBlocked {
+            HStack(spacing: 8) {
+                Image(systemName: "memorychip").foregroundStyle(.orange)
+                Text(ramMessage ?? "Modelo grande demais para este iPhone")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 10)
+            .padding(.horizontal, 12)
+            .background(.orange.opacity(0.12), in: Capsule())
+        } else if Config.isOpenClawExclusive {
+            HStack(spacing: 8) {
+                Image(systemName: "server.rack").foregroundStyle(.secondary)
+                Text("Só \(Config.agentName) no VPS responde — sem Qwen nem API no iPhone")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 10)
+            .padding(.horizontal, 12)
+            .background(.quaternary.opacity(0.35), in: Capsule())
+        } else {
+            Button { loadModel(modelId) } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "cpu")
+                    Text("Carregar \(active.name)")
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(accent, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Carregar modelo \(active.name) na memória")
+        }
+
+        if let error = actionError ?? service.lastLoadError {
+            Text(error)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+        }
+        } // VStack
+    }
+
+    private func loadModel(_ modelId: String) {
+        actionError = nil
+        Task {
+            do {
+                try await service.loadModel(modelId)
+            } catch {
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    private func downloadModel(_ modelId: String) {
+        actionError = nil
+        Task {
+            do {
+                try await service.downloadModel(modelId)
+            } catch {
+                actionError = error.localizedDescription
+            }
         }
     }
 }
@@ -192,6 +293,7 @@ private struct VoiceTabControls: View {
 
     @Binding var showPreview: Bool
     @Binding var showModelPicker: Bool
+    @Binding var showGatewaySettings: Bool
     @Binding var showChatInput: Bool
 
     var body: some View {
@@ -200,9 +302,96 @@ private struct VoiceTabControls: View {
             openAISession: openAISession,
             showSettings: .constant(false),
             showModelPicker: $showModelPicker,
+            showGatewaySettings: $showGatewaySettings,
             showPreview: $showPreview,
             showChatInput: $showChatInput
         )
+    }
+}
+
+// MARK: - Voice Routing Banner
+
+/// Shows where voice queries actually go (VPS agent vs cloud API vs fallback).
+struct VoiceRoutingBanner: View {
+    @ObservedObject var openClawBridge: OpenClawBridge
+
+    private struct RoutingStatus {
+        let icon: String
+        let text: String
+        let color: Color
+    }
+
+    private var status: RoutingStatus? {
+        let gatewayReady = openClawBridge.webSocketReady
+            && openClawBridge.connectionState == .connected
+
+        if gatewayReady,
+           Config.phoneAIStrategy == .hybridVPSLocal || Config.phoneAIStrategy == .vpsOnly {
+            return RoutingStatus(
+                icon: "server.rack",
+                text: "Voz via \(Config.agentName) no VPS",
+                color: .green
+            )
+        }
+
+        if let active = Config.activeModel, active.isUsableCloudAPI,
+           Config.phoneAIStrategy == .cloudOnly || Config.phoneAIStrategy == .hybridLocalCloud {
+            return RoutingStatus(
+                icon: "cloud.fill",
+                text: "Voz via \(active.name) (API na nuvem)",
+                color: .blue
+            )
+        }
+
+        switch Config.phoneAIStrategy {
+        case .cloudOnly, .hybridLocalCloud:
+            if let cloud = Config.usableCloudModel() {
+                return RoutingStatus(icon: "cloud.fill", text: "Voz via \(cloud.name)", color: .blue)
+            }
+            return RoutingStatus(
+                icon: "exclamationmark.triangle",
+                text: "Configure uma API na nuvem em Settings → AI Models",
+                color: .orange
+            )
+        case .hybridVPSLocal, .vpsOnly:
+            let gatewayReady = openClawBridge.webSocketReady
+                && openClawBridge.connectionState == .connected
+            if gatewayReady {
+                return RoutingStatus(
+                    icon: "server.rack",
+                    text: "Voz só via \(Config.agentName) no VPS (OpenClaw)",
+                    color: .green
+                )
+            }
+            let host = Config.enabledGateways.first?.tunnelURL
+                ?? GatewayEndpoint.sanitize(Config.openClawTunnelHost)
+            let hostLine = host.isEmpty ? "" : " (\(host))"
+            let wsHint = GatewayEndpoint.isHermesHost(host)
+                ? " — URL errada (Hermes/KVM4); use \(AppBranding.defaultMaiaGatewayURL)"
+                : host.isEmpty ? "" : " — /ws issue (see SERVER-CONTRACT-FOR-GROK.md on VPS)"
+            return RoutingStatus(
+                icon: "exclamationmark.triangle",
+                text: "\(Config.agentName) offline\(hostLine)\(wsHint)",
+                color: .red
+            )
+        }
+    }
+
+    var body: some View {
+        if let status {
+            HStack(spacing: 8) {
+                Image(systemName: status.icon)
+                    .foregroundStyle(status.color)
+                Text(status.text)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
+            .background(status.color.opacity(0.1), in: Capsule())
+        }
     }
 }
 
@@ -234,7 +423,7 @@ struct StatusPillsRow: View {
             if connected {
                 showDisconnectConfirm = true
             } else {
-                Task { await appState.glassesService.connect() }
+                Task { await appState.connectAndListen() }
             }
         } label: {
             HStack(spacing: 6) {
@@ -260,26 +449,70 @@ struct StatusPillsRow: View {
         .accessibilityLabel("Glasses: \(label)")
     }
 
+    @State private var showGatewayDiagnostic = false
+
     private var openClawPill: some View {
         let (color, label): (Color, String) = {
             switch openClawBridge.connectionState {
-            case .connected: return (.green, "Connected")
-            case .checking: return (.orange, "Checking")
-            case .unreachable: return (.red, "Unreachable")
-            case .notConfigured: return (.gray, "Not Set Up")
+            case .connected:
+                return openClawBridge.webSocketReady
+                    ? (.green, "\(Config.agentName) pronta")
+                    : (.orange, "HTTP só — WS pendente")
+            case .checking: return (.orange, "Verificando…")
+            case .unreachable: return (.red, "Offline")
+            case .notConfigured: return (.gray, "Não configurado")
             }
         }()
 
-        return HStack(spacing: 6) {
-            Circle().fill(color).frame(width: 6, height: 6)
-            Text("OpenClaw")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Color(.label))
+        return Button {
+            showGatewayDiagnostic = true
+            Task { await openClawBridge.checkConnection() }
+        } label: {
+            HStack(spacing: 6) {
+                Circle().fill(color).frame(width: 6, height: 6)
+                Text("OpenClaw")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color(.label))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .glassEffect(in: .capsule)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .glassEffect(in: .capsule)
+        .buttonStyle(.plain)
         .accessibilityLabel("OpenClaw: \(label)")
+        .alert("OpenClaw / \(Config.agentName)", isPresented: $showGatewayDiagnostic) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(gatewayDiagnosticMessage)
+        }
+    }
+
+    private var gatewayDiagnosticMessage: String {
+        switch openClawBridge.connectionState {
+        case .connected where openClawBridge.webSocketReady:
+            return "\(Config.agentName) conectada — voz pode usar o VPS."
+        case .connected:
+            var msg = """
+            HTTP OK (pill laranja), mas WebSocket falhou — por isso \(Config.agentName) aparece offline.
+            Reinstalar o app não resolve: o VPS precisa liberar /ws na porta 443.
+            """
+            if !openClawBridge.lastConnectionDetail.isEmpty {
+                msg += "\n\n\(openClawBridge.lastConnectionDetail)"
+            }
+            msg += "\n\nDepois de conectado: veja o contrato em /opt/openclaw/SERVER-CONTRACT-FOR-GROK.md"
+            return msg
+        case .unreachable(let reason):
+            return """
+            \(reason)
+
+            Modo OpenClaw: o iPhone não usa Qwen nem NVIDIA quando \(Config.agentName) está offline.
+            Corrija o gateway para a voz funcionar.
+            """
+        case .checking:
+            return "Testando conexão…"
+        case .notConfigured:
+            return "Configure o gateway em Settings → Gateways."
+        }
     }
 }
 
