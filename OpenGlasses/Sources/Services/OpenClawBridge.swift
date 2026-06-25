@@ -60,6 +60,11 @@ class OpenClawBridge: ObservableObject {
     /// Detail from the last connection attempt (WebSocket / pairing / token errors).
     @Published var lastConnectionDetail: String = ""
 
+    // Injected for inbound node.invoke handling (glasses control from server)
+    var cameraService: CameraService?
+    var audioRecordingService: AudioRecordingService?
+    var videoRecorder: VideoRecordingService?
+
     private let pingSession: URLSession
     private let lanPingSession: URLSession
     private var sessionKey: String
@@ -68,6 +73,10 @@ class OpenClawBridge: ObservableObject {
     private var cachedEndpoint: String?
     /// The gateway config that resolved to the cached endpoint
     private var activeGateway: GatewayConfig?
+
+    private var isConnecting = false
+    private var keepaliveTask: Task<Void, Never>?
+    private var lastConnectionAttempt = Date.distantPast
 
     /// WebSocket for chat (`chat.send`)
     private var webSocketTask: URLSessionWebSocketTask?
@@ -405,9 +414,12 @@ class OpenClawBridge: ObservableObject {
 
     /// Drop cached routing and stale WebSocket before a voice/chat turn.
     func refreshConnectionForChat() async {
-        clearCachedEndpoint()
-        disconnectWebSocket()
-        await checkConnection()
+        // In persistent iMetaClaw mode we avoid forced disconnects.
+        // Only refresh if we are not connected.
+        if connectionState != .connected || !webSocketReady {
+            clearCachedEndpoint()
+            await checkConnection()
+        }
     }
 
     private static func offlineHint(endpoint: String, detail: String) -> String {
@@ -475,6 +487,17 @@ class OpenClawBridge: ObservableObject {
     /// Ensure WebSocket is connected and authenticated
     private func ensureWebSocket() async throws {
         if wsConnected, webSocketTask != nil { return }
+        if isConnecting { return }
+
+        // Simple backoff to avoid storm of reconnects
+        if Date().timeIntervalSince(lastConnectionAttempt) < 3 {
+            return
+        }
+        lastConnectionAttempt = Date()
+
+        isConnecting = true
+        defer { isConnecting = false }
+
         if webSocketTask != nil {
             disconnectWebSocket()
         }
@@ -533,8 +556,32 @@ class OpenClawBridge: ObservableObject {
         } catch {
             NSLog("[OpenClaw] sessions.messages.subscribe error: %@", error.localizedDescription)
         }
-        Task { await queryAvailableTools() }
+
+        // For iMetaClaw / persistent connection to support inbound node.invoke,
+        // skip auto tools query (can cause extra activity) and start keepalive.
+        if !Config.isOpenClawExclusive {
+            Task { await queryAvailableTools() }
+        }
+        startKeepalive()
         onGatewayConnected?()
+    }
+
+    private func startKeepalive() {
+        keepaliveTask?.cancel()
+        keepaliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000) // 15s
+                guard let self = self,
+                      !Task.isCancelled,
+                      self.wsConnected,
+                      let task = self.webSocketTask else { break }
+                task.sendPing { error in
+                    if let error = error {
+                        NSLog("[OpenClaw] WS ping failed: %@", error.localizedDescription)
+                    }
+                }
+            }
+        }
     }
 
     private func waitForConnectChallenge(endpoint: String, timeoutSeconds: UInt64 = 20) async throws {
@@ -704,20 +751,45 @@ class OpenClawBridge: ObservableObject {
                         default:
                             break // Other events handled by OpenClawEventClient
                         }
+                    } else if type == "req", let id = json["id"] as? String, let method = json["method"] as? String {
+                        let params = json["params"] as? [String: Any] ?? [:]
+                        Task {
+                            let response = await self.handleIncomingRequest(method: method, params: params)
+                            // Follow the contract: res with ok + payload
+                            let resMsg: [String: Any] = [
+                                "type": "res",
+                                "id": id,
+                                "ok": response["ok"] as? Bool ?? false,
+                                "payload": response["payload"] ?? [:]
+                            ]
+                            if let data = try? JSONSerialization.data(withJSONObject: resMsg),
+                               let str = String(data: data, encoding: .utf8) {
+                                try? await self.webSocketTask?.send(.string(str))
+                            }
+                        }
                     }
                 } catch {
                     NSLog("[OpenClaw] WS receive error: %@", error.localizedDescription)
+                    // Do not immediately kill the connection on transient receive errors.
+                    // Let upper layers / next ensure decide.
+                    // Only clear pending if we are truly disconnected.
                     await MainActor.run {
-                        self.wsConnected = false
-                        for (_, cont) in self.pendingResponses {
-                            cont.resume(throwing: error)
+                        if !self.wsConnected || self.webSocketTask == nil {
+                            for (_, cont) in self.pendingResponses {
+                                cont.resume(throwing: error)
+                            }
+                            self.pendingResponses.removeAll()
+                            for (_, cont) in self.pendingRunCompletions {
+                                cont.resume(throwing: error)
+                            }
+                            self.pendingRunCompletions.removeAll()
+                            self.pendingRunText.removeAll()
                         }
-                        self.pendingResponses.removeAll()
-                        for (_, cont) in self.pendingRunCompletions {
-                            cont.resume(throwing: error)
-                        }
-                        self.pendingRunCompletions.removeAll()
-                        self.pendingRunText.removeAll()
+                    }
+                    // Continue the loop if task still exists (may recover)
+                    if self.webSocketTask != nil {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        continue
                     }
                     break
                 }
@@ -803,6 +875,8 @@ class OpenClawBridge: ObservableObject {
         }
         pendingRunCompletions.removeAll()
         pendingRunText.removeAll()
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
     }
 
     // MARK: - Tool Visibility
@@ -1019,15 +1093,15 @@ class OpenClawBridge: ObservableObject {
 
             var response: [String: Any]
             do {
-                response = try await sendAgentMessage(task: task, attachments: attachments)
+                response = try await sendAgentMessage(task: task, attachments: attachments, imageBase64: imageBase64)
             } catch {
                 NSLog("[OpenClaw] agent RPC error: %@ — trying chat.send", error.localizedDescription)
-                response = try await sendChatMessage(task: task, attachments: attachments)
+                response = try await sendChatMessage(task: task, attachments: attachments, imageBase64: imageBase64)
             }
             var ok = response["ok"] as? Bool ?? false
             if !ok {
                 NSLog("[OpenClaw] agent RPC failed — trying chat.send")
-                response = try await sendChatMessage(task: task, attachments: attachments)
+                response = try await sendChatMessage(task: task, attachments: attachments, imageBase64: imageBase64)
                 ok = response["ok"] as? Bool ?? false
             }
             guard ok else {
@@ -1259,7 +1333,7 @@ class OpenClawBridge: ObservableObject {
         return nil
     }
 
-    private func sendChatMessage(task: String, attachments: [[String: Any]]) async throws -> [String: Any] {
+    private func sendChatMessage(task: String, attachments: [[String: Any]], imageBase64: String? = nil) async throws -> [String: Any] {
         var params: [String: Any] = [
             "sessionKey": sessionKey,
             "message": task,
@@ -1284,7 +1358,7 @@ class OpenClawBridge: ObservableObject {
         NSLog("[OpenClaw] Stored device token for future handshakes")
     }
 
-    private func sendAgentMessage(task: String, attachments: [[String: Any]]) async throws -> [String: Any] {
+    private func sendAgentMessage(task: String, attachments: [[String: Any]], imageBase64: String? = nil) async throws -> [String: Any] {
         var params: [String: Any] = [
             "message": task,
             "sessionKey": sessionKey,
@@ -1292,6 +1366,9 @@ class OpenClawBridge: ObservableObject {
             "timeout": 120,
             "idempotencyKey": UUID().uuidString
         ]
+        if let b64 = imageBase64 {
+            params["imageBase64"] = b64
+        }
         if !attachments.isEmpty {
             params["attachments"] = attachments
         }
@@ -1305,6 +1382,95 @@ class OpenClawBridge: ObservableObject {
         guard let data = data, data.count > 4_000 else { return false }
         guard let img = UIImage(data: data) else { return false }
         return img.size.width >= 80 && img.size.height >= 80
+    }
+
+    /// Handle inbound req from the gateway (for bidirectional glasses control from Maia).
+    /// Supports node.invoke so Maia on VPS can initiate actions on the glasses (take photo, record, translate etc).
+    private func handleIncomingRequest(method: String, params: [String: Any]) async -> [String: Any] {
+        NSLog("[OpenClaw] Inbound req: %@ params: %@", method, String(describing: params))
+
+        if method == "node.invoke" {
+            let node = params["node"] as? String ?? ""
+            let action = params["action"] as? String ?? params["command"] as? String ?? ""
+            let payload = params["payload"] as? [String: Any] ?? params
+
+            if node == "glasses" || node.isEmpty || action.contains("photo") || action.contains("record") || action.contains("translate") {
+                return await handleGlassesAction(action: action, payload: payload)
+            }
+            return ["ok": false, "payload": ["error": "Unknown node: \(node)"]]
+        }
+
+        return ["ok": false, "payload": ["error": "Unsupported inbound method: \(method)"]]
+    }
+
+    private func handleGlassesAction(action: String, payload: [String: Any]) async -> [String: Any] {
+        do {
+            switch action.lowercased() {
+            case "capture_photo", "take_photo", "photo":
+                guard let cam = cameraService, isConnected else {
+                    return ["ok": false, "payload": ["error": "Glasses not connected or no camera service"]]
+                }
+                let imageData = try await cam.capturePhoto()
+                let b64 = imageData.base64EncodedString()
+                // Server will validate and save; we return the base64
+                return ["ok": true, "payload": ["imageBase64": b64, "mimeType": "image/jpeg", "size": imageData.count]]
+
+            case "start_recording", "record_audio", "start_audio":
+                guard let rec = audioRecordingService else {
+                    return ["ok": false, "payload": ["error": "No audio service"]]
+                }
+                try rec.startRecording()
+                return ["ok": true, "payload": ["status": "recording_started"]]
+
+            case "stop_recording", "stop_audio":
+                guard let rec = audioRecordingService else {
+                    return ["ok": false, "payload": ["error": "No audio service"]]
+                }
+                if let url = await rec.stopRecording() {
+                    return ["ok": true, "payload": ["status": "stopped", "url": url.absoluteString, "transcript": rec.recordingTranscript]]
+                }
+                return ["ok": true, "payload": ["status": "stopped"]]
+
+            case "start_video", "record_video":
+                guard let vid = videoRecorder, isConnected else {
+                    return ["ok": false, "payload": ["error": "Glasses not connected or no video service"]]
+                }
+                try await vid.startRecording()
+                return ["ok": true, "payload": ["status": "video_recording_started"]]
+
+            case "stop_video":
+                guard let vid = videoRecorder else {
+                    return ["ok": false, "payload": ["error": "No video service"]]
+                }
+                if let url = await vid.stopRecording() {
+                    return ["ok": true, "payload": ["status": "stopped", "url": url.absoluteString]]
+                }
+                return ["ok": true, "payload": ["status": "stopped"]]
+
+            case "translate", "translate_live", "start_translation":
+                // Live translation is handled via the mic stream + server or on-device
+                // For explicit, we can note it or trigger if service available
+                return ["ok": true, "payload": ["status": "translation_active_via_stream", "note": "Use live audio stream"]]
+
+            case "get_status":
+                return ["ok": true, "payload": ["connected": isConnected, "ws_ready": webSocketReady]]
+
+            case "add_note", "save_note":
+                let note = payload["note"] as? String ?? payload["text"] as? String ?? ""
+                // For now, log; can integrate with userMemory later
+                NSLog("[OpenClaw] Note from Maia: %@", note)
+                return ["ok": true, "payload": ["status": "note_received", "length": note.count]]
+
+            case "get_transcript", "get_notes":
+                // Return basic status; full history can be added if needed
+                return ["ok": true, "payload": ["status": "transcript_available_via_stream", "note": "Use recent conversation"]]
+
+            default:
+                return ["ok": false, "payload": ["error": "Unknown glasses action: \(action)"]]
+            }
+        } catch {
+            return ["ok": false, "payload": ["error": error.localizedDescription]]
+        }
     }
 
     private static func formatGatewayError(from response: [String: Any]) -> String {
@@ -1322,13 +1488,13 @@ class OpenClawBridge: ObservableObject {
 
         let lower = message.lowercased()
         if lower.contains("pairing") || lower.contains("device identity") || lower.contains("device required") {
-            return "iPhone precisa de aprovação no VPS. SSH no servidor e execute: openclaw devices list && openclaw devices approve --latest"
+            return "iPhone precisa de aprovação no VPS. Verifique o contrato e tokens em /opt/maia/.env"
         }
         if lower.contains("missing scope") || lower.contains("operator.write") || lower.contains("scope") {
-            return "Gateway sem permissão operator.write. Aprove o iPhone no VPS: openclaw devices approve --latest"
+            return "Sem permissão. Verifique o contrato do node.invoke"
         }
         if lower.contains("unauthorized") || lower.contains("invalid token") {
-            return "Token do gateway inválido ou expirado. Verifique em Configurações → Gateway."
+            return "Token do gateway inválido. Use OPENCLAW_TOKEN de /opt/maia/.env"
         }
         if !codeText.isEmpty {
             return "\(message) (código \(codeText))"

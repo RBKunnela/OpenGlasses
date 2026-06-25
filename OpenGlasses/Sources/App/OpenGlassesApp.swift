@@ -746,6 +746,11 @@ class AppState: ObservableObject, AppStateProtocol {
         geminiLiveSession.openClawBridge = openClawBridge
         userMemory.openClawBridge = openClawBridge
 
+        // Wire services for inbound node.invoke (Phase 2 glasses control from Maia)
+        openClawBridge.cameraService = cameraService
+        openClawBridge.audioRecordingService = audioRecorder
+        openClawBridge.videoRecorder = videoRecorder
+
         // Wire native tool router to LLM service and Gemini Live
         llmService.nativeToolRouter = nativeToolRouter
         nativeToolRouter.mcpClient = mcpClient

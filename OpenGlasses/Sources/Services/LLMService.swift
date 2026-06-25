@@ -1987,7 +1987,11 @@ class LLMService: ObservableObject {
         guard let bridge = openClawBridge else {
             throw LLMError.missingAPIKey("OpenClaw gateway not initialized")
         }
-        await bridge.refreshConnectionForChat()
+        // For persistent connection (iMetaClaw), avoid forced refresh on every send.
+        // Reconnect only if needed via ensure inside send.
+        if bridge.connectionState != .connected || !bridge.webSocketReady {
+            await bridge.checkConnection()
+        }
         if case .unreachable(let reason) = bridge.connectionState {
             NSLog("[OpenClaw] Health check failed — tentando WebSocket mesmo assim: %@", reason)
         }
