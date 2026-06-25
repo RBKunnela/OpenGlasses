@@ -632,7 +632,7 @@ class TextToSpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         }
     }
 
-    /// Resolve the iOS TTS voice — uses saved preference or auto-selects best available.
+    /// Resolve the iOS TTS voice — uses saved preference or auto-selects best available for the app locale.
     private static func bestAvailableVoice() -> AVSpeechSynthesisVoice? {
         // Use saved preference if set
         let preferred = Config.iosTTSVoiceId
@@ -640,25 +640,47 @@ class TextToSpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
             return voice
         }
 
-        // Auto-select: best quality English voice available
+        let languagePrefix = preferredSpeechLanguagePrefix()
         let allVoices = AVSpeechSynthesisVoice.speechVoices()
-        let englishVoices = allVoices.filter { $0.language.hasPrefix("en") }
+        let localeVoices = allVoices.filter { $0.language.hasPrefix(languagePrefix) }
 
         // Sort by quality descending (premium=3, enhanced=2, default=1)
-        let sorted = englishVoices.sorted { $0.quality.rawValue > $1.quality.rawValue }
+        let sorted = localeVoices.sorted { $0.quality.rawValue > $1.quality.rawValue }
+
+        // Prefer Brazilian neural voices explicitly (pt-BR "Luciana" etc. are high quality and free)
+        if languagePrefix.hasPrefix("pt") {
+            let brazilVoices = sorted.filter { $0.language == "pt-BR" || $0.language.hasPrefix("pt-BR") }
+            if let bestBR = brazilVoices.first(where: { $0.quality.rawValue >= 2 }) ?? brazilVoices.first {
+                return bestBR
+            }
+        }
 
         if let best = sorted.first, best.quality.rawValue >= 2 {
             return best
         }
 
-        // Fallback to standard en-US
-        return AVSpeechSynthesisVoice(language: "en-US")
+        if let any = sorted.first {
+            return any
+        }
+
+        return AVSpeechSynthesisVoice(language: languagePrefix == "pt" ? "pt-BR" : "en-US")
     }
 
-    /// All English voices available on this device, grouped by quality.
+    /// pt-BR for Brazilian users (wake phrase / device language); English otherwise.
+    private static func preferredSpeechLanguagePrefix() -> String {
+        let speechLocale = SpeechRecognitionLocale.preferredIdentifier.lowercased()
+        if speechLocale.hasPrefix("pt") { return "pt" }
+        if let code = Locale.preferredLanguages.first?.lowercased(), code.hasPrefix("pt") {
+            return "pt"
+        }
+        return "en"
+    }
+
+    /// Voices for the current locale, grouped by quality.
     static func availableVoices() -> [AVSpeechSynthesisVoice] {
-        AVSpeechSynthesisVoice.speechVoices()
-            .filter { $0.language.hasPrefix("en") }
+        let prefix = preferredSpeechLanguagePrefix()
+        return AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.hasPrefix(prefix) }
             .sorted { lhs, rhs in
                 if lhs.quality != rhs.quality { return lhs.quality.rawValue > rhs.quality.rawValue }
                 return lhs.name < rhs.name

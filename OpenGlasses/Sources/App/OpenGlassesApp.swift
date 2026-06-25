@@ -10,6 +10,7 @@ import MediaPlayer
 
 extension Notification.Name {
     static let onboardingCompleted = Notification.Name("onboardingCompleted")
+    static let onboardingReset = Notification.Name("onboardingReset")
 }
 
 private func processWearablesCallbackURL(_ url: URL, source: String) {
@@ -136,7 +137,10 @@ struct OpenGlassesApp: App {
         // Move any plaintext provider secrets out of UserDefaults and into the
         // Keychain. Must run before anything reads a secret (AppState, LLM, TTS…).
         Config.migrateSecretsToKeychainIfNeeded()
+        Config.migrateToIMetaClawFreshStartIfNeeded()
         Config.migrateToIMetaClawWakePhraseIfNeeded()
+        Config.ensurePrimaryAgentPersona()
+        Config.enforceTerminalMode()
         // Defer Wearables SDK (Bluetooth permission) until after onboarding
         if Config.hasCompletedOnboarding {
             configureWearables()
@@ -161,6 +165,14 @@ struct OpenGlassesApp: App {
             }
             .onAppear {
                 AppStateProvider.shared = appState
+                Config.upgradeLocalModelsToPreferredIfNeeded()
+                appState.llmService.refreshActiveModel()
+                if let local = appState.llmService.localLLMService,
+                   let active = Config.activeModel,
+                   active.llmProvider == .local,
+                   local.loadedModelId != active.model {
+                    local.unloadModel()
+                }
                 ListeningChangedObserver.shared.start { newValue in
                     Task { @MainActor in
                         if appState.listeningEnabled != newValue {
@@ -299,7 +311,7 @@ struct OpenGlassesApp: App {
                     appState.setListeningEnabled(storedEnabled)
                 }
                 if appState.listeningEnabled {
-                    appState.liveActivityManager.start(glassesName: appState.glassesService.deviceName ?? "OpenGlasses")
+                    appState.liveActivityManager.start(glassesName: appState.glassesService.deviceName ?? AppBranding.name)
                     appState.updateLiveActivity()
                 }
                 if Config.hasCompletedOnboarding {
@@ -343,7 +355,7 @@ struct OpenGlassesApp: App {
     private func configureWearables() {
         do {
             NSLog("[OpenGlasses] Logging active")
-            try Wearables.configure()
+            try WearablesBootstrap.ensureConfigured()
             NSLog("[OpenGlasses] Meta Wearables SDK configured successfully")
             let state = Wearables.shared.registrationState
             NSLog("[OpenGlasses] Registration state: \(state.rawValue)")
@@ -481,9 +493,7 @@ class AppState: ObservableObject, AppStateProtocol {
     /// Acting tool calls the supervisor held while the user was disengaged (Plan W), surfaced on
     /// re-engagement.
     let heldRecommendations = HeldRecommendationStore()
-    /// CoreMotion activity signal (Plan W v2) — feeds presence so a moving-but-quiet user reads as
-    /// present, not idle. Inert on Simulator / without permission.
-    let motionProvider = MotionActivityProvider()
+
     /// Last explicit user interaction (wake word / transcription) — the presence `lastInteraction`
     /// signal. `isForegroundActive` is the `foreground` signal (MLX is foreground-only, so
     /// background ⇒ `away` ⇒ paused). `presenceTimer` drives periodic re-evaluation.
@@ -649,6 +659,11 @@ class AppState: ObservableObject, AppStateProtocol {
         }
 
         addDebugEvent("AppState initialized")
+
+        Config.enforceTerminalMode()
+        if Config.blocksRealtimeModes, currentMode.isRealtime {
+            currentMode = .direct
+        }
 
         // Register Gemma 4 model type — not yet in the official mlx-swift-lm registry
         Task {
@@ -994,13 +1009,13 @@ class AppState: ObservableObject, AppStateProtocol {
         openClawBridge.onStreamChunk = { [weak self] chunk in
             guard let self else { return }
             Task { @MainActor in
-                // Append to visible response and queue for speech
+                self.speechService.stopThinkingSound()
                 self.lastResponse += chunk
                 await self.speechService.speakStreaming(chunk)
             }
         }
 
-        if Config.isOpenClawConfigured {
+        if Config.isAnyGatewayConfigured {
             openClawEventClient.connect()
             Task { await openClawBridge.checkConnection() }
         }
@@ -1012,6 +1027,14 @@ class AppState: ObservableObject, AppStateProtocol {
     /// Switch between app modes: Direct, Gemini Live, or OpenAI Realtime.
     /// Tears down the current mode's audio and starts the new one.
     func switchMode(to mode: AppMode) {
+        if Config.blocksRealtimeModes, mode.isRealtime {
+            NSLog("[App] Blocked switch to %@ — VPS terminal mode (OpenClaw only)", mode.rawValue)
+            if currentMode.isRealtime {
+                currentMode = .direct
+                Config.setAppMode(.direct)
+            }
+            return
+        }
         guard mode != currentMode else { return }
         let oldMode = currentMode
         currentMode = mode
@@ -1077,7 +1100,9 @@ class AppState: ObservableObject, AppStateProtocol {
             }
         }
         locationService.startTracking()
-        HomeKitTool.prepareShared()
+        if !Config.simpleMode {
+            HomeKitTool.prepareShared()
+        }
     }
 
     /// The active model id before a Field Assist session swapped in the vault's model.
@@ -1518,28 +1543,119 @@ class AppState: ObservableObject, AppStateProtocol {
         addDebugEvent("No device appeared after 30s of polling")
     }
 
-    func completeAuthorizationInMetaAI() async {
+    /// Validates MWDAT keys in the built Info.plist before talking to Meta AI.
+    func metaWearablesConfigurationError() -> String? {
+        guard let mwdat = Bundle.main.object(forInfoDictionaryKey: "MWDAT") as? [String: Any] else {
+            return "Configuração Meta (MWDAT) ausente no app."
+        }
+
+        let metaAppID = (mwdat["MetaAppID"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if metaAppID.isEmpty || metaAppID.localizedCaseInsensitiveContains("YOUR_") {
+            return "MetaAppID não configurado. Atualize Config/Info/Info.personal.plist e reinstale o app."
+        }
+
+        let appLink = (mwdat["AppLinkURLScheme"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if appLink.isEmpty
+            || appLink.localizedCaseInsensitiveContains("YOUR_")
+            || appLink.hasPrefix("applinks:") {
+            return """
+            AppLinkURLScheme inválido (\(appLink.isEmpty ? "vazio" : appLink)). \
+            Use clawglasses:// e o mesmo valor no Meta Wearables Developer Center.
+            """
+        }
+
+        let expectedScheme = "mwdat-\(metaAppID)"
+        let urlSchemes = (Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]])?
+            .compactMap { $0["CFBundleURLSchemes"] as? [String] }
+            .flatMap { $0 } ?? []
+        if !urlSchemes.contains(expectedScheme) {
+            return "CFBundleURLSchemes deve incluir \(expectedScheme). Reinstale após corrigir Info.personal.plist."
+        }
+
+        guard UIApplication.shared.canOpenURL(URL(string: "fb-viewapp://")!) else {
+            return "Instale o app Meta AI e emparelhe os óculos Ray-Ban Meta nele primeiro."
+        }
+
+        do {
+            let parsed = try Configuration(bundle: .main)
+            if !parsed.attestationConfiguration.hasCompleteData {
+                return """
+                Credenciais Meta incompletas. Confira no wearables.developer.meta.com: \
+                Bundle ID com.clawglasses.app, Team ID VF88UK56C3, AppLink clawglasses:// e Client Token.
+                """
+            }
+        } catch {
+            return "Erro ao ler configuração Meta: \(error.localizedDescription)"
+        }
+
+        return nil
+    }
+
+    /// Opens Meta AI for registration via the SDK (never bare fb-viewapp://).
+    @discardableResult
+    func completeAuthorizationInMetaAI() async -> String? {
         addDebugEvent("Manual Meta authorization requested")
+
+        if let configError = metaWearablesConfigurationError() {
+            addDebugEvent("Meta config invalid: \(configError)")
+            return configError
+        }
+
+        do {
+            try WearablesBootstrap.ensureConfigured()
+        } catch {
+            let detail = WearablesBootstrap.userFacingMessage(for: error)
+            let msg = detail.isEmpty ? "" : "SDK Meta: \(detail)"
+            if !msg.isEmpty {
+                addDebugEvent(msg)
+                return msg
+            }
+        }
+
+        glassesService.startObserving()
+
         do {
             try await Wearables.shared.startRegistration()
+            addDebugEvent("startRegistration() invoked — Meta AI should show approval UI")
         } catch {
+            let msg = "Falha ao iniciar registro Meta: \(error.localizedDescription)"
             print("📋 Manual registration start failed: \(error)")
-            addDebugEvent("Manual registration start failed: \(error.localizedDescription)")
+            addDebugEvent(msg)
+            return msg
         }
 
         let currentState = Wearables.shared.registrationState.rawValue
         registrationStateRaw = currentState
         if currentState >= 3 {
             await requestEarlyPermission()
-            return
+            return nil
         }
 
-        await MainActor.run {
-            guard let viewAppUrl = URL(string: "fb-viewapp://") else { return }
-            if UIApplication.shared.canOpenURL(viewAppUrl) {
-                UIApplication.shared.open(viewAppUrl, options: [:])
-            }
+        return nil
+    }
+
+    /// User-initiated Meta registration with wait for callback from Meta AI.
+    func performMetaRegistrationFlow(timeoutSeconds: Double = 25) async -> (registered: Bool, message: String) {
+        if let configError = await completeAuthorizationInMetaAI() {
+            return (false, configError)
         }
+
+        let settled = await waitForRegistration(minState: 3, timeoutSeconds: timeoutSeconds)
+        registrationStateRaw = settled
+
+        if settled >= 3 {
+            await requestEarlyPermission()
+            return (true, "Autorizado — óculos prontos para usar.")
+        }
+
+        return (
+            false,
+            """
+            Aprove o iMetaClaw no Meta AI (tela que o SDK abriu). Se aparecer "Internal error", \
+            confira Modo Desenvolvedor no Meta AI (Sobre → 5× na versão) e que o app está cadastrado em wearables.developer.meta.com. \
+            Depois volte aqui e toque Permitir de novo.
+            """
+        )
     }
 
     func resetMetaRegistration() async {
@@ -1585,6 +1701,11 @@ class AppState: ObservableObject, AppStateProtocol {
                     addDebugEvent("Skipping wake word auto-start: registration did not reach state 3")
                     return
                 }
+            }
+
+            guard listeningEnabled else {
+                print("🔇 Listening disabled — skipping wake word auto-start")
+                return
             }
 
             // Don't auto-start in silent mode — saves battery, user uses tap-to-talk
@@ -1655,10 +1776,8 @@ class AppState: ObservableObject, AppStateProtocol {
 
         if enabled {
             // Restart wake word detection and Live Activity
-            liveActivityManager.start(glassesName: glassesService.deviceName ?? "OpenGlasses")
-            if isConnected {
-                Task { try? await wakeWordService.startListening() }
-            }
+            liveActivityManager.start(glassesName: glassesService.deviceName ?? AppBranding.name)
+            Task { try? await wakeWordService.startListening() }
             NSLog("[Listening] Enabled")
         } else {
             // Stop everything: wake word, transcription, TTS, Live Activity
@@ -2109,9 +2228,8 @@ class AppState: ObservableObject, AppStateProtocol {
         presenceMonitor.foreground = { [weak self] in self?.isForegroundActive ?? true }
         presenceMonitor.voiceActive = { [weak self] in self?.wakeWordService.isListening ?? false }
         presenceMonitor.lastInteraction = { [weak self] in self?.lastInteractionAt ?? Date() }
-        // CoreMotion activity (Plan W v2): a moving-but-quiet user reads as present, not idle.
-        presenceMonitor.motionActive = { [weak self] in self?.motionProvider.isActive ?? false }
-        motionProvider.start()
+        // iMetaClaw does not use CMMotionActivityManager (no motion & fitness permission).
+        presenceMonitor.motionActive = { false }
 
         // Surface anything the supervisor held while the user was away, on re-engagement (TTS + HUD).
         presenceMonitor.onReEngage = { [weak self] in
@@ -2271,7 +2389,11 @@ class AppState: ObservableObject, AppStateProtocol {
     /// 3. If preset has "always" camera behavior, keep camera on.
     /// 4. Otherwise, no image.
     private func smartCameraImageData(for query: String) async -> Data? {
-        guard Config.activeModel?.visionEnabled == true else { return nil }
+        // In OpenClaw / iMetaClaw exclusive VPS mode we always want glasses vision when connected.
+        let forceGlassesVision = Config.isOpenClawExclusive || Config.simpleMode
+        if !forceGlassesVision {
+            guard Config.activeModel?.visionEnabled == true else { return nil }
+        }
 
         // Already have a live frame? Use it (cheapest path).
         if let existing = currentVisionFrameDataIfAvailable() {
@@ -2287,8 +2409,8 @@ class AppState: ObservableObject, AppStateProtocol {
             return await smartCameraCapture(reason: "always-on mode")
         }
 
-        // Smart camera detection
-        guard Config.smartCameraEnabled || cameraBehavior == "smart" else { return nil }
+        // Smart camera detection — always allow in exclusive VPS mode
+        guard forceGlassesVision || Config.smartCameraEnabled || cameraBehavior == "smart" else { return nil }
 
         // Within cooldown window from last vision query? Auto-activate for follow-ups.
         if let lastActivation = lastSmartCameraActivation,
@@ -2554,8 +2676,10 @@ class AppState: ObservableObject, AppStateProtocol {
         let classification = conversationClassifier.classify(query, hasImage: hasImage, conversationTurnCount: turnCount)
         print("🧭 Classified: complexity=\(String(format: "%.2f", classification.complexity)) tier=\(classification.modelTier.rawValue) direct=\(classification.directToolCall?.toolName ?? "none")")
 
-        // Tier 0: Direct tool call — skip LLM entirely
-        if let directCall = classification.directToolCall,
+        // Tier 0: Direct tool call — skip LLM entirely (disabled in OpenClaw-exclusive mode;
+        // weather etc. must go through Maia on the VPS, not on-phone shortcuts).
+        if !Config.isOpenClawExclusive,
+           let directCall = classification.directToolCall,
            let router = llmService.nativeToolRouter {
             isProcessing = true
             do {
@@ -2597,39 +2721,54 @@ class AppState: ObservableObject, AppStateProtocol {
         var originalModelId: String?
         var useLocalAgent = false
 
-        // Route fast-tier queries to the agent model when agentic mode is on + model ready.
-        // If the agent model is the on-device MLX model, only do so when the user has
-        // opted in (localAgentEnabled, default off) — that path can fatally crash. Cloud
-        // agent models route normally.
-        let agentIsCloud = Config.savedModels.contains(where: { $0.id == Config.agentModelId })
-        if classification.modelTier == .fast,
-           Config.agentModeEnabled,
-           Config.agentModelDownloaded,
-           (agentIsCloud || Config.localAgentEnabled),
-           !isPhotoCommand(query) {
-            useLocalAgent = true
-            print("🧠 Routing to agent model (fast tier, agentic mode)\(agentIsCloud ? " [cloud]" : " [on-device]")")
-        } else if classification.modelTier == .fast, Config.agentModeEnabled, Config.agentModelDownloaded, !isPhotoCommand(query) {
-            print("🧠 Skipping on-device agent (localAgentEnabled off) — routing to cloud instead")
-            if Config.autoModelRoutingEnabled,
+        let routeToGateway = llmService.prefersGatewayRouting()
+        let vpsVoiceMode = Config.phoneAIStrategy == .hybridVPSLocal || Config.phoneAIStrategy == .vpsOnly
+        let gatewayReady = openClawBridge.webSocketReady
+            && openClawBridge.connectionState == .connected
+
+        // VPS voice: never swap to local Qwen for "fast" tier — Maia on the server handles everything.
+        if Config.isOpenClawExclusive || routeToGateway || (vpsVoiceMode && Config.isAnyGatewayConfigured && gatewayReady) {
+            if Config.isOpenClawExclusive || vpsVoiceMode {
+                print("🌐 VPS voice mode — skipping local/tier routing (→ \(Config.agentName))")
+            }
+        } else {
+            // Route fast-tier queries to the agent model when agentic mode is on + model ready.
+            let agentIsCloud = Config.savedModels.contains(where: { $0.id == Config.agentModelId })
+            if classification.modelTier == .fast,
+               Config.agentModeEnabled,
+               Config.agentModelDownloaded,
+               (agentIsCloud || Config.localAgentEnabled),
+               !isPhotoCommand(query) {
+                useLocalAgent = true
+                print("🧠 Routing to agent model (fast tier, agentic mode)\(agentIsCloud ? " [cloud]" : " [on-device]")")
+            } else if classification.modelTier == .fast, Config.agentModeEnabled, Config.agentModelDownloaded, !isPhotoCommand(query) {
+                print("🧠 Skipping on-device agent (localAgentEnabled off) — routing to cloud instead")
+                if Config.autoModelRoutingEnabled,
+                   let tierModel = Config.modelForTier(classification.modelTier),
+                   tierModel.id != Config.activeModelId {
+                    originalModelId = Config.activeModelId
+                    Config.setActiveModelId(tierModel.id)
+                    llmService.refreshActiveModel()
+                }
+            } else if Config.autoModelRoutingEnabled,
                let tierModel = Config.modelForTier(classification.modelTier),
                tierModel.id != Config.activeModelId {
                 originalModelId = Config.activeModelId
                 Config.setActiveModelId(tierModel.id)
                 llmService.refreshActiveModel()
+                print("🧭 Model routed: \(classification.modelTier.rawValue) → \(tierModel.name)")
             }
-        } else if Config.autoModelRoutingEnabled,
-           let tierModel = Config.modelForTier(classification.modelTier),
-           tierModel.id != Config.activeModelId {
-            originalModelId = Config.activeModelId
-            Config.setActiveModelId(tierModel.id)
-            llmService.refreshActiveModel()
-            print("🧭 Model routed: \(classification.modelTier.rawValue) → \(tierModel.name)")
         }
 
         // Normal message — send to LLM (with Tier 1 prompt trimming via sections)
         isProcessing = true
-        speechService.startThinkingSound()
+        lastResponse = ""
+        let willUseGateway = llmService.prefersGatewayRouting()
+        if willUseGateway {
+            localLLMService.cancelActiveLoad()
+        } else {
+            speechService.startThinkingSound()
+        }
 
         do {
             let rawResponse: String
@@ -2642,9 +2781,23 @@ class AppState: ObservableObject, AppStateProtocol {
                 )
             } else {
                 // Standard path: cloud LLM
-                let imageData = await smartCameraImageData(for: query)
+                var imageData = await smartCameraImageData(for: query)
+
+                // Glasses context for Maia/OpenClaw when in exclusive mode
+                var effectiveQuery = query
+                if Config.isOpenClawExclusive || Config.simpleMode {
+                    let glassesContext = " [Usuário com óculos Ray-Ban Meta conectados. Câmera e microfone dos óculos disponíveis via app. Use foto enviada para visão.] "
+                    if !effectiveQuery.lowercased().contains("óculos") && !effectiveQuery.lowercased().contains("glasses") {
+                        effectiveQuery = glassesContext + effectiveQuery
+                    }
+                    // Force glasses camera for visual queries in thin client mode
+                    if imageData == nil && VisionIntentDetector.classify(query) == .vision, isConnected {
+                        imageData = try? await cameraService.capturePhoto()
+                    }
+                }
+
                 rawResponse = try await llmService.sendMessage(
-                    query,
+                    effectiveQuery,
                     locationContext: classification.relevantSections.contains(.location) ? locationService.locationContext : nil,
                     imageData: imageData,
                     memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
@@ -2670,21 +2823,41 @@ class AppState: ObservableObject, AppStateProtocol {
                 response = rawResponse
             }
 
-            lastResponse = response
-            print("🤖 \(llmService.activeModelName): \(response)")
+            let finalResponse = response.isEmpty ? lastResponse : response
+            lastResponse = finalResponse
+            let viaGateway = llmService.lastResponseViaGateway
+            let label = viaGateway ? Config.agentName : llmService.activeModelName
+            print("🤖 \(label): \(finalResponse)")
 
             // Save to conversation store
-            if Config.conversationPersistenceEnabled {
-                conversationStore.appendMessage(role: "assistant", content: response)
+            if Config.conversationPersistenceEnabled, !finalResponse.isEmpty {
+                conversationStore.appendMessage(role: "assistant", content: finalResponse)
             }
 
-            // Start wake word listener during TTS so user can say "stop"
-            startStopListener()
-            await speechService.speak(response)
-            stopStopListener()
+            // Gateway may have already spoken via streaming chunks during sessions.send.
+            let spokeViaStream = viaGateway && response.isEmpty && !finalResponse.isEmpty
+            if viaGateway {
+                await speechService.flushStreamBuffer()
+            }
+            if !finalResponse.isEmpty && !spokeViaStream {
+                startStopListener()
+                await speechService.speak(finalResponse)
+                stopStopListener()
+            } else if finalResponse.isEmpty {
+                errorMessage = "Sem resposta do agente. Verifique se o gateway OpenClaw está conectado."
+                await speechService.speak("Não consegui uma resposta da \(Config.agentName). Verifique a conexão com o VPS.")
+            }
         } catch {
-            errorMessage = "Failed to get response: \(error.localizedDescription)"
-            await speechService.speak("Sorry, I encountered an error.")
+            let msg = error.localizedDescription
+            errorMessage = "Failed to get response: \(msg)"
+            print("❌ Voice/LLM error: \(msg)")
+            let spoken: String
+            if Config.isOpenClawExclusive {
+                spoken = "\(Config.agentName) está offline. Conecte o OpenClaw no VPS — o iPhone não responde sozinho."
+            } else {
+                spoken = msg.count > 200 ? String(msg.prefix(200)) : msg
+            }
+            await speechService.speak(spoken)
         }
 
         // Restore original model if we switched for this request
@@ -2742,8 +2915,19 @@ class AppState: ObservableObject, AppStateProtocol {
             } else {
                 image = await smartCameraImageData(for: query)
             }
+
+            // When talking to Maia / OpenClaw gateway, prepend glasses context so the agent
+            // knows it can use the connected Ray-Ban Meta glasses capabilities (camera + mic).
+            var effectiveQuery = query
+            if Config.isOpenClawExclusive || Config.simpleMode {
+                let glassesContext = " [Usuário com óculos Ray-Ban Meta conectados a este app. Câmera dos óculos e microfone disponíveis. Capturei foto se for visual. Responda em português do Brasil.] "
+                if !effectiveQuery.contains("óculos") && !effectiveQuery.contains("glasses") {
+                    effectiveQuery = glassesContext + effectiveQuery
+                }
+            }
+
             let rawResponse = try await llmService.sendMessage(
-                query,
+                effectiveQuery,
                 locationContext: locationService.locationContext,
                 imageData: image,
                 memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
@@ -3001,33 +3185,78 @@ class AppState: ObservableObject, AppStateProtocol {
 
     // MARK: - Connect & Listen
 
+    /// Actionable message when glasses won't connect — shown in the transcript error card.
+    func glassesConnectionHelpMessage(
+        registrationState: Int? = nil,
+        devicesEmpty: Bool? = nil
+    ) -> String {
+        let reg = registrationState ?? registrationStateRaw
+        let noDevices = devicesEmpty ?? Wearables.shared.devices.isEmpty
+
+        if reg < 3 {
+            return """
+            Autorize o iMetaClaw no Meta AI: toque no ícone dos óculos → Permitir → abra o Meta AI e aprove. Volte aqui e toque de novo.
+            """
+        }
+        if noDevices {
+            return """
+            Meta autorizado, mas óculos não detectados. Confira: óculos ligados e perto do iPhone · pareados no Meta AI · Modo Desenvolvedor no Meta AI (Sobre → toque 5× na versão → ativar).
+            """
+        }
+        return "Não conectou. Verifique Bluetooth do iPhone e se os óculos estão ligados."
+    }
+
     /// One-tap reconnect — connect glasses and immediately start listening.
     /// Used by hero capsule, widget, watch, and Dynamic Island reconnect actions.
     func connectAndListen() async {
         guard !isConnected else {
-            // Already connected — just start listening
             wakeWordService.stopListening()
             try? await Task.sleep(nanoseconds: 100_000_000)
             await handleWakeWordDetected(manual: true)
             return
         }
 
-        // Connect glasses
+        errorMessage = nil
+        addDebugEvent("connectAndListen started")
+
+        do {
+            try WearablesBootstrap.ensureConfigured()
+        } catch {
+            addDebugEvent("Wearables.configure in connect: \(WearablesBootstrap.userFacingMessage(for: error))")
+        }
+        glassesService.startObserving()
+
+        registrationStateRaw = Wearables.shared.registrationState.rawValue
+        addDebugEvent("Registration before connect: \(registrationStateRaw)")
+
         await glassesService.connect()
 
-        // Wait for connection to establish — up to 15s on fresh install (DAT registration
-        // can take a while the first time or after re-pairing)
+        if registrationStateRaw < 3 {
+            addDebugEvent("Registration < 3 — starting Meta registration flow")
+            let reg = await performMetaRegistrationFlow()
+            addDebugEvent("Registration after Meta AI wait: \(registrationStateRaw)")
+            if !reg.registered {
+                errorMessage = reg.message
+                return
+            }
+        }
+
+        if !isConnected {
+            addDebugEvent("Registered — requesting camera permission for device discovery")
+            await requestEarlyPermission()
+        }
+
         for _ in 0..<60 {
             if isConnected { break }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
 
         guard isConnected else {
-            errorMessage = "Could not connect to glasses"
+            errorMessage = glassesConnectionHelpMessage()
+            addDebugEvent("connectAndListen failed: \(errorMessage ?? "")")
             return
         }
 
-        // Now start listening
         try? await Task.sleep(nanoseconds: 200_000_000)
         await handleWakeWordDetected(manual: true)
     }
