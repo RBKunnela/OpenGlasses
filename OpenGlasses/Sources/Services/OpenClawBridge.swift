@@ -1004,16 +1004,17 @@ class OpenClawBridge: ObservableObject {
         NSLog("[OpenClaw] → Maia session=%@ (%d chars): %@", sessionKey, task.count, String(task.prefix(120)))
 
         do {
-            let attachments: [[String: Any]]
-            if let imageData, OpenClawBridge.isValidVisionImageData(imageData) {
+            var attachments: [[String: Any]] = []
+            var imageBase64: String?
+            if let imageData, Self.isValidVisionImageData(imageData) {
+                let b64 = imageData.base64EncodedString()
+                imageBase64 = b64
                 attachments = [[
                     "type": "image",
                     "mimeType": "image/jpeg",
                     "fileName": "glasses.jpg",
-                    "content": imageData.base64EncodedString()
+                    "content": b64
                 ]]
-            } else {
-                attachments = []
             }
 
             var response: [String: Any]
@@ -1266,10 +1267,13 @@ class OpenClawBridge: ObservableObject {
             "timeoutMs": 120_000,
             "idempotencyKey": UUID().uuidString
         ]
+        if let b64 = imageBase64 {
+            params["imageBase64"] = b64
+        }
         if !attachments.isEmpty {
             params["attachments"] = attachments
         }
-        return try await sendRequest(method: "chat.send", params: params)
+        return try await sendRequest(method: "sessions.send", params: params)
     }
 
     private func storeDeviceTokenIfPresent(from connectResponse: [String: Any]) {
