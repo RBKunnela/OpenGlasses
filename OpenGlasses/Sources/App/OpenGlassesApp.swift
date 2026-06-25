@@ -2375,7 +2375,17 @@ class AppState: ObservableObject, AppStateProtocol {
     private func currentVisionFrameDataIfAvailable() -> Data? {
         guard Config.activeModel?.visionEnabled == true else { return nil }
         guard cameraService.isStreaming, let frame = cameraService.latestFrame else { return nil }
-        return frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality)
+        let data = frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality)
+        return isValidVisionImage(data) ? data : nil
+    }
+
+    /// Reject degenerate images (1x1 placeholders etc.) that the glasses SDK can return
+    /// before a real frame is available. Sending these poisons the conversation context
+    /// on the VPS (Anthropic 400 "Could not process image").
+    private func isValidVisionImage(_ data: Data?) -> Bool {
+        guard let data = data, data.count > 4_000 else { return false } // at least ~4KB
+        guard let img = UIImage(data: data) else { return false }
+        return img.size.width >= 80 && img.size.height >= 80
     }
 
     // MARK: - Smart Camera Activation
@@ -2433,25 +2443,44 @@ class AppState: ObservableObject, AppStateProtocol {
     private func smartCameraCapture(reason: String) async -> Data? {
         print("📷 Smart Camera: activating (\(reason))")
 
-        // If camera is already streaming, just grab the frame
+        let isGlasses = isConnected
+        let forceGlasses = Config.isOpenClawExclusive || Config.simpleMode
+
+        // If already streaming, try the latest frame (but validate it)
         if cameraService.isStreaming, let frame = cameraService.latestFrame {
-            return frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality)
+            if let data = frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality),
+               isValidVisionImage(data) {
+                return data
+            }
+            // bad frame, fall through to wait for a better one
         }
 
-        // Try to start streaming and capture
         do {
             try await cameraService.startStreaming()
-            // Brief wait for first frame
-            try await Task.sleep(nanoseconds: 500_000_000)
-            if let frame = cameraService.latestFrame {
-                print("📷 Smart Camera: captured frame")
-                return frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality)
+
+            // For glasses in iMetaClaw mode, be patient — the first frames can be 1x1 placeholders.
+            let maxWaitMs: UInt64 = forceGlasses && isGlasses ? 3_000_000_000 : 800_000_000
+            let deadline = Date().addingTimeInterval(Double(maxWaitMs) / 1_000_000_000)
+
+            while Date() < deadline {
+                if let frame = cameraService.latestFrame,
+                   let data = frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality),
+                   isValidVisionImage(data) {
+                    print("📷 Smart Camera: captured valid frame")
+                    return data
+                }
+                try await Task.sleep(nanoseconds: 200_000_000) // poll every 200ms
             }
-            // Try photo capture as fallback
+
+            // Final fallback: explicit photo capture
             let photoData = try await cameraService.capturePhoto()
             cameraService.restoreAudioForWakeWord()
-            print("📷 Smart Camera: captured photo")
-            return photoData
+            if isValidVisionImage(photoData) {
+                print("📷 Smart Camera: captured valid photo fallback")
+                return photoData
+            }
+            print("📷 Smart Camera: photo fallback was also invalid, discarding image")
+            return nil
         } catch {
             print("📷 Smart Camera: capture failed — \(error.localizedDescription)")
             return nil
@@ -2791,7 +2820,10 @@ class AppState: ObservableObject, AppStateProtocol {
                     && imageData == nil
                     && VisionIntentDetector.classify(query) == .vision
                     && isConnected {
-                    imageData = try? await cameraService.capturePhoto()
+                    if let candidate = try? await cameraService.capturePhoto(),
+                       isValidVisionImage(candidate) {
+                        imageData = candidate
+                    }
                 }
 
                 rawResponse = try await llmService.sendMessage(
@@ -2914,7 +2946,7 @@ class AppState: ObservableObject, AppStateProtocol {
         do {
             // Use provided image, or fall back to smart camera if no image attached
             let image: Data?
-            if let imageData {
+            if let imageData, isValidVisionImage(imageData) {
                 image = imageData
             } else {
                 image = await smartCameraImageData(for: query)

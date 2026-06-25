@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 // MARK: - Connection Types
 
@@ -1004,7 +1005,7 @@ class OpenClawBridge: ObservableObject {
 
         do {
             let attachments: [[String: Any]]
-            if let imageData {
+            if let imageData, OpenClawBridge.isValidVisionImageData(imageData) {
                 attachments = [[
                     "type": "image",
                     "mimeType": "image/jpeg",
@@ -1291,6 +1292,15 @@ class OpenClawBridge: ObservableObject {
             params["attachments"] = attachments
         }
         return try await sendRequest(method: "agent", params: params)
+    }
+
+    /// Lightweight guard against degenerate images (1x1 placeholders etc.) that can be
+    /// produced when the glasses camera stream is not yet delivering real frames.
+    /// Sending these causes Anthropic 400 errors and poisons the agent's context.
+    static func isValidVisionImageData(_ data: Data?) -> Bool {
+        guard let data = data, data.count > 4_000 else { return false }
+        guard let img = UIImage(data: data) else { return false }
+        return img.size.width >= 80 && img.size.height >= 80
     }
 
     private static func formatGatewayError(from response: [String: Any]) -> String {
