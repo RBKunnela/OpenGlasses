@@ -2835,7 +2835,7 @@ class AppState: ObservableObject, AppStateProtocol {
                     query,
                     locationContext: classification.relevantSections.contains(.location) ? locationService.locationContext : nil,
                     imageData: imageData,
-                    memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
+                    memoryContext: (Config.userMemoryEnabled && !Config.isOpenClawExclusive) ? userMemory.systemPromptContext() : nil,
                     playbookContext: classification.relevantSections.contains(.playbook) ? playbookStore.playbookContext() : nil,
                     nowPlayingContext: nowPlayingAtStart?.promptContext,
                     shortcutsContext: ShortcutsCatalog.shared.promptBlock(),
@@ -2964,7 +2964,7 @@ class AppState: ObservableObject, AppStateProtocol {
                 query,
                 locationContext: locationService.locationContext,
                 imageData: image,
-                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
+                memoryContext: (Config.userMemoryEnabled && !Config.isOpenClawExclusive) ? userMemory.systemPromptContext() : nil,
                 playbookContext: playbookStore.playbookContext(),
                 shortcutsContext: ShortcutsCatalog.shared.promptBlock()
             )
@@ -3084,7 +3084,7 @@ class AppState: ObservableObject, AppStateProtocol {
         do {
             let response = try await llmService.sendMessage(
                 triagePrompt,
-                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
+                memoryContext: (Config.userMemoryEnabled && !Config.isOpenClawExclusive) ? userMemory.systemPromptContext() : nil,
                 agentContext: currentAgentContext
             )
 
@@ -3159,7 +3159,7 @@ class AppState: ObservableObject, AppStateProtocol {
             do {
                 let summary = try await llmService.sendMessage(
                     summaryPrompt,
-                    memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
+                    memoryContext: (Config.userMemoryEnabled && !Config.isOpenClawExclusive) ? userMemory.systemPromptContext() : nil,
                     agentContext: currentAgentContext
                 )
                 let cleaned = summary.trimmingCharacters(in: .whitespacesAndNewlines)

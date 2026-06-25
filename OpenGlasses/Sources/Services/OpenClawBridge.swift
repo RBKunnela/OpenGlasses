@@ -515,7 +515,7 @@ class OpenClawBridge: ObservableObject {
         connectChallengeWaiter = nil
 
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForRequest = 300  // longer for persistent WS
         wsSession = URLSession(configuration: config)
 
         var request = URLRequest(url: url)
@@ -786,12 +786,16 @@ class OpenClawBridge: ObservableObject {
                             self.pendingRunText.removeAll()
                         }
                     }
-                    // Continue the loop if task still exists (may recover)
-                    if self.webSocketTask != nil {
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        continue
+                    // For persistent connection: on receive error, wait a bit and let ensure reconnect if needed.
+                    // Do not break if we can recover.
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if self.webSocketTask == nil {
+                        // attempt to re-establish
+                        Task { [weak self] in
+                            try? await self?.ensureWebSocket()
+                        }
                     }
-                    break
+                    continue
                 }
             }
         }
@@ -885,6 +889,7 @@ class OpenClawBridge: ObservableObject {
     /// Populates `availableGatewayTools` so the system prompt only references live capabilities.
     private func queryAvailableTools() async {
         guard Config.agentModeEnabled else { return }
+        guard !Config.isOpenClawExclusive else { return }  // iMetaClaw doesn't need client-side tools list
         do {
             let response = try await sendRequest(method: "tools.available", params: [:])
             if let ok = response["ok"] as? Bool, ok,
