@@ -750,6 +750,8 @@ class AppState: ObservableObject, AppStateProtocol {
         openClawBridge.cameraService = cameraService
         openClawBridge.audioRecordingService = audioRecorder
         openClawBridge.videoRecorder = videoRecorder
+        openClawBridge.liveTranslationService = liveTranslation
+        openClawBridge.ambientCaptionService = ambientCaptions
 
         // Wire native tool router to LLM service and Gemini Live
         llmService.nativeToolRouter = nativeToolRouter
@@ -1006,7 +1008,9 @@ class AppState: ObservableObject, AppStateProtocol {
         openClawBridge.onGatewayConnected = { [weak self] in
             guard let self else { return }
             Task { @MainActor in
-                await self.userMemory.syncFromGateway()
+                if !Config.isOpenClawExclusive {
+                    await self.userMemory.syncFromGateway()
+                }
             }
         }
 

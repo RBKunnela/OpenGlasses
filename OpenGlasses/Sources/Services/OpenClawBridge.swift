@@ -64,6 +64,13 @@ class OpenClawBridge: ObservableObject {
     var cameraService: CameraService?
     var audioRecordingService: AudioRecordingService?
     var videoRecorder: VideoRecordingService?
+    var liveTranslationService: LiveTranslationService?
+    var ambientCaptionService: AmbientCaptionService?
+
+    /// Bridge-level connection for inbound commands (node.invoke etc). WS handshake success.
+    var isConnected: Bool {
+        connectionState == .connected || webSocketReady || wsConnected
+    }
 
     private let pingSession: URLSession
     private let lanPingSession: URLSession
@@ -340,6 +347,9 @@ class OpenClawBridge: ObservableObject {
             connectionState = .notConfigured
             lastCheckedURL = nil
             return
+        }
+        if isConnecting || (wsConnected && webSocketTask != nil) {
+            return // already good or connecting
         }
         connectionState = .checking
         let endpoint = await resolveEndpoint()
@@ -748,7 +758,11 @@ class OpenClawBridge: ObservableObject {
                             await MainActor.run {
                                 self.handleStreamingChatPayload(event: event, payload: payload)
                             }
+                        case "tick", "heartbeat", "keepalive":
+                            // Server tick every 4s - just keep the socket alive, do not treat as fatal
+                            break
                         default:
+                            NSLog("[OpenClaw] Unhandled event: \(event)")
                             break // Other events handled by OpenClawEventClient
                         }
                     } else if type == "req", let id = json["id"] as? String, let method = json["method"] as? String {
@@ -1399,7 +1413,12 @@ class OpenClawBridge: ObservableObject {
             let action = params["action"] as? String ?? params["command"] as? String ?? ""
             let payload = params["payload"] as? [String: Any] ?? params
 
-            if node == "glasses" || node.isEmpty || action.contains("photo") || action.contains("record") || action.contains("translate") {
+            // Broad match so Maia can drive any glasses action (capture, record, translate, transcribe, status, stop/pare)
+            let a = action.lowercased()
+            if node == "glasses" || node.isEmpty ||
+               a.contains("photo") || a.contains("record") || a.contains("video") ||
+               a.contains("translate") || a.contains("transcribe") || a.contains("status") ||
+               a.contains("note") || a.contains("stop") || a.contains("pare") || a.contains("para") {
                 return await handleGlassesAction(action: action, payload: payload)
             }
             return ["ok": false, "payload": ["error": "Unknown node: \(node)"]]
@@ -1409,25 +1428,28 @@ class OpenClawBridge: ObservableObject {
     }
 
     private func handleGlassesAction(action: String, payload: [String: Any]) async -> [String: Any] {
+        let a = action.lowercased().replacingOccurrences(of: " ", with: "_").replacingOccurrences(of: "-", with: "_")
         do {
-            switch action.lowercased() {
-            case "capture_photo", "take_photo", "photo":
-                guard let cam = cameraService, isConnected else {
-                    return ["ok": false, "payload": ["error": "Glasses not connected or no camera service"]]
+            switch a {
+            // PHOTO / VISION (already works end-to-end)
+            case "capture_photo", "take_photo", "photo", "tira_uma_foto", "tira_foto", "o_que_voce_ve", "que_que_e_isso":
+                guard let cam = cameraService else {
+                    return ["ok": false, "payload": ["error": "No camera service"]]
                 }
                 let imageData = try await cam.capturePhoto()
                 let b64 = imageData.base64EncodedString()
-                // Server will validate and save; we return the base64
+                // IMPORTANT: return imageBase64 so Maia can see (and validate server-side)
                 return ["ok": true, "payload": ["imageBase64": b64, "mimeType": "image/jpeg", "size": imageData.count]]
 
-            case "start_recording", "record_audio", "start_audio":
+            // AUDIO RECORD (grava áudio / anota isso) + transcript on stop
+            case "start_recording", "record_audio", "start_audio", "grava_um_audio", "grava_audio", "anota_isso", "grava_nota":
                 guard let rec = audioRecordingService else {
                     return ["ok": false, "payload": ["error": "No audio service"]]
                 }
                 try rec.startRecording()
                 return ["ok": true, "payload": ["status": "recording_started"]]
 
-            case "stop_recording", "stop_audio":
+            case "stop_recording", "stop_audio", "para_de_gravar", "para_audio", "para_gravacao", "stop_audio":
                 guard let rec = audioRecordingService else {
                     return ["ok": false, "payload": ["error": "No audio service"]]
                 }
@@ -1436,14 +1458,20 @@ class OpenClawBridge: ObservableObject {
                 }
                 return ["ok": true, "payload": ["status": "stopped"]]
 
-            case "start_video", "record_video":
-                guard let vid = videoRecorder, isConnected else {
-                    return ["ok": false, "payload": ["error": "Glasses not connected or no video service"]]
+            // VIDEO RECORD (grava vídeo) — no hard time limit, muxes audio+video
+            case "start_video", "record_video", "grava_um_video", "grava_video", "comeca_a_gravar", "inicia_video", "comeca_gravar":
+                guard let vid = videoRecorder, let cam = cameraService else {
+                    return ["ok": false, "payload": ["error": "No video or camera service"]]
                 }
-                try await vid.startRecording()
-                return ["ok": true, "payload": ["status": "video_recording_started"]]
+                if !cam.isStreaming {
+                    try await cam.startStreaming()
+                }
+                let frameSize = cam.latestFrame?.size ?? CGSize(width: 720, height: 1280)
+                let bitrate = 1_500_000
+                try vid.startRecording(from: cam.framePublisher, bitrate: bitrate, outputSize: frameSize)
+                return ["ok": true, "payload": ["status": "video_recording_started", "note": "No time limit until stop. Includes audio."]]
 
-            case "stop_video":
+            case "stop_video", "para_o_video", "para_video", "stop_recording_video":
                 guard let vid = videoRecorder else {
                     return ["ok": false, "payload": ["error": "No video service"]]
                 }
@@ -1452,23 +1480,78 @@ class OpenClawBridge: ObservableObject {
                 }
                 return ["ok": true, "payload": ["status": "stopped"]]
 
-            case "translate", "translate_live", "start_translation":
-                // Live translation is handled via the mic stream + server or on-device
-                // For explicit, we can note it or trigger if service available
-                return ["ok": true, "payload": ["status": "translation_active_via_stream", "note": "Use live audio stream"]]
+            // LIVE TRANSLATION (modo tradução) — speaks translations via on-device + TTS
+            case "translate", "translate_live", "start_translation", "modo_traducao", "traduz_pro_ingles", "traduz", "traduzir":
+                guard let lt = liveTranslationService else {
+                    return ["ok": false, "payload": ["error": "No live translation service"]]
+                }
+                let source = payload["source"] as? String ?? payload["from"] as? String ?? "auto"
+                let target = payload["target"] as? String ?? payload["to"] as? String ?? "en"
+                lt.start(from: source, to: target)
+                return ["ok": true, "payload": ["status": "translation_started", "source": source, "target": target]]
 
-            case "get_status":
-                return ["ok": true, "payload": ["connected": isConnected, "ws_ready": webSocketReady]]
+            case "stop_translation", "stop_translate", "para_traducao", "para_traduzir", "para_tradução":
+                if let lt = liveTranslationService, lt.isActive {
+                    lt.stop()
+                }
+                return ["ok": true, "payload": ["status": "translation_stopped"]]
 
+            // TRANSCRIBE / MEETING / CONSULTA (transcreve reunião, transcreve consulta)
+            // Starts ambient live captions (no file save by default; transcript collected)
+            case "start_transcribe", "transcribe_start", "modo_reuniao", "transcreve_isso", "transcreve_reuniao", "transcreve_consulta", "start_meeting", "start_consulta", "transcreve":
+                guard let cap = ambientCaptionService else {
+                    return ["ok": false, "payload": ["error": "No ambient caption service"]]
+                }
+                if !cap.isActive {
+                    cap.start()
+                }
+                let mode = a.contains("consulta") ? "consulta" : (a.contains("reuniao") ? "reuniao" : "transcribe")
+                return ["ok": true, "payload": ["status": "transcribing_started", "mode": mode]]
+
+            case "stop_transcribe", "transcribe_stop", "encerra_reuniao", "encerra_consulta", "encerra", "para_transcricao", "para_transcreve", "stop_meeting":
+                if let cap = ambientCaptionService, cap.isActive {
+                    cap.stop()
+                }
+                return ["ok": true, "payload": ["status": "transcribing_stopped"]]
+
+            // STATUS / BATTERY (quanto de bateria?)
+            case "status", "quanto_de_bateria", "quanto_bateria", "estado", "get_status", "bateria":
+                UIDevice.current.isBatteryMonitoringEnabled = true
+                var p: [String: Any] = [
+                    "connected": isConnected,
+                    "ws_ready": webSocketReady,
+                    "audio_recording": audioRecordingService?.isRecording ?? false,
+                    "video_recording": videoRecorder?.isRecording ?? false,
+                    "translation_active": liveTranslationService?.isActive ?? false,
+                    "caption_active": ambientCaptionService?.isActive ?? false,
+                    "glasses_streaming": cameraService?.isStreaming ?? false
+                ]
+                let bat = UIDevice.current.batteryLevel
+                if bat >= 0 {
+                    p["battery_level"] = Int(bat * 100)
+                    p["battery_unit"] = "% (iPhone)"
+                } else {
+                    p["battery_level"] = "unknown"
+                }
+                p["note"] = "Glasses battery not directly readable here — check Meta View app. Use 'pare' to stop any active mode."
+                return ["ok": true, "payload": p]
+
+            // GENERIC STOP / PARE (the pattern you described: "pare", "para xxx", "quando acabar fala pare")
+            case "stop", "pare", "para", "para_tudo", "stop_all", "encerra_tudo", "para_xxx":
+                await stopAllActive()
+                return ["ok": true, "payload": ["status": "stopped_all_active_modes"]]
+
+            // NOTES (from Maia or for later)
             case "add_note", "save_note":
                 let note = payload["note"] as? String ?? payload["text"] as? String ?? ""
-                // For now, log; can integrate with userMemory later
                 NSLog("[OpenClaw] Note from Maia: %@", note)
                 return ["ok": true, "payload": ["status": "note_received", "length": note.count]]
 
             case "get_transcript", "get_notes":
-                // Return basic status; full history can be added if needed
-                return ["ok": true, "payload": ["status": "transcript_available_via_stream", "note": "Use recent conversation"]]
+                let fromCaptions = ambientCaptionService?.captionHistory.map(\.text).joined(separator: " ") ?? ""
+                let fromAudio = audioRecordingService?.recordingTranscript ?? ""
+                let tx = fromCaptions.isEmpty ? fromAudio : fromCaptions
+                return ["ok": true, "payload": ["transcript": tx, "source": fromCaptions.isEmpty ? "audio" : "captions"]]
 
             default:
                 return ["ok": false, "payload": ["error": "Unknown glasses action: \(action)"]]
@@ -1476,6 +1559,22 @@ class OpenClawBridge: ObservableObject {
         } catch {
             return ["ok": false, "payload": ["error": error.localizedDescription]]
         }
+    }
+
+    private func stopAllActive() async {
+        if let rec = audioRecordingService, rec.isRecording {
+            _ = await rec.stopRecording()
+        }
+        if let vid = videoRecorder, vid.isRecording {
+            _ = await vid.stopRecording()
+        }
+        if let lt = liveTranslationService, lt.isActive {
+            lt.stop()
+        }
+        if let cap = ambientCaptionService, cap.isActive {
+            cap.stop()
+        }
+        // Note: transcriptionService if separately started can be added here too
     }
 
     private static func formatGatewayError(from response: [String: Any]) -> String {
