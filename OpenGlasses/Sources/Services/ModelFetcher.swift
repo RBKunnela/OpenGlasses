@@ -70,7 +70,7 @@ enum ModelFetcher {
             return await fetchQwen(apiKey: apiKey, baseURL: baseURL)
         case .minimax:
             return await fetchMiniMax(apiKey: apiKey, baseURL: baseURL)
-        case .openai, .groq, .zai, .openrouter, .custom, .xai:
+        case .openai, .groq, .zai, .openrouter, .custom, .xai, .nvidia:
             return await fetchOpenAICompatible(apiKey: apiKey, baseURL: baseURL)
         case .local, .appleOnDevice:
             return []  // Local/Apple models are managed separately

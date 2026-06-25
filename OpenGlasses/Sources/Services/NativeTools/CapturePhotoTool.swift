@@ -25,8 +25,9 @@ struct CapturePhotoTool: NativeTool {
     func execute(args: [String: Any]) async throws -> String {
         // First check if we have a recent frame already available
         if let latestFrame = await MainActor.run(body: { cameraService.latestFrame }),
-           let raw = latestFrame.jpegData(compressionQuality: 0.8) {
-            let data = LLMImagePreparer.prepared(raw)   // keep under Anthropic's 5 MB inline cap
+           let raw = latestFrame.jpegData(compressionQuality: 0.8),
+           let data = LLMImagePreparer.prepared(raw) {
+            // Guard: LLMImagePreparer returns nil for degenerate frames (e.g. 1×1 placeholders).
             let base64 = data.base64EncodedString()
             let sizeKB = data.count / 1024
             NSLog("[CapturePhoto] Using latest frame (%d KB)", sizeKB)
@@ -35,7 +36,10 @@ struct CapturePhotoTool: NativeTool {
 
         // Fall back to explicit photo capture
         do {
-            let photoData = LLMImagePreparer.prepared(try await cameraService.capturePhoto())
+            let raw = try await cameraService.capturePhoto()
+            guard let photoData = LLMImagePreparer.prepared(raw) else {
+                return "Camera returned a degenerate frame (too small to process). Please try again in a moment — the camera may still be initialising."
+            }
             let base64 = photoData.base64EncodedString()
             let sizeKB = photoData.count / 1024
             NSLog("[CapturePhoto] Captured photo (%d KB)", sizeKB)

@@ -240,6 +240,16 @@ struct LocalModelManagerView: View {
             }
             .buttonStyle(.borderless)
             .accessibilityLabel("Model loaded — tap to unload")
+        } else if !LocalLLMService.isGPULoadAllowed {
+            Text("VPS")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.green)
+                .accessibilityLabel("Voice uses VPS agent")
+        } else if localService?.canLoadModel(modelId) == false {
+            Image(systemName: "memorychip")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .accessibilityLabel("Not enough RAM for this model")
         } else {
             Button { loadLocalModel(modelId) } label: {
                 Text("Load")

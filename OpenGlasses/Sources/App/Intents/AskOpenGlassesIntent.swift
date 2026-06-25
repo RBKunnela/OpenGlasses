@@ -4,7 +4,7 @@ import AppIntents
 /// User configures: Settings → Action Button → Shortcut → "Ask OpenGlasses".
 /// Skips wake word detection entirely — just starts transcribing immediately.
 struct AskOpenGlassesIntent: AppIntent {
-    static var title: LocalizedStringResource = "Ask OpenGlasses"
+    static var title: LocalizedStringResource = "Ask iMetaClaw"
     static var description = IntentDescription("Start listening for a voice command without the wake word")
 
     static var isDiscoverable: Bool { true }
@@ -33,14 +33,14 @@ struct AskOpenGlassesIntent: AppIntent {
         case appNotRunning
 
         var localizedStringResource: LocalizedStringResource {
-            "OpenGlasses is not running. Open the app first."
+            AppBranding.appNotRunningLocalized
         }
     }
 }
 
 /// AppIntent to take a photo and analyze it.
 struct TakePhotoIntent: AppIntent {
-    static var title: LocalizedStringResource = "OpenGlasses Photo"
+    static var title: LocalizedStringResource = "iMetaClaw Photo"
     static var description = IntentDescription("Take a photo with the glasses and describe what you see")
 
     static var isDiscoverable: Bool { true }
@@ -60,7 +60,7 @@ struct TakePhotoIntent: AppIntent {
         case appNotRunning
 
         var localizedStringResource: LocalizedStringResource {
-            "OpenGlasses is not running. Open the app first."
+            AppBranding.appNotRunningLocalized
         }
     }
 }
@@ -94,7 +94,7 @@ struct OpenGlassesShortcuts: AppShortcutsProvider {
                 "Hey \(.applicationName)",
                 "\(.applicationName) listen"
             ],
-            shortTitle: "Ask OpenGlasses",
+            shortTitle: "Ask iMetaClaw",
             systemImageName: "mic.fill"
         )
         AppShortcut(

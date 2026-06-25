@@ -130,17 +130,14 @@ struct ModelFormView: View {
                 }
 
                 // Manual token / API key field (always shown so user can paste if OAuth fails)
-                TextField(
-                    selectedProvider == .custom
+                PasteableFormSecretField(
+                    title: selectedProvider == .custom
                         ? "API Key (optional for local servers)"
                         : selectedProvider.isOAuthProvider ? "Token (auto-filled after sign-in)"
                         : selectedProvider.isSubscriptionBased ? "Subscription Token" : "API Key",
-                    text: $apiKey
+                    text: $apiKey,
+                    onTextChange: { resetModelList() }
                 )
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-                .textContentType(.oneTimeCode)
-                .onChange(of: apiKey) { _, _ in resetModelList() }
 
                 if let url = selectedProvider.consoleURL {
                     Link(destination: url) {
@@ -381,6 +378,7 @@ struct ModelFormView: View {
         case .openai: return "Get your API key at platform.openai.com"
         case .gemini: return "Get your API key at aistudio.google.com"
         case .groq: return "Get your API key at console.groq.com"
+        case .nvidia: return "NVIDIA NIM — paste your API key from build.nvidia.com/settings/api-keys. Uses Llama, Nemotron, and other NIM models via the OpenAI-compatible endpoint."
         case .xai: return "xAI Grok subscription — paste your API key from console.x.ai. Works with Grok 3, Grok 3 Mini, and Grok 2 Vision."
         case .zai: return "Z.ai GLM subscription — paste your token from z.ai. Uses GLM-4.5 and other GLM models via the coding endpoint."
         case .qwen: return "Qwen subscription — paste your token from the Alibaba Cloud DashScope console. Uses the international coding endpoint."

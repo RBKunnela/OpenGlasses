@@ -69,10 +69,7 @@ struct ServicesSettingsView: View {
 
             // MARK: Text-to-Speech
             Section {
-                TextField("API Key", text: $elevenLabsKeyInput)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .textContentType(.oneTimeCode)
+                PasteableFormSecretField(title: "API Key", text: $elevenLabsKeyInput)
 
                 if elevenLabsKeyInput.isEmpty {
                     Link(destination: URL(string: "https://elevenlabs.io/app/settings/api-keys")!) {
@@ -255,10 +252,7 @@ struct ServicesSettingsView: View {
 
             // MARK: Web Search
             Section {
-                TextField("API Key", text: $perplexityKeyInput)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .textContentType(.oneTimeCode)
+                PasteableFormSecretField(title: "API Key", text: $perplexityKeyInput)
 
                 if perplexityKeyInput.isEmpty {
                     Link(destination: URL(string: "https://www.perplexity.ai/settings/api")!) {
@@ -372,10 +366,7 @@ struct ServicesSettingsView: View {
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
 
-                TextField("Stream Key", text: $broadcastStreamKey)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .textContentType(.oneTimeCode)
+                PasteableFormSecretField(title: "Stream Key", text: $broadcastStreamKey)
             } header: {
                 Text("Live Streaming")
             } footer: {
@@ -396,13 +387,9 @@ struct ServicesSettingsView: View {
                         Config.setHomeAssistantURL(newValue)
                     }
 
-                TextField("Long-Lived Access Token", text: $haToken)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .textContentType(.oneTimeCode)
-                    .onChange(of: haToken) { _, newValue in
-                        Config.setHomeAssistantToken(newValue)
-                    }
+                PasteableFormSecretField(title: "Long-Lived Access Token", text: $haToken) {
+                    Config.setHomeAssistantToken(haToken)
+                }
             } header: {
                 Text("Home Assistant")
             } footer: {

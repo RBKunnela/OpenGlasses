@@ -5,6 +5,7 @@ struct AgentSettingsView: View {
     @ObservedObject var appState: AppState
     @State private var agentName: String = Config.agentName
     @State private var saved = false
+    @State private var showResetConfirmation = false
 
     private var wakePreview: String {
         AppBranding.wakePhraseDisplay(for: agentName)
@@ -58,7 +59,7 @@ struct AgentSettingsView: View {
             } header: {
                 Text("Conexão")
             } footer: {
-                Text("Configure a URL e o token do gateway OpenClaw no seu VPS (Hostinger ou outro).")
+                Text("Maia no KVM2: \(AppBranding.defaultMaiaGatewayURL). Não use Hermes / aicontexteng.com (KVM4).")
             }
 
             Section {
@@ -69,16 +70,42 @@ struct AgentSettingsView: View {
                 }
                 .disabled(agentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
+
+            Section {
+                Button(role: .destructive) {
+                    showResetConfirmation = true
+                } label: {
+                    Label("Reiniciar configuração inicial", systemImage: "arrow.counterclockwise")
+                }
+            } footer: {
+                Text("Mostra o assistente de boas-vindas novamente e faz o agente perguntar seu nome e preferências. Suas chaves de API e gateway são mantidos.")
+            }
         }
         .navigationTitle("Agente")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             agentName = Config.agentName
         }
+        .confirmationDialog(
+            "Reiniciar configuração?",
+            isPresented: $showResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Reiniciar", role: .destructive) {
+                Config.resetOnboardingForFreshStart()
+                agentName = Config.agentName
+                saved = false
+                NotificationCenter.default.post(name: .onboardingReset, object: nil)
+            }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("O assistente de configuração vai aparecer de novo na tela principal.")
+        }
     }
 
     private func save() {
         Config.setAgentName(agentName)
+        Config.ensurePrimaryAgentPersona()
         saved = true
         Task {
             await appState.openClawBridge.checkConnection()

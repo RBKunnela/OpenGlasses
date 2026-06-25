@@ -14,12 +14,14 @@ final class ConfigTests: XCTestCase {
         "openClawGatewayToken",
         "geminiLiveAPIKey",
         "geminiLiveModel",
+        "simpleMode",
     ]
 
     // Secrets now live in the Keychain (see KeychainService), so they must be
     // cleared there too — clearing UserDefaults alone would leave them set.
     private let keychainTestKeys = [
         "openClawGatewayToken",
+        "savedGateways",
     ]
 
     override func setUp() {
@@ -48,11 +50,25 @@ final class ConfigTests: XCTestCase {
     }
 
     func testAppModeSetAndGet() {
+        Config.setSimpleMode(false)
         Config.setAppMode(.geminiLive)
         XCTAssertEqual(Config.appMode, .geminiLive)
 
         Config.setAppMode(.direct)
         XCTAssertEqual(Config.appMode, .direct)
+        Config.setSimpleMode(true)
+    }
+
+    func testAppModeLockedToDirectInSimpleMode() {
+        Config.setSimpleMode(true)
+        Config.setAppMode(.geminiLive)
+        XCTAssertEqual(Config.appMode, .direct)
+    }
+
+    func testPhoneAIStrategyLockedToVPSOnlyInSimpleMode() {
+        Config.setSimpleMode(true)
+        Config.setPhoneAIStrategy(.cloudOnly)
+        XCTAssertEqual(Config.phoneAIStrategy, .vpsOnly)
     }
 
     func testAppModeEnum() {
@@ -197,5 +213,58 @@ final class ConfigTests: XCTestCase {
 
     func testOpenClawConnectionModeAllCases() {
         XCTAssertEqual(OpenClawConnectionMode.allCases.count, 3)
+    }
+
+    // MARK: - Maia-only gateway (simple mode)
+
+    func testEnabledGatewaysExcludeHermesInSimpleMode() {
+        Config.setSimpleMode(true)
+        let hermes = GatewayConfig(
+            id: "hermes",
+            name: "Hermes",
+            provider: GatewayProvider.openclaw.rawValue,
+            lanHost: "",
+            port: 18789,
+            tunnelHost: "https://aicontexteng.com",
+            token: "secret",
+            connectionMode: OpenClawConnectionMode.tunnel.rawValue,
+            enabled: true,
+            priority: 0
+        )
+        let maia = GatewayConfig(
+            id: "maia",
+            name: "Maia VPS",
+            provider: GatewayProvider.openclaw.rawValue,
+            lanHost: "",
+            port: 18789,
+            tunnelHost: GatewayEndpoint.defaultMaiaGatewayURL,
+            token: "secret",
+            connectionMode: OpenClawConnectionMode.tunnel.rawValue,
+            enabled: true,
+            priority: 1
+        )
+        Config.setSavedGateways([hermes, maia])
+        XCTAssertEqual(Config.enabledGateways.map(\.id), ["maia"])
+    }
+
+    func testMigrateHermesGatewayToMaiaRewritesSavedURL() {
+        Config.setSimpleMode(true)
+        Config.setOpenClawTunnelHost("https://aicontexteng.com")
+        let gw = GatewayConfig(
+            id: "legacy",
+            name: "OpenClaw",
+            provider: GatewayProvider.openclaw.rawValue,
+            lanHost: "",
+            port: 18789,
+            tunnelHost: "https://aicontexteng.com",
+            token: "secret",
+            connectionMode: OpenClawConnectionMode.tunnel.rawValue,
+            enabled: true,
+            priority: 0
+        )
+        Config.setSavedGateways([gw])
+        Config.migrateHermesGatewayToMaiaIfNeeded()
+        XCTAssertEqual(Config.openClawTunnelHost, GatewayEndpoint.defaultMaiaGatewayURL)
+        XCTAssertEqual(Config.savedGateways.first?.tunnelHost, GatewayEndpoint.defaultMaiaGatewayURL)
     }
 }

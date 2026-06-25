@@ -25,7 +25,7 @@ struct StatusIndicator: View {
                         .frame(width: 48, height: 48)
 
                     Group {
-                        if iconName == "OpenGlassesLogo" {
+                        if iconName == AppBranding.logoIconName {
                             LogoIcon(size: 26)
                         } else {
                             Image(systemName: iconName)
@@ -96,7 +96,7 @@ struct StatusIndicator: View {
 
     private var activeModeBadge: some View {
         let persona = appState.activePersona
-        let name = persona?.name ?? "OpenGlasses"
+        let name = persona?.name ?? Config.agentName
         let icon = persona?.icon ?? "sparkles"
         let connected = appState.isConnected
         let badgeColor: Color = connected ? .green : .gray
@@ -107,7 +107,7 @@ struct StatusIndicator: View {
                 .frame(width: 6, height: 6)
                 .accessibilityHidden(true)
             Group {
-                if icon == "OpenGlassesLogo" {
+                if icon == AppBranding.logoIconName {
                     LogoIcon(size: 11)
                 } else {
                     Image(systemName: icon)
@@ -131,7 +131,7 @@ struct StatusIndicator: View {
 
     private var iconName: String {
         if !appState.isConnected {
-            return "OpenGlassesLogo"
+            return AppBranding.logoIconName
         }
 
         if appState.glassesIdle {
@@ -141,23 +141,23 @@ struct StatusIndicator: View {
         if isGemini {
             switch session.connectionState {
             case .ready where session.isModelSpeaking: return "speaker.wave.3.fill"
-            case .ready: return "OpenGlassesLogo"
+            case .ready: return AppBranding.logoIconName
             case .connecting, .settingUp: return "antenna.radiowaves.left.and.right"
             case .error: return "exclamationmark.triangle.fill"
-            case .disconnected: return "OpenGlassesLogo"
+            case .disconnected: return AppBranding.logoIconName
             }
         } else if isOpenAI {
             switch openAISession.connectionState {
             case .ready where openAISession.isModelSpeaking: return "speaker.wave.3.fill"
-            case .ready: return "OpenGlassesLogo"
+            case .ready: return AppBranding.logoIconName
             case .connecting, .settingUp: return "antenna.radiowaves.left.and.right"
             case .error: return "exclamationmark.triangle.fill"
-            case .disconnected: return "OpenGlassesLogo"
+            case .disconnected: return AppBranding.logoIconName
             }
         } else {
             if appState.isListening { return "ear.fill" }
             if appState.speechService.isSpeaking { return "speaker.wave.3.fill" }
-            return "OpenGlassesLogo"
+            return AppBranding.logoIconName
         }
     }
 
@@ -220,9 +220,16 @@ struct StatusIndicator: View {
             case .disconnected: return openAISession.reconnecting ? "Reconnecting..." : "Disconnected"
             }
         } else {
-            if appState.isListening { return "Listening..." }
-            if appState.speechService.isSpeaking { return "Speaking..." }
-            return "Ready"
+            if appState.isProcessing { return "Pensando com \(Config.agentName)…" }
+            if appState.isListening { return "Ouvindo você…" }
+            if appState.speechService.isSpeaking { return "Falando…" }
+            if appState.wakeWordService.isListening {
+                return "Diga \(AppBranding.wakePhraseDisplay(for: Config.agentName))"
+            }
+            if Config.silentMode {
+                return "Toque no microfone para falar"
+            }
+            return "Pronto — toque no microfone"
         }
     }
 

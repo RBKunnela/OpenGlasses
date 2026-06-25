@@ -29,6 +29,6 @@ enum IntentConnectionError: Error, CustomLocalizedStringResourceConvertible {
     case appNotRunning
 
     var localizedStringResource: LocalizedStringResource {
-        "OpenGlasses is not running. Open the app first."
+        AppBranding.appNotRunningLocalized
     }
 }

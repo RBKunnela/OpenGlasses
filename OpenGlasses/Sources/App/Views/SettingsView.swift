@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var modelConfigs: [ModelConfig] = Config.savedModels
     @State private var editingModel: ModelConfig? = nil
     @State private var showAddModel = false
+    @State private var phoneAIStrategy: PhoneAIStrategy = Config.phoneAIStrategy
 
     // Intelligence settings
     @State private var intentClassifierEnabled = Config.intentClassifierEnabled
@@ -85,7 +86,7 @@ struct SettingsView: View {
                             }
                         }
                     ),
-                    info: "Turns off the always-on wake-word listener so the mic isn't held in the background — fixes conflicts with music/podcasts playing at the same time. Start a conversation on demand instead: the iPhone Action Button (\"Ask OpenGlasses\"), Siri, the home screen widget, the Apple Watch, or a manual mic tap."
+                    info: "Desliga o microfone sempre ativo. Inicie conversas pelo botão de Ação do iPhone (\"Perguntar ao \(AppBranding.name)\"), Siri, widget, Apple Watch ou toque no microfone."
                 )
 
                 InfoToggle(
@@ -94,7 +95,7 @@ struct SettingsView: View {
                         get: { Config.siriAskOpensApp },
                         set: { Config.setSiriAskOpensApp($0) }
                     ),
-                    info: "When you say \"Hey Siri, ask OpenGlasses…\", the answer is normally spoken hands-free without opening the app. Turn this on if Siri says OpenGlasses isn't running — it launches the app first so the question always goes through, at the cost of bringing the app to the foreground."
+                    info: "Com \"Ei Siri, pergunte ao \(AppBranding.name)…\" a resposta costuma ser falada sem abrir o app. Ative se a Siri disser que o \(AppBranding.name) não está em execução."
                 )
             } header: {
                 Text("Voice")
@@ -103,6 +104,7 @@ struct SettingsView: View {
             }
 
             // MARK: Hands-Free Triggers
+            if !Config.simpleMode {
             Section {
                 ForEach(AlternativeTrigger.allCases) { trigger in
                     InfoToggle(
@@ -122,70 +124,107 @@ struct SettingsView: View {
             } footer: {
                 Text("Alternative ways to start the assistant without the wake word — for noisy, silent, or no-speech situations. All are off by default. The Volume Button trigger can interfere with normal volume control.")
             }
+            }
 
-            // MARK: AI Models
-            Section {
-                ForEach(modelConfigs) { model in
-                    Button {
-                        editingModel = model
+            if Config.simpleMode {
+                Section {
+                    LabeledContent("Modo") {
+                        Text("Terminal VPS")
+                            .foregroundStyle(.secondary)
+                    }
+                    LabeledContent("Agente") {
+                        Text(Config.agentName)
+                            .foregroundStyle(.secondary)
+                    }
+                    NavigationLink {
+                        GatewaySettingsView(appState: appState)
                     } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(model.name)
-                                    .foregroundStyle(Color(.label))
-                                    .lineLimit(1)
-                                HStack(spacing: 4) {
-                                    Text(model.llmProvider.displayName)
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
+                        Label("OpenClaw Gateway", systemImage: "server.rack")
+                    }
+                } header: {
+                    Text("OpenClaw")
+                } footer: {
+                    Text("O iPhone só faz mic, óculos e TTS. Toda inteligência vem de \(Config.agentName) no VPS — sem Qwen, NVIDIA ou API no telefone.")
+                }
+            } else {
+                // MARK: AI Models
+                Section {
+                    ForEach(modelConfigs) { model in
+                        Button {
+                            editingModel = model
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(model.name)
+                                        .foregroundStyle(Color(.label))
                                         .lineLimit(1)
-                                    if model.visionEnabled {
-                                        Image(systemName: "eye")
-                                            .font(.caption2)
-                                            .foregroundStyle(Color(.label))
-                                            .accessibilityLabel("Vision enabled")
-                                    }
-                                    if !model.apiKey.isEmpty {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .font(.caption2)
-                                            .foregroundStyle(.green)
-                                            .accessibilityLabel("API key set")
-                                    } else {
-                                        Image(systemName: "exclamationmark.circle")
-                                            .font(.caption2)
-                                            .foregroundStyle(.orange)
-                                            .accessibilityLabel("API key missing")
+                                    HStack(spacing: 4) {
+                                        Text(model.llmProvider.displayName)
+                                            .font(.footnote)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                        if model.visionEnabled {
+                                            Image(systemName: "eye")
+                                                .font(.caption2)
+                                                .foregroundStyle(Color(.label))
+                                                .accessibilityLabel("Vision enabled")
+                                        }
+                                        if !model.apiKey.isEmpty {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .font(.caption2)
+                                                .foregroundStyle(.green)
+                                                .accessibilityLabel("API key set")
+                                        } else {
+                                            Image(systemName: "exclamationmark.circle")
+                                                .font(.caption2)
+                                                .foregroundStyle(.orange)
+                                                .accessibilityLabel("API key missing")
+                                        }
                                     }
                                 }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityHidden(true)
                             }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .accessibilityHidden(true)
                         }
+                        .buttonStyle(.plain)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("\(model.name), \(model.llmProvider.displayName)\(!model.apiKey.isEmpty ? "" : ", API key missing")\(model.visionEnabled ? ", vision enabled" : "")")
+                        .accessibilityHint("Double-tap to edit")
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel("\(model.name), \(model.llmProvider.displayName)\(!model.apiKey.isEmpty ? "" : ", API key missing")\(model.visionEnabled ? ", vision enabled" : "")")
-                    .accessibilityHint("Double-tap to edit")
-                }
-                .onDelete { indexSet in
-                    modelConfigs.remove(atOffsets: indexSet)
+                    .onDelete { indexSet in
+                        modelConfigs.remove(atOffsets: indexSet)
+                    }
+
+                    Button {
+                        showAddModel = true
+                    } label: {
+                        Label("Add Model", systemImage: "plus.circle.fill")
+                    }
+                } header: {
+                    Text("AI Models")
+                } footer: {
+                    Text("Models are the AI you talk to. Add a key for any provider you want — you can switch between them anytime from the main screen.")
                 }
 
-                Button {
-                    showAddModel = true
-                } label: {
-                    Label("Add Model", systemImage: "plus.circle.fill")
+                Section {
+                    Picker("Estratégia de IA no iPhone", selection: $phoneAIStrategy) {
+                        ForEach(PhoneAIStrategy.allCases) { strategy in
+                            Label(strategy.title, systemImage: strategy.icon).tag(strategy)
+                        }
+                    }
+                    .onChange(of: phoneAIStrategy) { _, newValue in
+                        Config.setPhoneAIStrategy(newValue)
+                    }
+                } footer: {
+                    Text(phoneAIStrategy.subtitle(agentName: Config.agentName))
                 }
-            } header: {
-                Text("AI Models")
-            } footer: {
-                Text("Models are the AI you talk to. Add a key for any provider you want — you can switch between them anytime from the main screen.")
             }
 
             // MARK: Personality
+            if !Config.simpleMode {
             Section {
                 NavigationLink {
                     PersonasView()
@@ -213,11 +252,13 @@ struct SettingsView: View {
             } footer: {
                 Text("Personas are different characters with their own model + prompt (e.g. a museum docent, a fitness coach). System Prompt tweaks the default voice and behaviour.")
             }
+            }
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             // MARK: — Intelligence
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+            if !Config.simpleMode {
             Section {
                 InfoToggle(
                     title: "Intent Classifier",
@@ -272,6 +313,7 @@ struct SettingsView: View {
             } footer: {
                 Text("Intent Classifier ignores nearby chatter so the AI only responds when you're talking to it. Memory and History let the AI remember who you are across sessions. Smart Routing picks the right model for the task; Agentic Features let the AI take multi-step actions on its own.")
             }
+            }
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             // MARK: — Privacy & Compliance
@@ -283,6 +325,7 @@ struct SettingsView: View {
             // MARK: — Tools & Actions
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+            if !Config.simpleMode {
             Section {
                 NavigationLink {
                     QuickActionsSettingsView()
@@ -403,6 +446,7 @@ struct SettingsView: View {
             } footer: {
                 Text("Quick Actions are shortcuts you can tap from the widget. Tools are built-in capabilities (camera, search, HomeKit, music…). Custom Tools and Playbooks let you script your own. The Skill Store adds community-built skills.")
             }
+            }
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             // MARK: — Connections
@@ -438,16 +482,20 @@ struct SettingsView: View {
                     }
                 }
 
-                NavigationLink {
-                    MCPServersView()
-                        .environmentObject(appState)
-                } label: {
-                    Label("MCP Servers", systemImage: "point.3.connected.trianglepath.dotted")
+                if !Config.simpleMode {
+                    NavigationLink {
+                        MCPServersView()
+                            .environmentObject(appState)
+                    } label: {
+                        Label("MCP Servers", systemImage: "point.3.connected.trianglepath.dotted")
+                    }
                 }
             } header: {
                 Text("Connected Apps & Services")
             } footer: {
-                Text("ElevenLabs voices, Perplexity search, broadcast targets, and live-streaming live under Services. Gateways are OpenClaw bridges to your devices (smart home, automations). MCP Servers expose external tool servers the AI can call.")
+                Text(Config.simpleMode
+                     ? "Gateways conectam ao OpenClaw no VPS. Serviços opcionais: voz ElevenLabs, busca Perplexity."
+                     : "ElevenLabs voices, Perplexity search, broadcast targets, and live-streaming live under Services. Gateways are OpenClaw bridges to your devices (smart home, automations). MCP Servers expose external tool servers the AI can call.")
             }
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -467,36 +515,40 @@ struct SettingsView: View {
                     Label("Hardware & Privacy", systemImage: "lock.shield")
                 }
 
-                NavigationLink {
-                    MedicalCompliancePaywallView(
-                        hipaaService: appState.hipaaService,
-                        exportService: appState.medicalExportService
-                    )
-                } label: {
-                    HStack {
-                        Label("Medical Compliance", systemImage: "cross.case.fill")
-                        Spacer()
-                        if StoreKitService.shared.canAccessMedicalCompliance && Config.hipaaMode {
-                            Image(systemName: "cross.case.fill")
-                                .font(.caption)
-                                .foregroundStyle(AppAccent.aiCoral)
-                                .accessibilityHidden(true)
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.green)
-                                .accessibilityLabel("Active")
-                        } else if !StoreKitService.shared.canAccessMedicalCompliance {
-                            Image(systemName: "cross.case.fill")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .accessibilityHidden(true)
+                if !Config.simpleMode {
+                    NavigationLink {
+                        MedicalCompliancePaywallView(
+                            hipaaService: appState.hipaaService,
+                            exportService: appState.medicalExportService
+                        )
+                    } label: {
+                        HStack {
+                            Label("Medical Compliance", systemImage: "cross.case.fill")
+                            Spacer()
+                            if StoreKitService.shared.canAccessMedicalCompliance && Config.hipaaMode {
+                                Image(systemName: "cross.case.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(AppAccent.aiCoral)
+                                    .accessibilityHidden(true)
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                                    .accessibilityLabel("Active")
+                            } else if !StoreKitService.shared.canAccessMedicalCompliance {
+                                Image(systemName: "cross.case.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityHidden(true)
+                            }
                         }
                     }
                 }
             } header: {
                 Text("Glasses & Privacy")
             } footer: {
-                Text("Mic source, on-device bystander-face blurring, and encrypted conversations live in Hardware & Privacy. Medical Compliance enables HIPAA-grade encryption and exports for clinical use (separate subscription).")
+                Text(Config.simpleMode
+                     ? "Microfone dos óculos, privacidade e criptografia de conversas."
+                     : "Mic source, on-device bystander-face blurring, and encrypted conversations live in Hardware & Privacy. Medical Compliance enables HIPAA-grade encryption and exports for clinical use (separate subscription).")
             }
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -597,25 +649,10 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Button {
-                    let webURL = URL(string: "https://discord.gg/8W2qaXJzz9")!
-                    UIApplication.shared.open(webURL)
-                } label: {
-                    HStack {
-                        Label("Discord", systemImage: "bubble.left.and.bubble.right")
-                        Spacer()
-                        Text("OpenGlasses Discord")
-                            .foregroundStyle(.secondary)
-                        Image(systemName: "arrow.up.right")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .foregroundStyle(Color(.label))
             } header: {
-                Text("About")
+                Text("Sobre")
             } footer: {
-                Text("OpenGlasses is an open-source community project. Join the Discord for help, ideas, and to share what you've built.")
+                Text(AppBranding.aboutBlurb)
             }
         }
         .navigationTitle("Settings")

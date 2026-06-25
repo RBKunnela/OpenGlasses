@@ -7,7 +7,7 @@ import SwiftUI
 struct MainView: View {
     @EnvironmentObject var appState: AppState
     @State private var selectedTab = 0
-    @State private var showOnboarding = Config.needsOnboarding
+    @State private var showOnboarding = !Config.hasCompletedOnboarding
     @AppStorage("appAppearance") private var appearance: String = "dark"
     @AppStorage("accentColorName") private var accentColorName: String = "green"
 
@@ -30,7 +30,7 @@ struct MainView: View {
                     VoiceTab()
                 }
 
-                Tab("Modes", systemImage: "person.2.fill", value: 1) {
+                Tab(Config.simpleMode ? "Agente" : "Modes", systemImage: Config.simpleMode ? "person.crop.circle" : "person.2.fill", value: 1) {
                     NavigationStack {
                         PersonaPickerTab(appState: appState)
                     }
@@ -60,6 +60,9 @@ struct MainView: View {
         }
         .environment(\.appAccent, accent)
         .animation(.easeInOut(duration: 0.3), value: showOnboarding)
+        .onReceive(NotificationCenter.default.publisher(for: .onboardingReset)) { _ in
+            showOnboarding = true
+        }
         .preferredColorScheme(colorScheme)
         .sheet(item: $appState.phoneCameraRequest) { request in
             PhoneCameraView(

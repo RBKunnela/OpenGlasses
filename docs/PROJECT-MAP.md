@@ -13,13 +13,14 @@ meta:
   fork_owner: Renata Baldissara-Kunnela (renatbk@gmail.com)
   apple_team: VF88UK56C3
   bundle_id: com.clawglasses.app
-  agent_vps: Hostinger kmv2 — OpenClaw agent "Maia" + Telegram bot
+  agent_vps: Hostinger KVM2 (srv753644) — OpenClaw agent "Maia" + Telegram bot
+  hermes_vps: Hostinger KVM4 (aicontexteng.com) — AIOX/Hermes infra — NOT for glasses
   market: Brazil (pt-BR) + international (en)
   strategy: Phase 1 quick wins on iOS fork → Phase 2 iMetaClaw stripped fork → Phase 3 Android thin client
-  map_version: "1.0.0"
+  map_version: "1.1.0"
   last_updated: "2026-06-25"
-  map_author: Grok (session) + Manus (sessions 1–3)
-  status_overall: IN_PROGRESS — Phase 1 ~35% complete
+  map_author: Grok (sessions 4–5) + Manus (sessions 1–3)
+  status_overall: IN_PROGRESS — Phase 1 ~50% complete; Maia E2E blocked on KVM2 /ws (Caddy)
 ```
 
 ---
@@ -34,8 +35,8 @@ The repo is a **brownfield fork** of upstream OpenGlasses (~400 Swift files, 85+
 |-----------|-------|
 | **Build & install** | ✅ Builds on device (USB) |
 | **Branding (iMetaClaw)** | 🚧 Done in working tree, not committed |
-| **Maia / VPS connected** | ❌ Not configured end-to-end |
-| **Sell-ready for Brazil** | ❌ Needs pt-BR completion, gateway wizard, simple mode |
+| **Maia / VPS connected** | ⚠️ **Blocked** — HTTP OK, WebSocket `/ws` returns 403 on KVM2 |
+| **Sell-ready for Brazil** | ❌ Needs pt-BR completion, gateway wizard; `simpleMode` done (uncommitted) |
 | **TestFlight** | ❌ Not started |
 | **Meta Wearables review** | ❌ Not registered |
 
@@ -56,7 +57,8 @@ The repo is a **brownfield fork** of upstream OpenGlasses (~400 Swift files, 85+
 | Gateway onboarding wizard | **CREATE** | Users cannot configure VPS from terminal |
 | Pairing QR (`imetaclaw://connect?...`) | **CREATE** | Reseller / full-stack sales flow |
 | `RecordingSettingsView` | **CREATE** | Recording + translation hub in Settings |
-| `simpleMode` feature flag | **CREATE** | Hide 90% of upstream features |
+| `simpleMode` feature flag | **CREATE** | ✅ Implemented (uncommitted) — VPS terminal mode |
+| Maia-only gateway guard | **CREATE** | ✅ `GatewayEndpoint.isHermesHost`, migration, block Hermes URLs |
 | VPS `openclaw install imetaclaw-bridge` | **CREATE** | Server-side pairing code generator |
 | Android thin client | **DEFERRED** | After iOS sells; shared protocol doc first |
 | Flutter/RN cross-platform UI | **REJECTED** | Meta Wearables DAT SDK is iOS-native |
@@ -79,14 +81,25 @@ iMetaClaw iOS App (thin client)
   • Optional: user AI APIs (Advanced mode)
         │ HTTPS / WebSocket (Bearer token)
         ▼
-Hostinger VPS (or any host)
-  • OpenClaw Gateway (:18789)
-  • Maia agent
-  • Telegram bot (same agent)
-  • Claude / Grok / skills (server-side)
+Hostinger KVM2 — Maia ONLY (srv753644.hstgr.cloud)
+  • Caddy :443 → must proxy /ws + /health → 127.0.0.1:18789 (OpenClaw)
+  • Maia agent + Telegram bot (same OpenClaw session)
+  • Port 18789 NOT public; iPhone uses HTTPS/WSS on 443 only
+
+Hostinger KVM4 — Hermes (aicontexteng.com) — separate stack
+  • AIOX / Hermes gateway / nginx — do NOT point iMetaClaw here
 ```
 
 **Hard constraint:** Video/photo capture on Ray-Ban Meta **always triggers hardware capture LED** — cannot be disabled by third-party apps. **Discrete recording = audio-only only.**
+
+### VPS inventory (corrected Jun 25, 2026)
+
+| VPS | Hostname | IP | Plan | Role | Glasses app? |
+|-----|----------|-----|------|------|--------------|
+| **KVM2** | `srv753644.hstgr.cloud` | `46.202.188.144` | KVM 2 | **Maia** — OpenClaw + Telegram | ✅ **YES** |
+| **KVM4** | `srv659320` / `aicontexteng.com` | `46.202.189.72` | KVM 4 | **Hermes** — AIOX infra | ❌ **NO** |
+
+**DNS:** `aicontexteng.com` → KVM4. No `maia.*` subdomain yet. iPhone URL: `https://srv753644.hstgr.cloud`.
 
 ---
 
@@ -154,21 +167,25 @@ Status legend: ✅ Done · 🚧 In progress / uncommitted · 📋 Planned · ❌
 |----|------|--------|------------------|
 | W2.1 | `OpenClawBridge` client (health + WebSocket) | ✅ Done | Upstream — REUSE |
 | W2.2 | `GatewaySettingsView` (URL + token) | ✅ Done | Upstream — expert UI, buried in Settings |
-| W2.3 | Gateway wizard in **onboarding** | 📋 Planned | Users need in-app setup, not terminal |
-| W2.4 | Test connection button in onboarding | 📋 Planned | `OpenClawBridge.checkConnection()` exists |
+| W2.3 | Gateway wizard in **onboarding** | 🚧 Partial | Onboarding gateway page + Maia default URL (uncommitted) |
+| W2.4 | Test connection button in onboarding | 🚧 Partial | Tap OpenClaw pill → diagnostic alert; `probeConnection()` exists |
 | W2.5 | Pairing QR parser `imetaclaw://connect?...` | 📋 Planned | Full-stack / reseller flow |
-| W2.6 | **Maia connected end-to-end** | ❌ Not started | Needs VPS URL + gateway token from user |
+| W2.6 | **Maia connected end-to-end** | ⚠️ **Blocked** | HTTP `/health` OK; `/ws` → 403 (Caddy → uvicorn, not :18789) |
 | W2.7 | VPS `imetaclaw-bridge` install script | 📋 Planned | Server-side pairing code generation |
-| W2.8 | Hostinger API auto-discovery | 🔍 Gap | Hostinger token ≠ OpenClaw gateway token |
+| W2.8 | Hostinger API auto-discovery | 🔍 Gap | Hostinger API token returns 403; ≠ gateway token |
+| W2.9 | Hermes vs Maia VPS mapping documented | ✅ Done | This map + `AIOX-enterprise/.env` comments |
+| W2.10 | Maia-only URL enforcement in app | 🚧 Uncommitted | `GatewayEndpoint`, `Config.migrateHermesGatewayToMaiaIfNeeded()` |
+| W2.11 | KVM2 Caddy `/ws` → OpenClaw :18789 | ⚠️ **Blocked** | Claude Code in Hostinger terminal — in progress |
+| W2.12 | `openclaw devices approve` (first pairing) | 📋 Planned | After `/ws` returns 101 |
 
 ### Wave 3 — Simplification (`simpleMode`)
 
 | ID | Item | Status | Evidence / Notes |
 |----|------|--------|------------------|
-| W3.1 | `Config.simpleMode` flag | 📋 Planned | Hide Field Assist, Medical, MCP catalog, etc. |
-| W3.2 | Tool whitelist (OpenClaw + camera + translate) | 📋 Planned | ~8–12 tools vs 85+ |
-| W3.3 | Simplified Settings navigation | 📋 Planned | ~10 items vs 50+ |
-| W3.4 | Onboarding skips API key (gateway-only path) | 📋 Planned | AI runs on VPS |
+| W3.1 | `Config.simpleMode` flag | 🚧 Uncommitted | Defaults on; locks `vpsOnly` + `direct` mode |
+| W3.2 | Tool whitelist (OpenClaw + camera + translate) | 🚧 Partial | `isOpenClawExclusive` skips local routing in `OpenGlassesApp` |
+| W3.3 | Simplified Settings navigation | 🚧 Partial | Settings/onboarding simplified for terminal mode |
+| W3.4 | Onboarding skips API key (gateway-only path) | 🚧 Partial | `simpleMode` forces gateway step; cloud path hidden |
 | W3.5 | Advanced mode toggle for power users | 📋 Planned | APIs, subscriptions, full tool list |
 | W3.6 | Full iMetaClaw fork (strip codebase) | 📋 Phase 2 | Option B — separate target |
 
@@ -206,7 +223,11 @@ Status legend: ✅ Done · 🚧 In progress / uncommitted · 📋 Planned · ❌
 | Gap | Severity | Impact | Resolution | Owner |
 |-----|----------|--------|------------|-------|
 | App assumes expert user (gateway jargon, 85 tools) | **P0** | Cannot sell to Brazilians | `simpleMode` + gateway wizard + pt-BR | Dev |
-| Maia VPS not connected | **P0** | Core value prop broken | User provides URL + token; wizard + test | User + Dev |
+| Maia VPS not connected | **P0** | Core value prop broken | Fix KVM2 Caddy `/ws` → :18789; Maia gateway token in app | VPS (Claude) + User |
+| Caddy routes `/ws` to uvicorn not OpenClaw | **P0** | Orange pill + "Maia offline" | `handle /ws*` → `127.0.0.1:18789` before catch-all | Claude Code @ KVM2 |
+| Hermes (KVM4) confused with Maia (KVM2) | **P0** | Wrong agent / wasted VPS work | App blocks `aicontexteng.com`; docs corrected | ✅ Mitigated in app |
+| KVM2 SSH inaccessible from Mac | **P1** | Cannot fix VPS from Cursor | Reset root password in hPanel; or Hostinger terminal only | User |
+| Hostinger API token 403 | **P2** | Cannot reset KVM2 password via API | hPanel manual reset | User |
 | Paste blocked on iOS (reported) | **P1** | Cannot enter API keys | Fixed in `a30e20c` — verify on device | QA |
 | `LiveTranslationService` stub | **P1** | Translation feature fake | Wire to LLM or Apple Translation framework | Dev |
 | Video recording without LED | **P2** | User expectation | **Not possible** — document audio-only path | UX copy |
@@ -219,7 +240,7 @@ Status legend: ✅ Done · 🚧 In progress / uncommitted · 📋 Planned · ❌
 | Android absent | **P3** | Half of phone market | Phase 3 thin Kotlin client | Roadmap |
 | `imetaclaw.com` DNS / landing | **P3** | Brand | Point domain to product page | User |
 
-**Gap verdict:** Phase 1 can proceed — no architectural blockers. **P0 gaps** are UX and VPS connection, not missing libraries.
+**Gap verdict:** App-side terminal mode is ready (uncommitted). **P0 blocker is server-side:** KVM2 Caddy must expose OpenClaw WebSocket on 443. Reinstalling the iPhone app does not help until `/ws` returns HTTP 101.
 
 ---
 
@@ -252,7 +273,11 @@ OpenGlasses upstream ships **85+ native tools**. iMetaClaw Phase 1 target: **~10
 | Agent name + wake phrase | `OpenGlasses/Sources/Utils/Config.swift` |
 | Agent settings UI | `OpenGlasses/Sources/App/Views/AgentSettingsView.swift` |
 | Gateway connection | `OpenGlasses/Sources/Services/OpenClawBridge.swift` |
+| Gateway URL normalize + Hermes block | `OpenGlasses/Sources/Utils/GatewayEndpoint.swift` |
 | Gateway settings | `OpenGlasses/Sources/App/Views/GatewaySettingsView.swift` |
+| Voice routing / offline banner | `OpenGlasses/Sources/App/Views/VoiceTab.swift` (`VoiceRoutingBanner`, `StatusPillsRow`) |
+| Connection pills (top bar) | `OpenGlasses/Sources/App/Views/ConnectionBanner.swift` |
+| Env / VPS notes (gitignored) | `/Volumes/aiagents2TB/Dev/GITHUB/AIOX-enterprise/.env` |
 | Onboarding | `OpenGlasses/Sources/App/Views/OnboardingView.swift` |
 | Audio recording (discrete) | `OpenGlasses/Sources/Services/AudioRecordingService.swift` |
 | Live translation (needs fix) | `OpenGlasses/Sources/Services/LiveTranslationService.swift` |
@@ -271,18 +296,17 @@ OpenGlasses upstream ships **85+ native tools**. iMetaClaw Phase 1 target: **~10
 | `88e8d19` | xAI/Grok provider + switch fixes |
 | `a30e20c` | Paste fix, Claude OAuth, pt-BR xcstrings (Manus session 3) |
 
-**Uncommitted (iMetaClaw session — Grok):**
+**Uncommitted (iMetaClaw — Grok sessions 4–5, Jun 25):**
 
-- `AppBranding.swift` (new)
-- `AgentSettingsView.swift` (new)
-- `iMetaClawLogo.imageset/` (new)
-- `AppIcon` PNGs (new)
-- Modified: `Config.swift`, `OnboardingView.swift`, `SettingsView.swift`, `LaunchScreen.swift`, `OnboardingOverlay.swift`, `OpenGlassesApp.swift`, `AccentColors.swift`
+- **New:** `AppBranding.swift`, `AgentSettingsView.swift`, `GatewayEndpoint.swift`, `PasteableSecretField.swift`, `DeviceAICapability.swift`, `SpeechRecognitionLocale.swift`, `WearablesBootstrap.swift`, `OpenClawDeviceIdentity.swift`, logo/icon assets
+- **Modified:** `Config.swift`, `OpenClawBridge.swift`, `OpenGlassesApp.swift`, `OnboardingView.swift`, `SettingsView.swift`, `GatewaySettingsView.swift`, `VoiceTab.swift`, `BottomControlBar.swift`, `ConnectionBanner.swift`, `WakeWordService.swift`, intents (`LiveAIModeIntents`, `ToggleGeminiLiveIntent`), tests (`ConfigTests`, `GatewayEndpointTests`)
+- **Docs:** `docs/PROJECT-MAP.md` (this file)
+- **External:** `AIOX-enterprise/.env` comments corrected (gitignored); KVM4 `/root/AIOX-enterprise/.env` warning note added via SSH
 
 **Recommended next commit message:**
 
 ```
-feat(imetaclaw): branding, Oi-wake agent identity, logo and app icon
+feat(imetaclaw): Maia-only gateway, simpleMode terminal, VPS diagnostics
 ```
 
 ---
@@ -295,6 +319,8 @@ feat(imetaclaw): branding, Oi-wake agent identity, logo and app icon
 | Jun 24, 2026 | Manus | xAI provider, exhaustive switch fixes (`88e8d19`) |
 | Jun 24, 2026 | Manus | Paste buttons, Claude OAuth, pt-BR xcstrings (`a30e20c`) |
 | Jun 24–25, 2026 | Grok | Architecture analysis, Phase 1 AIOX plan, iMetaClaw branding, `Oi {bot}` wake, logo/icon, `AgentSettingsView`, this PROJECT-MAP |
+| Jun 25, 2026 (session 4–5) | Grok + Claude Code | Maia/KVM2 vs Hermes/KVM4 correction; `simpleMode` + VPS-only routing; gateway guards; external probes; KVM2 `/ws` blocker identified |
+| Jun 25, 2026 (ongoing) | Claude Code | Hostinger browser terminal on **KVM2** — Caddy `/ws` → OpenClaw :18789 (not yet verified externally) |
 
 ---
 
@@ -309,23 +335,26 @@ feat(imetaclaw): branding, Oi-wake agent identity, logo and app icon
 | D5 | Discrete recording = **audio-only** | Camera LED is hardware-enforced | ✅ Approved |
 | D6 | AI primary path = **VPS OpenClaw**, APIs optional | Matches reseller model | ✅ Approved |
 | D7 | Android = thin client Phase 3 | Shared protocol later | 📋 Planned |
+| D8 | **Maia = KVM2**, **Hermes = KVM4** | Earlier work targeted wrong VPS | ✅ Corrected |
+| D9 | iMetaClaw must **never** use `aicontexteng.com` | Hermes OpenClaw ≠ Maia agent | ✅ App enforcement (uncommitted) |
+| D10 | Telegram OK ≠ glasses OK | Telegram is server-side channel; app needs `/ws` on 443 | ✅ Documented |
 
 ---
 
 ## 12. Next Actions (Ordered)
 
-| # | Action | Wave | Est. |
-|---|--------|------|------|
-| 1 | **Commit** uncommitted iMetaClaw work | W1 | 30 min |
-| 2 | Rebuild & install on iPhone (⌘R) — verify icon + "Oi Maia" | W1 | 15 min |
-| 3 | Implement `Config.simpleMode` + hide settings sections | W3 | 1 day |
-| 4 | Gateway wizard page in onboarding + test connection | W2 | 1 day |
-| 5 | `RecordingSettingsView` + LED disclaimer | W4 | 1 day |
-| 6 | Fix `LiveTranslationService` for PT↔EN | W4 | 1–2 days |
-| 7 | Complete pt-BR for onboarding + settings strings | W5 | 1–2 days |
-| 8 | Connect Maia VPS (URL + token) and voice test | W2 | User + 1 hr |
-| 9 | Pairing QR format + parser | W2 | 1 day |
-| 10 | TestFlight archive pipeline | W5 | 2–3 days |
+| # | Action | Wave | Est. | Owner |
+|---|--------|------|------|-------|
+| 1 | **Fix KVM2 Caddy:** `/ws` + `/health` → `127.0.0.1:18789` (before uvicorn catch-all) | W2.11 | 30–60 min | Claude Code @ hPanel terminal |
+| 2 | Verify external: `curl -sI -H 'Connection: Upgrade' -H 'Upgrade: websocket' 'https://srv753644.hstgr.cloud/ws?token=***'` → **101** | W2.6 | 5 min | Any agent |
+| 3 | iPhone: URL `https://srv753644.hstgr.cloud` + Maia `gateway.auth.token`; tap OpenClaw pill → green | W2.6 | 15 min | User |
+| 4 | KVM2: `openclaw devices list` → `openclaw devices approve --latest` | W2.12 | 10 min | Claude Code / User |
+| 5 | **Commit** uncommitted iMetaClaw work | W1–W3 | 30 min | Dev |
+| 6 | Rebuild & install on iPhone | W1 | 15 min | Dev |
+| 7 | Complete pt-BR for onboarding + settings | W5 | 1–2 days | Dev |
+| 8 | `RecordingSettingsView` + LED disclaimer | W4 | 1 day | Dev |
+| 9 | Pairing QR format + parser | W2 | 1 day | Dev |
+| 10 | TestFlight archive pipeline | W5 | 2–3 days | Dev |
 
 ---
 
@@ -337,8 +366,10 @@ feat(imetaclaw): branding, Oi-wake agent identity, logo and app icon
 | Oi {bot} wake phrase | W1.6–W1.8 | 🚧 Done — uncommitted |
 | Paste fix | W0.11 | ✅ `a30e20c` |
 | Gateway onboarding wizard | W2.3–W2.4 | 📋 Planned |
-| Maia VPS live | W2.6 | ❌ Blocked on credentials |
-| simpleMode | W3.1–W3.3 | 📋 Planned |
+| Maia VPS live | W2.6 | ⚠️ Blocked on KVM2 `/ws` (Caddy) |
+| KVM2 Caddy fix | W2.11 | ⚠️ Claude Code in progress |
+| Hermes/Maia separation | W2.9–W2.10 | 🚧 Done — uncommitted |
+| simpleMode | W3.1–W3.4 | 🚧 Done — uncommitted |
 | Recording settings | W4.2–W4.4 | 📋 Planned |
 | Live PT↔EN translation | W4.6–W4.8 | 📋 Planned |
 | pt-BR localization | W5.1–W5.2 | 🚧 Partial |
@@ -352,14 +383,117 @@ feat(imetaclaw): branding, Oi-wake agent identity, logo and app icon
 | Term | Meaning |
 |------|---------|
 | **iMetaClaw** | Product brand — Meta glasses + OpenClaw agent bridge |
-| **Maia** | User's OpenClaw agent on Hostinger VPS (Telegram bot name) |
-| **OpenClaw Gateway** | Server on port ~18789; app connects via `/health` + WebSocket `sessions.send` |
-| **Gateway token** | Bearer auth for OpenClaw — **not** the same as Hostinger API token |
+| **Maia** | User's OpenClaw agent on **Hostinger KVM2** (`srv753644`) — Telegram bot name |
+| **Hermes** | Separate AIOX stack on **Hostinger KVM4** (`aicontexteng.com`) — not for glasses |
+| **OpenClaw Gateway** | Listens on `127.0.0.1:18789`; public access via Caddy `/health` + `/ws` on 443 |
+| **Gateway token** | `gateway.auth.token` from Maia's `~/.openclaw/openclaw.json` — not Telegram token, not Hermes token |
+| **Orange OpenClaw pill** | HTTP `/health` OK, WebSocket not ready |
+| **Red "Maia offline"** | `webSocketReady == false` — voice blocked in `vpsOnly` mode |
 | **Oi {name}** | Wake phrase pattern — e.g. "Oi Maia" |
-| **simpleMode** | Planned flag to hide upstream complexity |
+| **simpleMode** | Flag (default on) — VPS terminal; hides upstream complexity |
 | **Discrete recording** | Audio-only via glasses mic — no camera, no capture LED |
 | **IDS** | Investigate existing → Decide REUSE/ADAPT/CREATE |
 | **VPS bridge** | Planned server module that generates pairing QR for the app |
+
+---
+
+## 15. Session 5 Handoff — Resume Here (Jun 25, 2026)
+
+> **Stop point:** User closed session with Maia still offline on iPhone. Next agent should read this section first.
+
+### 15.1 What we accomplished (app — Grok in Cursor)
+
+| Area | Done (uncommitted) |
+|------|---------------------|
+| **VPS terminal mode** | `Config.simpleMode` locks `vpsOnly` + `direct`; blocks Gemini Live / local LLM routing |
+| **Maia-only gateway** | Default URL `https://srv753644.hstgr.cloud`; blocks/migrates Hermes hosts (`aicontexteng.com`) |
+| **Diagnostics** | Orange pill = "HTTP só — WS pendente"; red banner explains `/ws` blocked; tap OpenClaw pill for alert |
+| **Onboarding** | Gateway step pre-fills Maia URL; PT copy warns KVM2 vs KVM4 |
+| **Tests** | `GatewayEndpointTests` (Hermes detection), `ConfigTests` (migration, enabledGateways filter) |
+| **Build** | `BUILD SUCCEEDED` on device target (Jun 25) |
+
+### 15.2 What we accomplished (VPS — mixed; mostly wrong host first)
+
+| Host | What happened |
+|------|----------------|
+| **KVM4 (Hermes)** | SSH via `~/.ssh/id_ed25519` works. Installed/restarted OpenClaw, nginx `/ws` on `aicontexteng.com` — **works for WebSocket but wrong agent**. Left warning in `/root/AIOX-enterprise/.env`. |
+| **KVM2 (Maia)** | SSH from Mac **fails** (password + key). Work delegated to **Claude Code in Hostinger browser terminal** (user confirmed still in progress). |
+
+### 15.3 The blocker (P0 — unchanged at session end)
+
+External probes (last: **2026-06-25 ~14:57 UTC**):
+
+```
+https://srv753644.hstgr.cloud/health  → 200  (Server: uvicorn — Maia status JSON)
+https://srv753644.hstgr.cloud/ws      → 401/403 (Server: uvicorn — NOT OpenClaw)
+http://46.202.188.144:18789           → port closed from internet
+wss://aicontexteng.com/ws             → OK connect.challenge (Hermes — wrong for glasses)
+```
+
+**Root cause:** Caddy on KVM2 sends `/ws` to the **Maia Python API (uvicorn)**, not to **OpenClaw on `127.0.0.1:18789`**. The iPhone app cannot work until `/ws` returns **HTTP 101 Switching Protocols**.
+
+**UI mapping:**
+
+| UI | Meaning |
+|----|---------|
+| Orange OpenClaw dot | `connectionState == .connected` but `webSocketReady == false` |
+| Red triangle "Maia offline" | `vpsOnly` mode + no WebSocket — voice disabled by design |
+
+Reinstalling the app **does not** fix this.
+
+### 15.4 Claude Code on Hostinger terminal — intended fix
+
+**Must run on `srv753644` (KVM2), not `srv659320` (KVM4).**
+
+```bash
+hostname   # expect srv753644
+curl -s http://127.0.0.1:18789/health
+cat /etc/caddy/Caddyfile
+
+# /ws and /health for OpenClaw MUST appear BEFORE catch-all to uvicorn:
+# handle /ws* { reverse_proxy 127.0.0.1:18789 }
+# handle /health { reverse_proxy 127.0.0.1:18789 }
+
+caddy validate --config /etc/caddy/Caddyfile
+systemctl reload caddy
+
+TOKEN=$(python3 -c "import json; print(json.load(open('/root/.openclaw/openclaw.json'))['gateway']['auth']['token'])")
+curl -sI -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  "https://srv753644.hstgr.cloud/ws?token=$TOKEN" | head -5
+# SUCCESS = HTTP/1.1 101 Switching Protocols
+```
+
+After 101: `openclaw devices approve --latest` on KVM2.
+
+### 15.5 iPhone config (after VPS fix)
+
+| Field | Value |
+|-------|-------|
+| Gateway URL | `https://srv753644.hstgr.cloud` |
+| Token | Maia KVM2 `gateway.auth.token` (not Hermes, not Telegram) |
+
+### 15.6 Access credentials (where to look — do not commit)
+
+| Secret | Location |
+|--------|----------|
+| Hostinger API token | `~/Downloads/env`, `AIOX-enterprise/.env` |
+| KVM2 root password (may be stale) | `HOSTINGER_VPS_KVM2_PASSWORD` in env |
+| SSH key to KVM4 only | `~/.ssh/id_ed25519` |
+| Hermes gateway token (wrong for Maia) | KVM4 vault / `.env` — do not use on iPhone |
+
+### 15.7 First actions for next session
+
+1. Re-run external probe on `wss://srv753644.hstgr.cloud/ws` — if still 403, Claude's Caddy fix not done.
+2. If 101: user tests iPhone (no reinstall needed); expect green pill + voice via Maia.
+3. Commit uncommitted iMetaClaw work once E2E confirmed.
+4. Optional: DNS `maia.aicontexteng.com` → `46.202.188.144`; reset KVM2 SSH password in hPanel for Mac access.
+
+### 15.8 Collaboration model
+
+| Agent | Role |
+|-------|------|
+| **Claude Code** @ Hostinger terminal | KVM2 infra: Caddy, OpenClaw, device pairing |
+| **Cursor / Grok** | iOS app, probes from Mac, `PROJECT-MAP.md`, builds |
 
 ---
 

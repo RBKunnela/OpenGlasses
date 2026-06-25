@@ -18,6 +18,7 @@ struct BottomControlBar: View {
 
     @Binding var showSettings: Bool
     @Binding var showModelPicker: Bool
+    @Binding var showGatewaySettings: Bool
     @Binding var showPreview: Bool
     var showChatInput: Binding<Bool>? = nil
 
@@ -64,11 +65,15 @@ struct BottomControlBar: View {
                 }
 
                 BarButton(
-                    icon: "brain",
-                    label: appState.llmService.activeModelName,
+                    icon: Config.simpleMode ? "server.rack" : "brain",
+                    label: appState.llmService.voiceRouteLabel,
                     truncateLabel: true
                 ) {
-                    showModelPicker = true
+                    if Config.simpleMode {
+                        showGatewaySettings = true
+                    } else {
+                        showModelPicker = true
+                    }
                 }
                 .frame(maxWidth: .infinity)
 
@@ -156,7 +161,7 @@ struct BottomControlBar: View {
         } else if !appState.isConnected && !Config.silentMode {
             // Disconnected and not in Push-to-Talk — one tap to reconnect + start listening
             ActionCapsule(
-                icon: "OpenGlassesLogo",
+                icon: AppBranding.logoIconName,
                 label: "Connect & Talk",
                 color: accent
             ) {
@@ -186,8 +191,8 @@ struct BottomControlBar: View {
     @ViewBuilder
     private var cameraButton: some View {
         if !appState.isConnected {
-            BarButton(icon: "OpenGlassesLogo", label: "Connect") {
-                Task { await appState.glassesService.connect() }
+            BarButton(icon: AppBranding.logoIconName, label: "Connect") {
+                Task { await appState.connectAndListen() }
             }
         } else if isRealtime {
             BarButton(
@@ -235,7 +240,7 @@ private struct ActionCapsule: View {
         Button(action: action) {
             HStack(spacing: 10) {
                 ZStack {
-                    if icon == "OpenGlassesLogo" {
+                    if icon == AppBranding.logoIconName {
                         LogoIcon(size: 18)
                             .foregroundStyle(color)
                     } else {
@@ -289,7 +294,7 @@ private struct BarButton: View {
         Button(action: action) {
             VStack(spacing: 3) {
                 ZStack {
-                    if icon == "OpenGlassesLogo" {
+                    if icon == AppBranding.logoIconName {
                         LogoIcon(size: 18)
                             .foregroundStyle(foreground)
                     } else {

@@ -12,8 +12,27 @@ struct PersonaPickerSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                if Config.simpleMode {
+                    Section {
+                        HStack(spacing: 12) {
+                            Image(systemName: "person.crop.circle.badge.checkmark")
+                                .font(.title3)
+                                .foregroundStyle(AppAccent.aiCoral)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(Config.agentName)
+                                    .font(.body.weight(.medium))
+                                Text(AppBranding.wakePhraseDisplay(for: Config.agentName))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } header: {
+                        Text("Seu agente")
+                    }
+                }
+
                 // MARK: - Installed Personas
-                let personas = Config.enabledPersonas
+                let personas = Config.simpleMode ? [] : Config.enabledPersonas
 
                 if personas.isEmpty {
                     ContentUnavailableView(
@@ -57,7 +76,7 @@ struct PersonaPickerSheet: View {
 
                 // MARK: - Available Modes (not yet installed)
                 let installed = Set(Config.savedPersonas.map(\.id))
-                let available = Config.builtInPersonaTemplates().filter { !installed.contains($0.id) }
+                let available = Config.simpleMode ? [] : Config.builtInPersonaTemplates().filter { !installed.contains($0.id) }
 
                 if !available.isEmpty {
                     Section {
@@ -92,7 +111,7 @@ struct PersonaPickerSheet: View {
                     }
                 }
             }
-            .navigationTitle("Personas & Modes")
+            .navigationTitle(Config.simpleMode ? "Agente" : "Personas & Modes")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -139,10 +158,84 @@ struct PersonaPickerTab: View {
 
     var body: some View {
         List {
-            // Field Assist sits above the personas — its own mode for field engineers.
-            fieldAssistSection
+            if Config.simpleMode {
+                simpleAgentSection
+            } else {
+                personaCatalogSections
+            }
+        }
+        .navigationTitle(Config.simpleMode ? "Agente" : "Modes")
+        .sheet(item: $editingPersona) { persona in
+            PersonaDetailView(persona: persona, appState: appState)
+        }
+    }
 
-            let personas = Config.enabledPersonas
+    // MARK: - iMetaClaw simple mode (one agent)
+
+    @ViewBuilder
+    private var simpleAgentSection: some View {
+        Section {
+            HStack(spacing: 12) {
+                Image(systemName: "person.crop.circle.badge.checkmark")
+                    .font(.title2)
+                    .foregroundStyle(AppAccent.aiCoral)
+                    .frame(width: 36)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(Config.agentName)
+                        .font(.body.weight(.semibold))
+                    Text(AppBranding.wakePhraseDisplay(for: Config.agentName))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Text("Agente OpenClaw no seu VPS")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+
+            if Config.isAnyGatewayConfigured {
+                LabeledContent("Gateway") {
+                    Text(Config.enabledGateways.first?.name ?? "OpenClaw")
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                NavigationLink {
+                    GatewaySettingsView(appState: appState)
+                } label: {
+                    Label("Conectar OpenClaw", systemImage: "server.rack")
+                }
+            }
+
+            if Config.phoneAIStrategy.needsLocalModelSetup || Config.savedModels.contains(where: { $0.llmProvider == .local }) {
+                NavigationLink {
+                    LocalModelManagerView()
+                        .environmentObject(appState)
+                } label: {
+                    HStack {
+                        Label("Modelos locais", systemImage: "cpu")
+                        Spacer()
+                        if appState.localLLMService.isDownloading {
+                            ProgressView(value: appState.localLLMService.downloadProgress)
+                                .frame(width: 48)
+                        }
+                    }
+                }
+            }
+        } header: {
+            Text("Seu agente")
+        } footer: {
+            Text("Você só precisa de um agente (\(Config.agentName)). Outros modos (Museu, Chef, etc.) ficam ocultos no modo simples.")
+        }
+    }
+
+    // MARK: - Full OpenGlasses persona catalog
+
+    @ViewBuilder
+    private var personaCatalogSections: some View {
+        // Field Assist sits above the personas — its own mode for field engineers.
+        fieldAssistSection
+
+        let personas = Config.enabledPersonas
 
             if personas.isEmpty {
                 ContentUnavailableView(
@@ -219,11 +312,6 @@ struct PersonaPickerTab: View {
                     Text("Tap to preview a mode before installing. Each mode has its own wake phrase, system prompt, and camera behavior.")
                 }
             }
-        }
-        .navigationTitle("Modes")
-        .sheet(item: $editingPersona) { persona in
-            PersonaDetailView(persona: persona, appState: appState)
-        }
     }
 
     // MARK: - Field Assist mode

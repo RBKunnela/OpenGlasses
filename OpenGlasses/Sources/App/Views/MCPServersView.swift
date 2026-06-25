@@ -218,10 +218,7 @@ struct MCPServerEditorView: View {
                     TextField("Header name (e.g. Authorization)", text: $authHeader)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                    TextField("Header value (e.g. Bearer xxx)", text: $authValue)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .textContentType(.oneTimeCode)
+                    PasteableFormSecretField(title: "Header value (e.g. Bearer xxx)", text: $authValue)
                 } header: {
                     Text("Authentication (Optional)")
                 } footer: {

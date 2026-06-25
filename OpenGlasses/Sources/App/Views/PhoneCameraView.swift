@@ -120,7 +120,7 @@ final class PhoneCameraController: NSObject, ObservableObject, @unchecked Sendab
             let granted = await AVCaptureDevice.requestAccess(for: .video)
             if !granted { await setError("Camera access is needed to take a photo."); return }
         case .denied, .restricted:
-            await setError("Camera access is off. Enable it in Settings → OpenGlasses.")
+            await setError("Câmera desativada. Ative em Ajustes → \(AppBranding.name).")
             return
         default:
             break

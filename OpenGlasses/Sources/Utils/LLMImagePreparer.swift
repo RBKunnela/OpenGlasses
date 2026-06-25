@@ -12,19 +12,45 @@ import UIKit
 /// on for hardware-free development. This shrinks such images first; already-small images
 /// pass through untouched, so the common glasses path pays nothing.
 ///
+/// **Degenerate-frame guard (added Jun 2026):**
+/// The glasses DAT stream occasionally emits a 1×1 single-component placeholder JPEG
+/// (160 bytes) before the camera has a real frame. Anthropic returns 400
+/// "Could not process image" for such frames, and because the message is added to the
+/// conversation history *before* the API call, the corrupt content block becomes stuck —
+/// every subsequent turn (even text-only) replays it and 400s, silencing the glasses
+/// until the session is reset. `prepared(_:)` now returns `nil` for any image whose
+/// decoded dimensions fall below `minDimension` on either axis, so callers can skip
+/// the API call entirely rather than poisoning the context.
+///
 /// (Lesson cribbed from the `glassbridge` project's LEARNINGS.md, which hit this 400 with
-/// native iPhone JPEGs.)
+/// native iPhone JPEGs, and from a Jun-2026 live incident on srv753644.hstgr.cloud.)
 enum LLMImagePreparer {
     /// Longest edge (in pixels) we allow before downscaling — Anthropic's recommended ceiling.
     static let maxLongEdge: CGFloat = 1568
     /// Byte ceiling for the encoded JPEG, kept comfortably under Anthropic's 5 MB hard limit.
     static let maxBytes = 4_500_000
+    /// Minimum pixel dimension on either axis. Images smaller than this are degenerate
+    /// placeholders (e.g. 1×1 initialisation frames) and must not be sent to any vision API.
+    static let minDimension = 32
 
-    /// Returns JPEG `Data` within `maxLongEdge` / `maxBytes` where possible. Already-bounded
-    /// input is returned unchanged (no re-encode). Undecodable input is returned as-is —
-    /// there is nothing we can do, and failing open beats dropping the image.
-    static func prepared(_ data: Data) -> Data {
-        guard let image = UIImage(data: data), let cg = image.cgImage else { return data }
+    /// Returns JPEG `Data` within `maxLongEdge` / `maxBytes` where possible, or `nil` if
+    /// the image is degenerate (too small, undecodable, or zero-dimension).
+    ///
+    /// Callers **must** treat a `nil` return as "skip the image" — do not fall back to
+    /// sending the raw bytes, as that is what causes context poisoning.
+    static func prepared(_ data: Data) -> Data? {
+        guard let image = UIImage(data: data), let cg = image.cgImage else {
+            // Completely undecodable — drop it.
+            return nil
+        }
+
+        // Degenerate-frame guard: reject 1×1 placeholders and any sub-threshold frame.
+        guard cg.width >= minDimension, cg.height >= minDimension else {
+            NSLog("[LLMImagePreparer] Dropping degenerate frame (%dx%d, %d bytes)",
+                  cg.width, cg.height, data.count)
+            return nil
+        }
+
         let pxLongEdge = CGFloat(max(cg.width, cg.height))
 
         // Fast path: small enough in both dimensions and bytes — leave it exactly as-is.

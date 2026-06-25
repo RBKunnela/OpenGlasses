@@ -16,7 +16,7 @@ import AppIntents
 struct AskPersonaIntent: AppIntent {
     static var title: LocalizedStringResource = "Ask a Persona"
     static var description = IntentDescription(
-        "Ask a specific OpenGlasses persona by voice and hear the answer"
+        "Ask a specific iMetaClaw persona by voice and hear the answer"
     )
 
     static var openAppWhenRun: Bool { Config.siriAskOpensApp }
@@ -98,7 +98,7 @@ struct AskPersonaIntent: AppIntent {
         var localizedStringResource: LocalizedStringResource {
             switch self {
             case .busy:
-                return "OpenGlasses is still working on something. Try again in a moment."
+                return "\(AppBranding.name) is still working on something. Try again in a moment."
             case .emptyQuestion:
                 return "I didn't catch a question."
             case .noResponse:

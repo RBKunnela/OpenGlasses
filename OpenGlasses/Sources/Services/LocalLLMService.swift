@@ -19,9 +19,12 @@ final class LocalLLMService: ObservableObject {
     @Published var isLoadingModel = false   // a model is being loaded into memory right now
     @Published var loadedModelId: String?
     @Published var downloadingModelId: String?
+    @Published var lastLoadError: String?
 
     private var modelContainer: ModelContainer?
     private var activeDownloadTask: Task<Void, Error>?
+    private var activeLoadTask: Task<Void, Never>?
+    private var lifecycleObservers: [NSObjectProtocol] = []
 
     /// Set when the app enters the background during a generation so the token loop
     /// can stop before submitting the next Metal command buffer (forbidden in the
@@ -35,6 +38,10 @@ final class LocalLLMService: ObservableObject {
         try? FileManager.default.createDirectory(at: modelsDir, withIntermediateDirectories: true)
         return HubClient(cache: HubCache(cacheDirectory: modelsDir))
     }()
+
+    init() {
+        registerLifecycleObservers()
+    }
 
     // MARK: - Recommended Models
 
@@ -56,7 +63,8 @@ final class LocalLLMService: ObservableObject {
             estimatedSize: "1.5 GB",
             hasVision: true,
             hasToolCalling: false,
-            notes: "Best small vision model — sees photos + video"
+            notes: "Best small vision model — sees photos + video",
+            minimumRAMGB: 6
         ),
         RecommendedModel(
             id: "mlx-community/SmolVLM2-500M-Video-Instruct-mlx",
@@ -64,7 +72,8 @@ final class LocalLLMService: ObservableObject {
             estimatedSize: "0.35 GB",
             hasVision: true,
             hasToolCalling: false,
-            notes: "Tiny vision model — basic photo understanding"
+            notes: "Tiny vision model — basic photo understanding",
+            minimumRAMGB: 4
         ),
         // Text-only MLX models
         RecommendedModel(
@@ -73,7 +82,8 @@ final class LocalLLMService: ObservableObject {
             estimatedSize: "1.8 GB",
             hasVision: false,
             hasToolCalling: true,
-            notes: "Strong reasoning and tool use"
+            notes: "Strong reasoning and tool use",
+            minimumRAMGB: 6
         ),
         RecommendedModel(
             id: "mlx-community/gemma-2-2b-it-4bit",
@@ -81,7 +91,8 @@ final class LocalLLMService: ObservableObject {
             estimatedSize: "1.5 GB",
             hasVision: false,
             hasToolCalling: true,
-            notes: "Good balance of size and quality"
+            notes: "Good balance of size and quality",
+            minimumRAMGB: 5
         ),
         RecommendedModel(
             id: "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
@@ -89,7 +100,8 @@ final class LocalLLMService: ObservableObject {
             estimatedSize: "0.4 GB",
             hasVision: false,
             hasToolCalling: true,
-            notes: "Ultra-light, basic capability"
+            notes: "Ultra-light, basic capability",
+            minimumRAMGB: 4
         ),
     ]
 
@@ -141,6 +153,27 @@ final class LocalLLMService: ObservableObject {
         downloadProgress = 0
     }
 
+    /// Cancel an in-flight GPU load. MLX cannot always be stopped mid-load, but we clear
+    /// state so voice queries can route to the VPS without waiting on a stuck load bar.
+    func cancelActiveLoad() {
+        activeLoadTask?.cancel()
+        activeLoadTask = nil
+        if isLoadingModel {
+            isLoadingModel = false
+            unloadModel()
+        }
+    }
+
+    /// Whether GPU load is allowed for the current phone AI strategy.
+    static var isGPULoadAllowed: Bool {
+        switch Config.phoneAIStrategy {
+        case .hybridVPSLocal, .vpsOnly:
+            return false
+        case .hybridLocalCloud, .cloudOnly:
+            return true
+        }
+    }
+
     /// Load an already-downloaded model into memory.
     /// Uses LLMModelFactory for text models, VLMModelFactory for vision models.
     func loadModel(_ modelId: String) async throws {
@@ -148,37 +181,111 @@ final class LocalLLMService: ObservableObject {
             return  // Already loaded — no GPU work needed, safe even in background
         }
 
+        lastLoadError = nil
+
+        guard Self.isGPULoadAllowed else {
+            throw LocalLLMError.generationFailed(
+                "No modo híbrido/VPS a voz usa \(Config.agentName) no servidor. Carregar modelo local está desativado para evitar travamentos."
+            )
+        }
+
+        // Refuse models that exceed this device's RAM before touching the GPU.
+        // iOS kills the process on OOM with no catchable Swift error.
+        try Self.validateDeviceRAM(for: modelId)
+
+        // Download weights to disk first — never silently download during GPU load
+        // (that showed "Loading…" with no visible download progress).
+        if !isModelDownloaded(modelId) {
+            try await downloadModel(modelId)
+        }
+
         // Loading materializes model weights on the GPU via Metal (same restriction
         // as generate()), which iOS forbids in the background. The model is unloaded
         // when the app backgrounds, so a backgrounded scheduled task would otherwise
         // try to reload here and crash. Refuse early with a catchable error so callers
         // can defer.
-        guard UIApplication.shared.applicationState != .background else {
+        guard UIApplication.shared.applicationState == .active else {
             throw LocalLLMError.backgrounded
         }
 
+        cancelActiveLoad()
         isLoadingModel = true
-        defer { isLoadingModel = false }
         unloadModel()
 
-        let config = ModelConfiguration(id: modelId)
-        let factory: any ModelFactory = Self.visionModelIds.contains(modelId)
-            ? VLMModelFactory.shared
-            : LLMModelFactory.shared
-
-        modelContainer = try await factory.loadContainer(
-            from: #hubDownloader(hub),
-            using: #huggingFaceTokenizerLoader(),
-            configuration: config
-        ) { progress in
-            Task { @MainActor in
-                self.downloadProgress = progress.fractionCompleted
+        let hub = hub
+        var loadError: Error?
+        let loadTask = Task { @MainActor in
+            defer {
+                isLoadingModel = false
+                activeLoadTask = nil
+            }
+            do {
+                let config = ModelConfiguration(id: modelId)
+                let factory: any ModelFactory = Self.visionModelIds.contains(modelId)
+                    ? VLMModelFactory.shared
+                    : LLMModelFactory.shared
+                modelContainer = try await factory.loadContainer(
+                    from: #hubDownloader(hub),
+                    using: #huggingFaceTokenizerLoader(),
+                    configuration: config
+                ) { progress in
+                    let fraction = progress.fractionCompleted
+                    Task { @MainActor in
+                        self.downloadProgress = fraction
+                    }
+                }
+                loadedModelId = modelId
+                isModelLoaded = true
+                print("✅ Local model loaded: \(modelId) (vision: \(Self.visionModelIds.contains(modelId)))")
+            } catch {
+                if !Task.isCancelled {
+                    loadError = error
+                    unloadModel()
+                }
             }
         }
+        activeLoadTask = loadTask
 
-        loadedModelId = modelId
-        isModelLoaded = true
-        print("✅ Local model loaded: \(modelId) (vision: \(Self.visionModelIds.contains(modelId)))")
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await loadTask.value
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 120_000_000_000)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+
+        if !finished {
+            cancelActiveLoad()
+            let message = "Carregamento expirou após 2 minutos. Tente um modelo menor."
+            lastLoadError = message
+            throw LocalLLMError.generationFailed(message)
+        }
+
+        if let loadError {
+            let message = loadError.localizedDescription
+            lastLoadError = message
+            throw LocalLLMError.generationFailed(message)
+        }
+    }
+
+    /// Whether this device has enough RAM to load the given model.
+    func canLoadModel(_ modelId: String) -> Bool {
+        (try? Self.validateDeviceRAM(for: modelId)) != nil
+    }
+
+    /// RAM requirement message for UI, if the model won't fit.
+    func ramRequirementMessage(for modelId: String) -> String? {
+        guard let required = Self.minimumRAMGB(for: modelId), required > 0 else { return nil }
+        let device = Self.deviceRAMGB
+        guard device < required else { return nil }
+        return String(format: "Precisa de %.0f GB de RAM — seu iPhone tem %.1f GB. Escolha um modelo menor.",
+                      required, device)
     }
 
     /// Unload model from memory.
@@ -351,6 +458,48 @@ final class LocalLLMService: ObservableObject {
 
     // MARK: - Helpers
 
+    private func registerLifecycleObservers() {
+        lifecycleObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didReceiveMemoryWarningNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                NSLog("⚠️ Memory warning — unloading local MLX model")
+                self.unloadModel()
+            }
+        )
+        lifecycleObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                if self.isLoadingModel {
+                    NSLog("📴 App backgrounded — cancelling in-flight MLX load")
+                    self.cancelActiveLoad()
+                } else if self.isModelLoaded {
+                    NSLog("📴 App backgrounded — unloading local MLX model (Metal forbidden in background)")
+                    self.unloadModel()
+                }
+            }
+        )
+    }
+
+    private static func minimumRAMGB(for modelId: String) -> Double? {
+        recommendedModels.first(where: { $0.id == modelId })?.minimumRAMGB
+    }
+
+    private static func validateDeviceRAM(for modelId: String) throws {
+        guard let required = minimumRAMGB(for: modelId), required > 0 else { return }
+        let device = deviceRAMGB
+        guard device >= required else {
+            throw LocalLLMError.insufficientMemory(requiredGB: required, deviceGB: device)
+        }
+    }
+
     private func directorySize(_ url: URL) -> Int64 {
         guard let enumerator = FileManager.default.enumerator(
             at: url, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]
@@ -372,6 +521,7 @@ enum LocalLLMError: LocalizedError {
     case modelNotLoaded
     case generationFailed(String)
     case backgrounded
+    case insufficientMemory(requiredGB: Double, deviceGB: Double)
 
     var errorDescription: String? {
         switch self {
@@ -381,6 +531,9 @@ enum LocalLLMError: LocalizedError {
             return "Local model generation failed: \(reason)"
         case .backgrounded:
             return "On-device models can't run while the app is in the background. Switch to a cloud model for background tasks."
+        case .insufficientMemory(let requiredGB, let deviceGB):
+            return String(format: "This model needs %.0f GB RAM but your iPhone has %.1f GB. Choose a smaller model (e.g. Qwen 0.5B).",
+                          requiredGB, deviceGB)
         }
     }
 }
@@ -417,5 +570,21 @@ extension LocalLLMService {
     /// Physical RAM of this device in GB.
     nonisolated static var deviceRAMGB: Double {
         Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+    }
+
+    /// Heaviest on-device model this iPhone can run — used for defaults and upgrades.
+    nonisolated static var preferredDefaultModelId: String {
+        let sorted = recommendedModels
+            .filter(\.isCompatibleWithDevice)
+            .sorted { lhs, rhs in
+                if lhs.minimumRAMGB != rhs.minimumRAMGB { return lhs.minimumRAMGB > rhs.minimumRAMGB }
+                if lhs.hasVision != rhs.hasVision { return lhs.hasVision }
+                return lhs.hasToolCalling && !rhs.hasToolCalling
+            }
+        return sorted.first?.id ?? "mlx-community/Qwen2.5-3B-Instruct-4bit"
+    }
+
+    nonisolated static func displayName(forModelId id: String) -> String {
+        recommendedModels.first(where: { $0.id == id })?.name ?? "Local"
     }
 }

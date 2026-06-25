@@ -60,19 +60,22 @@ class GlassesConnectionService: ObservableObject {
         do {
             try await Wearables.shared.startRegistration()
 
-            // Poll registration state — can take up to ~10s on fresh install
+            // Poll registration state — user must approve in Meta AI; callback may take ~25s
             var stateAfter = Wearables.shared.registrationState
-            let deadline = ContinuousClock.now + .seconds(10)
+            let deadline = ContinuousClock.now + .seconds(25)
             while stateAfter.rawValue < 3, ContinuousClock.now < deadline {
-                connectionStatus = "Registering… (state \(stateAfter.rawValue))"
+                connectionStatus = "Aguardando aprovação no Meta AI… (estado \(stateAfter.rawValue))"
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 stateAfter = Wearables.shared.registrationState
             }
 
-            print("✅ startRegistration() succeeded, state: \(stateAfter)")
-            connectionStatus = stateAfter.rawValue >= 3
-                ? "Waiting for device..."
-                : "Complete authorization in Meta AI app"
+            if stateAfter.rawValue >= 3 {
+                print("✅ Meta registration complete, state: \(stateAfter)")
+                connectionStatus = "Waiting for device..."
+            } else {
+                print("⏳ startRegistration() opened Meta AI; awaiting user approval, state: \(stateAfter)")
+                connectionStatus = "Aprove o iMetaClaw no Meta AI e volte ao app"
+            }
         } catch {
             print("❌ startRegistration() failed: \(error)")
             connectionStatus = "Connection failed: \(error.localizedDescription)"
