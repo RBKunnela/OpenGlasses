@@ -68,6 +68,29 @@ class OpenClawBridge: ObservableObject {
     var ambientCaptionService: AmbientCaptionService?
     var glassesDisplayService: GlassesDisplayService?
 
+    /// Returns the list of actions this device currently supports, based on hardware (via official MWDAT SDK).
+    /// Used for device.capabilities handshake and degradation logic on Maia.
+    private func currentGlassesCapabilities() -> [String] {
+        var caps: [String] = [
+            "capture_photo",
+            "record_audio", "stop_audio",
+            "start_video", "stop_video",
+            "translate", "stop_translation",
+            "transcribe_start", "transcribe_stop",
+            "status", "stop", "pare"
+        ]
+
+        // Display / lens HUD only if the connected glasses report support
+        if let disp = glassesDisplayService, disp.deviceSupportsDisplay() {
+            caps.append(contentsOf: ["display_show", "display_clear", "display_caption_start", "display_caption_stop"])
+        }
+
+        // Audio play/speak is always available via speakers (even if no "display")
+        caps.append("speak")
+
+        return caps
+    }
+
     /// Bridge-level connection for inbound commands (node.invoke etc). WS handshake success.
     var isConnected: Bool {
         connectionState == .connected || webSocketReady || wsConnected
@@ -568,6 +591,9 @@ class OpenClawBridge: ObservableObject {
         storeDeviceTokenIfPresent(from: connectResponse)
         NSLog("[OpenClaw] WS connected as operator (chat.send ready)")
 
+        // Push initial device.event for connection (per contract)
+        sendDeviceEvent(type: "connection", payload: ["status": "connected", "ws_ready": true])
+
         do {
             let sub = try await sendRequest(method: "sessions.messages.subscribe", params: ["key": sessionKey])
             if sub["ok"] as? Bool != true {
@@ -619,6 +645,29 @@ class OpenClawBridge: ObservableObject {
                         self.lastSuccessfulSend = Date()
                     }
                 }
+            }
+        }
+    }
+
+    /// Fire-and-forget device event push to Maia (per contract).
+    /// Examples: gesture, battery, wear, connection change.
+    func sendDeviceEvent(type: String, payload: [String: Any]) {
+        guard wsConnected, let task = webSocketTask else { return }
+        let eventMsg: [String: Any] = [
+            "type": "event",
+            "event": "device.event",
+            "payload": [
+                "type": type,
+                "timestamp": Int(Date().timeIntervalSince1970),
+                "data": payload
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: eventMsg),
+           let str = String(data: data, encoding: .utf8) {
+            Task {
+                try? await task.send(.string(str))
+                self.lastSuccessfulSend = Date()
+                NSLog("[OpenClaw] Sent device.event type=\(type)")
             }
         }
     }
@@ -912,6 +961,9 @@ class OpenClawBridge: ObservableObject {
         connectChallengeReceived = false
         connectChallengeNonce = nil
         connectChallengeWaiter?.resume(throwing: NSError(domain: "OpenClaw", code: -5, userInfo: [NSLocalizedDescriptionKey: "Disconnected"]))
+
+        // Push device.event for disconnect
+        sendDeviceEvent(type: "connection", payload: ["status": "disconnected"])
         connectChallengeWaiter = nil
         reconnectTask?.cancel()
         reconnectTask = nil
@@ -1455,7 +1507,8 @@ class OpenClawBridge: ObservableObject {
             if node == "glasses" || node.isEmpty ||
                a.contains("photo") || a.contains("record") || a.contains("video") ||
                a.contains("translate") || a.contains("transcribe") || a.contains("status") ||
-               a.contains("note") || a.contains("stop") || a.contains("pare") || a.contains("para") {
+               a.contains("note") || a.contains("stop") || a.contains("pare") || a.contains("para") ||
+               a == "device.capabilities" || a.contains("display") {
                 return await handleGlassesAction(action: action, payload: payload)
             }
             return ["ok": false, "payload": ["error": "Unknown node: \(node)"]]
@@ -1669,6 +1722,48 @@ class OpenClawBridge: ObservableObject {
                 let fromAudio = audioRecordingService?.recordingTranscript ?? ""
                 let tx = fromCaptions.isEmpty ? fromAudio : fromCaptions
                 return ["ok": true, "payload": ["transcript": tx, "source": fromCaptions.isEmpty ? "audio" : "captions"]]
+
+            // device.capabilities — report what this hardware actually supports (for Maia degradation logic)
+            case "device.capabilities", "get_capabilities":
+                let caps = currentGlassesCapabilities()
+                var payload: [String: Any] = [
+                    "actions": caps,
+                    "model": "rayban_meta", // or detect better
+                    "sdk_version": "0.7+",
+                    "has_display": glassesDisplayService?.hasDisplayCapability ?? false,
+                    "has_camera": true,
+                    "has_mic": true,
+                    "has_speakers": true
+                ]
+                return ["ok": true, "payload": payload]
+
+            // Display actions per new contract (map to existing display service)
+            case "display_show", "show_text", "push_display", "display_text", "show_on_lens", "show_overlay":
+                guard let disp = glassesDisplayService, disp.deviceSupportsDisplay() else {
+                    return ["ok": false, "payload": ["error": "Display not supported on this hardware", "degradation": "use speak or transcribe instead"]]
+                }
+                let text = payload["text"] as? String ?? payload["body"] as? String ?? ""
+                let ttl = payload["ttl_s"] as? TimeInterval ?? 0
+                if ttl > 0 {
+                    disp.flash(text, duration: ttl)
+                } else {
+                    disp.showText(text)
+                }
+                return ["ok": true, "payload": ["status": "display_shown"]]
+
+            case "display_clear", "clear_display", "clear_lens", "clear_hud":
+                glassesDisplayService?.clear()
+                return ["ok": true, "payload": ["status": "display_cleared"]]
+
+            case "display_caption_start", "start_display_caption":
+                guard let cap = ambientCaptionService else { return ["ok": false, "payload": ["error": "No caption service"]] }
+                if !cap.isActive { cap.start() }
+                // Captions will be pushed via sessions.send with context if Maia subscribes; reuse existing stream
+                return ["ok": true, "payload": ["status": "display_caption_started"]]
+
+            case "display_caption_stop", "stop_display_caption":
+                ambientCaptionService?.stop()
+                return ["ok": true, "payload": ["status": "display_caption_stopped"]]
 
             default:
                 return ["ok": false, "payload": ["error": "Unknown glasses action: \(action)"]]

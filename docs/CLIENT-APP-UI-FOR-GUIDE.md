@@ -48,6 +48,15 @@ Only the iOS app (Grok/Pedro side) knows these screens and flows.
 
    The app acts as the official SDK bridge. Maia (remote) fully orchestrates vision input, audio I/O, recordings, translation, live transcription, and HUD output on the lens. Continuous mic/text and on-demand frames stream to Maia; commands come back via the bidirectional WS + node.invoke. This is the recommended architecture per Meta SDK docs and community (phone middleman + external agent).
 
+## Alignment to updated server contract (NODE-INVOKE-CONTRACT-FOR-GROK + capabilities)
+
+The app now implements:
+- `device.capabilities` query (reports dynamic list: always vision/audio/recording/status + display_* only if hardware `device.supportsDisplay()` via official SDK).
+- `display_show` / `display_clear` / `display_caption_*` (maps to GlassesDisplayService + ambient for live captions on lens).
+- `device.event` push (fire-and-forget on same WS for connection, can extend for battery/gesture/wear).
+
+This matches the multi-tenant, hardware-agnostic contract with degradation.
+
 ## Important behavioral notes for the guide (do not promise more)
 
 - "Gravar vídeo": works in the app layer on top of the raw glasses camera frame stream + mic. Produces normal MP4. No hard time limit in the recorder. Real-world duration depends on the underlying Meta glasses Bluetooth session staying alive + battery/heat. The glasses LED will be on. This is **not** the same as native Meta View video recording (different cloud behavior, possibly different power profile). Mark as "funciona, teste na prática".
