@@ -2,6 +2,14 @@ import Foundation
 import MWDATCore
 
 /// Service for connecting to Ray-Ban Meta smart glasses
+///
+/// IMPORTANT (official limits):
+/// - Pairing and full registration require the official Meta AI companion app
+///   (Developer Mode must be enabled there).
+/// - registrationState must reach 3 for camera/mic capabilities.
+/// - Your app is always the middleman; no direct glasses-to-cloud without the phone.
+/// - See CameraService.swift for full SDK boundary notes.
+///
 /// Uses Meta Wearables Device Access Toolkit (MWDAT)
 @MainActor
 class GlassesConnectionService: ObservableObject {

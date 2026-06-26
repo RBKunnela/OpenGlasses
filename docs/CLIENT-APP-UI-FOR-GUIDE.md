@@ -1,5 +1,17 @@
 # iMetaClaw / Maia on Glasses — Exact App-Side Facts for Client Install Guide (A)
 
+**Critical reality (official Meta Wearables Device Access Toolkit as of mid-2026):**
+
+Meta strictly limits third-party access. Glasses are a Bluetooth peripheral. All intelligence lives on the phone or your remote agent (Maia). The phone app is the **mandatory middleman**. You cannot run code on the glasses, bypass the official Meta AI companion app for pairing, disable the LED, replace native "Hey Meta", or deeply control firmware.
+
+The sanctioned path (what this app does):
+- Use official MWDAT SDK (MWDATCore + MWDATCamera + MWDATDisplay).
+- Stream camera frames + mic to your agent in real time (must process on phone or forward immediately).
+- Receive commands from agent and execute via SDK (capture, play audio on open-ear speakers, push HUD overlays on Display models).
+- Requires the official Meta AI / Meta View app installed for pairing + Developer Mode.
+
+This app (iMetaClaw) implements exactly the recommended "phone bridge + external agent orchestrator" pattern. Your Telegram/Maia agent controls everything the hardware exposes, without fighting Meta's sandbox.
+
 This is the authoritative "what the end user actually does and sees" for the iPhone app part.
 Only the iOS app (Grok/Pedro side) knows these screens and flows.
 
@@ -61,65 +73,72 @@ Only the iOS app (Grok/Pedro side) knows these screens and flows.
 ### Block for Catálogo (replace the video part and add the technical note)
 
 ✅ Dá pra fazer (o que importa pra Maia):
-- Tirar foto / visão (pronto, devolve imageBase64)
-- Ouvir (STT local + stream contínuo pro Maia)
-- Falar (TTS de volta)
-- Gravar áudio + nota, transcrever reunião/consulta + salvar, tradução ao vivo de qualquer idioma (via mic + Maia; qualidade e idiomas melhores que o nativo da Meta)
-- Gravar vídeo ⚠️ (funciona sobre o stream cru da câmera dos óculos + áudio muxado. Sem limite artificial de tempo no app. Duração real depende da sessão Bluetooth da Meta + bateria/termal. LED dos óculos fica aceso. Não é idêntico ao gravador nativo da Meta View. Testar na prática.)
+- Tirar foto / visão (pronto — devolve imageBase64 limpo, sem 1x1)
+- Ouvir (STT local bom em pt-BR + stream contínuo)
+- Falar (resposta em voz)
+- Gravar áudio + nota, transcrever reunião/consulta + salvar, tradução ao vivo de qualquer idioma (nossa stack via mic + Maia — cobre muito mais que o nativo da Meta)
+- Gravar vídeo ⚠️ (funciona: usa o stream cru da câmera dos óculos + áudio muxado em MP4. Sem limite de tempo imposto pelo app. Duração real = quanto o stream Bluetooth da Meta aguenta + bateria/termal dos óculos. LED fica aceso durante a gravação. Não é o gravador oficial da Meta View com upload automático etc. Testar na prática com os óculos alvo.)
 
 🔴 Parede do Meta (não dá pra app de terceiro – não vamos prometer):
-- "Hey Meta" / Meta AI nativa (por isso usamos "Oi Maia")
-- Música, chamadas, navegação nativa, legendas/tradução do Meta, modelo Display (tela/pulseira neural)
+- "Hey Meta" / Meta AI nativa (por isso "Oi Maia")
+- Música, chamadas, navegação, legendas/tradução nativas, modelo Display (tela/pulseira neural)
 
 Descoberta técnica boa:
-Tradução ao vivo e transcrição de ambiente **não precisam de node.invoke para o fluxo de dados**. O app só precisa manter o stream do microfone/texto enviando continuamente para a Maia via o canal de voz/sessão. O node.invoke é usado apenas para controle (iniciar/parar os modos). Isso simplifica bastante o lado do servidor.
+Tradução e transcrição de ambiente **não precisam de node.invoke para o fluxo de dados**. O app só precisa streamar o texto do mic (e frames válidos) continuamente para a Maia. O node.invoke serve para a Maia comandar ações (start/stop, foto, status, pare). Isso deixa o contrato bem mais simples pro lado do servidor.
 
 ### Block for (A) Cliente – passos exatos nas telas do app (substitui os [Grok/Pedro])
 
 **(A) Cliente** — o que a pessoa faz no iPhone:
 
 1. Instala o app iMetaClaw (via TestFlight ou .ipa fornecido pelo operador).  
-   O build já vem com tudo embutido (handler de node.invoke, gravação de vídeo/áudio, tradução, legendas ambiente e ponte persistente com a Maia).
+   O build já vem com tudo embutido (handler completo de `node.invoke`, gravação de vídeo/áudio, tradução ao vivo, legendas de ambiente e a ponte WebSocket persistente).
 
-2. Abre o app pela primeira vez ou vai em **Ajustes → Gateways**.
+2. Abre o app pela primeira vez ou vai em **Ajustes → Gateways** (ou na seção de Gateways que aparece no onboarding).
 
-3. Adiciona ou edita o gateway:
-   - Nome: "Minha Maia" (ou o que quiser)
-   - Tunnel URL (ou LAN URL): o endereço que o Caddy expõe para o Maia Command Center (o mesmo que você usa no contrato atual, tipicamente apontando para :3600)
-   - Token: exatamente o valor de `OPENCLAW_TOKEN` que está em `/opt/maia/.env` no VPS
-   - Modo de conexão: Tunnel (ou Auto)
-   - Salva
+3. Cria ou edita o gateway:
+   - **Name**: "Minha Maia" (livre)
+   - Escolha o Provider: OpenClaw (para Maia)
+   - **Token**: cole exatamente o `OPENCLAW_TOKEN` de `/opt/maia/.env`
+   - **Connection Mode**: Tunnel (ou Auto)
+   - **Tunnel Host** (quando Tunnel): o domínio/URL que o Caddy expõe (o que aponta para o Maia Command Center na porta :3600). Exemplo placeholder costuma ser o default da Maia.
+   - (Se LAN) LAN Host + Port
+   - Salve
 
-4. Aguarda o indicador de status ficar verde:
-   - Pílula / banner mostra círculo verde + texto **"Maia pronta — HTTP + WebSocket OK"**
-   - Se aparecer laranja: "HTTP OK — WebSocket pendente (aprovar device no VPS)"
-   - Vermelho: "Gateway offline para o iPhone"
-   - Detalhes do último erro aparecem logo abaixo (copiáveis).
+4. Aguarde o status:
+   - Círculo verde + **"Maia pronta — HTTP + WebSocket OK"**
+   - Laranja: **"HTTP OK — WebSocket pendente (aprovar device no VPS)"**
+   - Vermelho: **"Gateway offline para o iPhone"**
+   - Cinza: **"Gateway não configurado"**
+   - Abaixo aparece `lastConnectionDetail` (mensagem de erro copiável) e preview de Health/WebSocket.
+   - Botão "Testar conexão completa (HTTP + WebSocket)" e "Test Connection" na edição.
 
-5. Pareia os Ray-Ban Meta normalmente pelo Bluetooth do iPhone.  
-   O app usa o stream de câmera e microfone dos óculos diretamente (MWDAT).
+5. Pareie os óculos Ray-Ban Meta normalmente (Bluetooth + permissões de câmera/microfone quando pedidas).  
+   O app captura direto do stream da câmera e microfone dos óculos (MWDAT SDK).
 
-6. Fala com a Maia:
-   - Diz **"Oi Maia"** (ou simplesmente fala). 
-   - O app transcreve localmente (boa qualidade em pt-BR) e envia o texto + (se válido) o último frame da câmera para a Maia via o socket persistente.
-   - A Maia responde em voz.
+6. Use:
+   - Fale **"Oi Maia"** ou qualquer frase. 
+   - Transcrição local (boa com sotaque pt-BR) + imagem da câmera (quando válida) é enviada continuamente para a Maia via `sessions.send`.
+   - Resposta vem em voz.
 
-7. A Maia pode comandar os óculos (via node.invoke):
-   - "tira uma foto" / "o que você vê?" → capture_photo (retorna imageBase64)
-   - "grava um vídeo" / "para o vídeo"
-   - "grava um áudio" / "anota isso" / "para de gravar"
-   - "modo tradução" / "para a tradução"
-   - "modo reunião" / "transcreve isso" / "transcreve consulta" / "encerra a reunião"
-   - "quanto de bateria?" / "status"
-   - Qualquer "pare" ou "para" genérico para desligar o que estiver ativo
+7. Comandos que a Maia pode disparar via `node.invoke` (controle):
+   - Tirar foto / visão
+   - Gravar/parar vídeo
+   - Gravar/parar áudio (anota isso)
+   - Modo tradução / parar tradução (fala a tradução em voz)
+   - Modo reunião / transcreve consulta / parar transcrição
+   - Status (bateria do iPhone + estados ativos)
+   - "pare" / "para" genérico (para tudo que estiver rodando)
 
-8. O app mantém o socket aberto em segundo plano usando a sessão de áudio (para wake word e gravações continuarem vivas quando o telefone está no bolso).
+8. O socket fica aberto em background graças à sessão de áudio do wake word. Funciona com o telefone no bolso.
 
-**Observações importantes para o cliente (não prometa mais que isso):**
-- Gravar vídeo funciona, mas duração real depende do stream dos óculos + bateria. LED fica ligado.
-- Tradução e transcrição de ambiente rodam localmente no telefone (qualquer idioma no nosso caminho).
-- Bateria reportada no status é do iPhone. Bateria dos óculos continua sendo vista no app oficial da Meta.
-- Se o pílula não ficar verde: problema quase sempre é token errado, Caddy não apontando para :3600, ou device ainda não aprovado no VPS.
+**Dicas e ressalvas importantes (escreva isso no guia):**
+- Em builds para cliente (simpleMode / iMetaClaw) a UI é bem mais limpa: esconde modelos locais, estratégias complexas, força vpsOnly para Maia.
+- No rodapé da edição em simpleMode aparece orientação: "Maia = KVM2 ... Token = gateway.auth.token da Maia. Não use Hermes."
+- Gravar vídeo: funciona (MP4 com áudio muxado do stream cru). Sem limite de tempo no código do app. Duração prática depende do quanto o stream Bluetooth dos óculos aguenta + bateria/termal dos óculos. O LED fica aceso. Não é o mesmo que gravar direto no Meta View.
+- Bateria: o comando status devolve % do iPhone. Bateria dos óculos → Meta View app.
+- Se não ficar verde: quase sempre token, Caddy proxy (:3600), ou device não aprovado no VPS (`openclaw devices list` ou equivalente).
+
+O cliente só precisa de: o app + a URL do tunnel + o token. O resto (handler, streaming, node.invoke) já vem junto.
 
 ### Nota sobre a extensão/script do Pedro
 
