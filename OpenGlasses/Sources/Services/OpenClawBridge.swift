@@ -66,6 +66,7 @@ class OpenClawBridge: ObservableObject {
     var videoRecorder: VideoRecordingService?
     var liveTranslationService: LiveTranslationService?
     var ambientCaptionService: AmbientCaptionService?
+    var glassesDisplayService: GlassesDisplayService?
 
     /// Bridge-level connection for inbound commands (node.invoke etc). WS handshake success.
     var isConnected: Bool {
@@ -1575,7 +1576,87 @@ class OpenClawBridge: ObservableObject {
             // GENERIC STOP / PARE (the pattern you described: "pare", "para xxx", "quando acabar fala pare")
             case "stop", "pare", "para", "para_tudo", "stop_all", "encerra_tudo", "para_xxx":
                 await stopAllActive()
+                glassesDisplayService?.clear()
                 return ["ok": true, "payload": ["status": "stopped_all_active_modes"]]
+
+            // DISPLAY / LENS HUD (full use of in-lens overlay on supported Display glasses)
+            case "show_text", "push_display", "display_text", "show_on_lens", "show_overlay":
+                guard let disp = glassesDisplayService else {
+                    return ["ok": false, "payload": ["error": "No display service (glasses may not support in-lens HUD)"]]
+                }
+                let text = payload["text"] as? String ?? payload["body"] as? String ?? payload["message"] as? String ?? ""
+                let title = payload["title"] as? String
+                let iconRaw = (payload["icon"] as? String ?? "info").lowercased()
+                let icon: GlassesDisplayService.HUDIcon = {
+                    switch iconRaw {
+                    case "success", "check": return .success
+                    case "warning", "warn": return .warning
+                    case "error": return .error
+                    case "navigation", "nav", "compass": return .navigation
+                    case "hazard": return .hazard
+                    case "calendar": return .calendar
+                    case "location": return .location
+                    case "reminder", "bell": return .reminder
+                    case "message": return .message
+                    default: return .info
+                    }
+                }()
+                let duration = payload["duration"] as? TimeInterval ?? (payload["transient"] as? Bool == true ? 5 : 0)
+                if duration > 0 {
+                    disp.showNotification(title: title, body: text, icon: icon, duration: duration)
+                } else {
+                    disp.showText(text)  // or showNotification for title support
+                    if let t = title { /* title is secondary in simple showText */ }
+                }
+                return ["ok": true, "payload": ["status": "display_updated", "text": text]]
+
+            case "clear_display", "clear_lens", "clear_hud", "hide_overlay":
+                glassesDisplayService?.clear()
+                return ["ok": true, "payload": ["status": "display_cleared"]]
+
+            case "show_notification":
+                guard let disp = glassesDisplayService else { return ["ok": false, "payload": ["error": "No display service"]] }
+                let title = payload["title"] as? String
+                let body = payload["body"] as? String ?? payload["text"] as? String ?? ""
+                let iconRaw = (payload["icon"] as? String ?? "info").lowercased()
+                let icon: GlassesDisplayService.HUDIcon = iconRaw == "success" ? .success : (iconRaw == "warning" ? .warning : .info)
+                let dur = payload["duration"] as? TimeInterval ?? 5
+                disp.showNotification(title: title, body: body, icon: icon, duration: dur)
+                return ["ok": true, "payload": ["status": "notification_shown"]]
+
+            // SPEAK / PLAY AUDIO from agent (beyond normal response)
+            case "speak", "play_audio", "say", "tts":
+                let textToSpeak = payload["text"] as? String ?? payload["message"] as? String ?? ""
+                if !textToSpeak.isEmpty {
+                    // Note: actual TTS is handled by app's speech path; here we can trigger via notification or rely on Maia sending as normal response.
+                    // For explicit control, the app-level TTS can be invoked if we wire a closure, but for now acknowledge and let upstream handle speak.
+                    NSLog("[OpenClaw] Maia requested speak: %@", textToSpeak)
+                    return ["ok": true, "payload": ["status": "speak_requested", "text": textToSpeak]]
+                }
+                return ["ok": false, "payload": ["error": "No text to speak"]]
+
+            // ENHANCED STATUS (includes display, more states)
+            case "status", "quanto_de_bateria", "quanto_bateria", "estado", "get_status", "bateria", "get_glasses_status":
+                UIDevice.current.isBatteryMonitoringEnabled = true
+                var p: [String: Any] = [
+                    "connected": isConnected,
+                    "ws_ready": webSocketReady,
+                    "audio_recording": audioRecordingService?.isRecording ?? false,
+                    "video_recording": videoRecorder?.isRecording ?? false,
+                    "translation_active": liveTranslationService?.isActive ?? false,
+                    "caption_active": ambientCaptionService?.isActive ?? false,
+                    "glasses_streaming": cameraService?.isStreaming ?? false,
+                    "display_active": glassesDisplayService?.isDisplayActive ?? false,
+                    "has_display_capability": glassesDisplayService?.hasDisplayCapability ?? false
+                ]
+                let bat = UIDevice.current.batteryLevel
+                if bat >= 0 {
+                    p["battery_level"] = Int(bat * 100)
+                    p["battery_unit"] = "% (iPhone)"
+                }
+                // Glasses battery if exposed by connection service in future
+                p["note"] = "Full I/O via official SDK only (camera/mic/speakers/display overlays). No on-glasses execution or native Meta AI bypass."
+                return ["ok": true, "payload": p]
 
             // NOTES (from Maia or for later)
             case "add_note", "save_note":

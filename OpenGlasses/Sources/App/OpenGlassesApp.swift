@@ -752,6 +752,7 @@ class AppState: ObservableObject, AppStateProtocol {
         openClawBridge.videoRecorder = videoRecorder
         openClawBridge.liveTranslationService = liveTranslation
         openClawBridge.ambientCaptionService = ambientCaptions
+        openClawBridge.glassesDisplayService = glassesDisplay
 
         // Wire native tool router to LLM service and Gemini Live
         llmService.nativeToolRouter = nativeToolRouter

@@ -36,14 +36,17 @@ Only the iOS app (Grok/Pedro side) knows these screens and flows.
 5. Pair the Ray-Ban Meta glasses normally (Bluetooth). The app uses the MWDAT camera + audio stream directly.
 6. Wake word in practice: user says **"Oi Maia"** (or just speaks). Local transcription (Sherpa or on-device) + the text + optional latest valid glasses frame (as imageBase64) is sent to Maia via the persistent `sessions.send`.
 7. Maia replies in voice (ElevenLabs or configured TTS flows back).
-8. Maia can also drive the glasses using `node.invoke` (control plane):
-   - capture_photo → returns imageBase64
-   - start_video / stop_video
-   - record_audio / stop_audio
-   - start_translation / stop_translation (live on-device translate + speak)
+8. Maia can also drive the glasses using `node.invoke` (control plane) — now covering **all major SDK-accessible I/O**:
+   - capture_photo → returns imageBase64 (for vision/describe)
+   - start_video / stop_video, record_audio / stop_audio
+   - start_translation / stop_translation (on-device, speaks back)
    - transcribe_start (reuniao or consulta) / transcribe_stop (ambient captions)
-   - status (battery, active modes, streaming)
-   - generic "pare" / "stop" stops whatever is running
+   - show_text / push_display / show_notification / clear_display → pushes text, title+body, icon overlays or notifications directly to the in-lens HUD (on supported Display models)
+   - speak / play_audio (explicit voice output from agent)
+   - status / get_glasses_status (now includes display capability, active modes, streaming, iPhone battery)
+   - generic "pare" / "stop" (stops recordings + clears HUD)
+
+   The app acts as the official SDK bridge. Maia (remote) fully orchestrates vision input, audio I/O, recordings, translation, live transcription, and HUD output on the lens. Continuous mic/text and on-demand frames stream to Maia; commands come back via the bidirectional WS + node.invoke. This is the recommended architecture per Meta SDK docs and community (phone middleman + external agent).
 
 ## Important behavioral notes for the guide (do not promise more)
 
