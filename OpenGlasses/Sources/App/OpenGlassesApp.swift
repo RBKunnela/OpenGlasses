@@ -13,6 +13,42 @@ extension Notification.Name {
     static let onboardingReset = Notification.Name("onboardingReset")
 }
 
+/// Thrown when a visible chat turn exceeds the user-facing interactive deadline (B2).
+/// The underlying gateway request may keep its own 120s deadline; this just stops the
+/// UI from looking frozen (Send disabled via `isProcessing`) while a slow turn runs.
+struct InteractiveTimeoutError: Error {}
+
+/// User-facing deadline for a visible chat turn. Distinct from the gateway/WS
+/// transport timeout — this is what keeps the Send button from being stuck
+/// disabled for ~120s when the gateway hangs.
+let interactiveTurnTimeoutSeconds: UInt64 = 25
+
+/// Runs `operation`, throwing `InteractiveTimeoutError` if it doesn't finish within
+/// `seconds`. The losing branch is cancelled. Used to bound visible chat turns (B2).
+///
+/// Main-actor isolated on purpose: the chat pipeline (`AppState`, `LLMService`) is all
+/// `@MainActor`, so this avoids `@Sendable` capture constraints on the operation closure.
+@MainActor
+func withInteractiveTimeout<T>(
+    seconds: UInt64 = interactiveTurnTimeoutSeconds,
+    operation: @escaping () async throws -> T
+) async throws -> T {
+    enum Race { case done(T); case timedOut }
+    return try await withThrowingTaskGroup(of: Race.self) { group in
+        group.addTask { .done(try await operation()) }
+        group.addTask {
+            try await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            return .timedOut
+        }
+        defer { group.cancelAll() }
+        guard let first = try await group.next() else { throw InteractiveTimeoutError() }
+        switch first {
+        case .done(let value): return value
+        case .timedOut: throw InteractiveTimeoutError()
+        }
+    }
+}
+
 private func processWearablesCallbackURL(_ url: URL, source: String) {
     NSLog("[OpenGlasses] [\(source)] Received URL callback: \(url.absoluteString)")
     Task { @MainActor in
@@ -479,6 +515,8 @@ class AppState: ObservableObject, AppStateProtocol {
     let speechService = TextToSpeechService()
     let cameraService = CameraService()
     let videoRecorder = VideoRecordingService()
+    // Inject for glasses button to toggle local video recording (iPhone extension mode)
+    cameraService.videoRecorder = videoRecorder
     let audioRecorder = AudioRecordingService()
     let meetingAssistant = MeetingAssistantService()
     let broadcastService = BroadcastService()
@@ -753,6 +791,11 @@ class AppState: ObservableObject, AppStateProtocol {
         openClawBridge.liveTranslationService = liveTranslation
         openClawBridge.ambientCaptionService = ambientCaptions
         openClawBridge.glassesDisplayService = glassesDisplay
+        openClawBridge.onSpeak = { [weak self] text in
+            Task { @MainActor in
+                await self?.speechService.speak(text)
+            }
+        }
 
         // Wire native tool router to LLM service and Gemini Live
         llmService.nativeToolRouter = nativeToolRouter
@@ -1111,7 +1154,7 @@ class AppState: ObservableObject, AppStateProtocol {
         }
         locationService.startTracking()
         if !Config.simpleMode {
-            HomeKitTool.prepareShared()
+            // HomeKitTool removed per user request (Apple HomeKit light control not intended for this app)
         }
     }
 
@@ -2042,6 +2085,63 @@ class AppState: ObservableObject, AppStateProtocol {
         }
     }
 
+    // MARK: - Local glasses recording (iPhone extension, not Meta)
+    /// Start long audio recording from glasses mic directly to iPhone (Documents/Recordings).
+    /// Triggered by voice command or glasses button.
+    func startGlassesAudioRecording() {
+        guard let rec = audioRecorder else { return }
+        do {
+            try rec.startRecording()
+            print("🎙️ Started local glasses audio recording to iPhone")
+        } catch {
+            errorMessage = "Audio recording failed: \(error.localizedDescription)"
+        }
+    }
+
+    func stopGlassesAudioRecording() async -> URL? {
+        guard let rec = audioRecorder else { return nil }
+        let url = await rec.stopRecording()
+        if let u = url { print("🎙️ Stopped, saved to iPhone: \(u.lastPathComponent)") }
+        return url
+    }
+
+    /// Start long video + audio recording from glasses directly to iPhone.
+    func startGlassesVideoRecording() {
+        guard let cam = cameraService, let vid = videoRecorder else { return }
+        Task {
+            do {
+                if !cam.isStreaming {
+                    try await cam.startStreaming()
+                }
+                let size = cam.latestFrame?.size ?? CGSize(width: 720, height: 1280)
+                try vid.startRecording(from: cam.framePublisher, bitrate: 1_500_000, outputSize: size)
+                print("🎥 Started local glasses video recording to iPhone")
+            } catch {
+                errorMessage = "Video recording failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func stopGlassesVideoRecording() async -> URL? {
+        guard let vid = videoRecorder else { return nil }
+        let url = await vid.stopRecording()
+        if let u = url { print("🎥 Stopped, saved to iPhone: \(u.lastPathComponent)") }
+        return url
+    }
+
+    /// Toggle via glasses button (called from CameraService when button pressed and flag on).
+    func toggleGlassesRecording() {
+        Task { @MainActor in
+            if videoRecorder?.isRecording == true || audioRecorder?.isRecording == true {
+                _ = await stopGlassesVideoRecording()
+                _ = await stopGlassesAudioRecording()
+            } else {
+                startGlassesVideoRecording()
+                startGlassesAudioRecording()
+            }
+        }
+    }
+
     func captureAndSharePhoto() async {
         guard isConnected else {
             errorMessage = "Connect glasses first"
@@ -2762,8 +2862,7 @@ class AppState: ObservableObject, AppStateProtocol {
 
         let routeToGateway = llmService.prefersGatewayRouting()
         let vpsVoiceMode = Config.phoneAIStrategy == .hybridVPSLocal || Config.phoneAIStrategy == .vpsOnly
-        let gatewayReady = openClawBridge.webSocketReady
-            && openClawBridge.connectionState == .connected
+        let gatewayReady = openClawBridge.isMaiaReady
 
         // VPS voice: never swap to local Qwen for "fast" tier — Maia on the server handles everything.
         if Config.isOpenClawExclusive || routeToGateway || (vpsVoiceMode && Config.isAnyGatewayConfigured && gatewayReady) {
@@ -2836,16 +2935,29 @@ class AppState: ObservableObject, AppStateProtocol {
                     }
                 }
 
-                rawResponse = try await llmService.sendMessage(
-                    query,
-                    locationContext: classification.relevantSections.contains(.location) ? locationService.locationContext : nil,
-                    imageData: imageData,
-                    memoryContext: (Config.userMemoryEnabled && !Config.isOpenClawExclusive) ? userMemory.systemPromptContext() : nil,
-                    playbookContext: classification.relevantSections.contains(.playbook) ? playbookStore.playbookContext() : nil,
-                    nowPlayingContext: nowPlayingAtStart?.promptContext,
-                    shortcutsContext: ShortcutsCatalog.shared.promptBlock(),
-                    promptSections: classification.relevantSections
-                )
+                // B2: bound the visible turn so a hung gateway can't hold
+                // isProcessing=true (Send disabled) for ~120s. On timeout this throws
+                // InteractiveTimeoutError, handled in the catch below.
+                let llm = llmService
+                let loc = classification.relevantSections.contains(.location) ? locationService.locationContext : nil
+                let mem = (Config.userMemoryEnabled && !Config.isOpenClawExclusive) ? userMemory.systemPromptContext() : nil
+                let play = classification.relevantSections.contains(.playbook) ? playbookStore.playbookContext() : nil
+                let nowCtx = nowPlayingAtStart?.promptContext
+                let shortcuts = ShortcutsCatalog.shared.promptBlock()
+                let sections = classification.relevantSections
+                let capturedImage = imageData
+                rawResponse = try await withInteractiveTimeout {
+                    try await llm.sendMessage(
+                        query,
+                        locationContext: loc,
+                        imageData: capturedImage,
+                        memoryContext: mem,
+                        playbookContext: play,
+                        nowPlayingContext: nowCtx,
+                        shortcutsContext: shortcuts,
+                        promptSections: sections
+                    )
+                }
             }
             nowPlayingAtStart = nil  // consumed for this turn
 
@@ -2887,6 +2999,13 @@ class AppState: ObservableObject, AppStateProtocol {
                 errorMessage = "Sem resposta do agente. Verifique se o gateway OpenClaw está conectado."
                 await speechService.speak("Não consegui uma resposta da \(Config.agentName). Verifique a conexão com o VPS.")
             }
+        } catch is InteractiveTimeoutError {
+            // B2: the visible turn exceeded the interactive deadline. Surface the
+            // standard "no response" message and let isProcessing reset below so
+            // Send is re-enabled (instead of being stuck for ~120s).
+            errorMessage = "Sem resposta do agente. Verifique se o gateway OpenClaw está conectado."
+            print("⏱️ Interactive turn timed out after \(interactiveTurnTimeoutSeconds)s")
+            await speechService.speak("A \(Config.agentName) demorou demais para responder. Verifique a conexão com o VPS.")
         } catch {
             let msg = error.localizedDescription
             let lower = msg.lowercased()
@@ -2965,14 +3084,23 @@ class AppState: ObservableObject, AppStateProtocol {
             // Send clean user text to the OpenClaw gateway (Maia).
             // Glasses capabilities should be described in the agent prompt on the VPS side
             // (not injected here, to keep compatibility with the original protocol).
-            let rawResponse = try await llmService.sendMessage(
-                query,
-                locationContext: locationService.locationContext,
-                imageData: image,
-                memoryContext: (Config.userMemoryEnabled && !Config.isOpenClawExclusive) ? userMemory.systemPromptContext() : nil,
-                playbookContext: playbookStore.playbookContext(),
-                shortcutsContext: ShortcutsCatalog.shared.promptBlock()
-            )
+            // B2: bound the visible typed turn with the interactive deadline too.
+            let llm = llmService
+            let loc = locationService.locationContext
+            let mem = (Config.userMemoryEnabled && !Config.isOpenClawExclusive) ? userMemory.systemPromptContext() : nil
+            let play = playbookStore.playbookContext()
+            let shortcuts = ShortcutsCatalog.shared.promptBlock()
+            let capturedImage = image
+            let rawResponse = try await withInteractiveTimeout {
+                try await llm.sendMessage(
+                    query,
+                    locationContext: loc,
+                    imageData: capturedImage,
+                    memoryContext: mem,
+                    playbookContext: play,
+                    shortcutsContext: shortcuts
+                )
+            }
 
             let response = Config.userMemoryEnabled ? userMemory.parseAndExecuteCommands(in: rawResponse) : rawResponse
             lastResponse = response
@@ -2991,6 +3119,12 @@ class AppState: ObservableObject, AppStateProtocol {
                 startStopListener()
                 await speechService.speak(response)
                 stopStopListener()
+            }
+        } catch is InteractiveTimeoutError {
+            errorMessage = "Sem resposta do agente. Verifique se o gateway OpenClaw está conectado."
+            print("⏱️ Interactive text turn timed out after \(interactiveTurnTimeoutSeconds)s")
+            if speakResponse {
+                await speechService.speak("A \(Config.agentName) demorou demais para responder.")
             }
         } catch {
             let msg = error.localizedDescription

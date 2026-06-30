@@ -68,6 +68,9 @@ class OpenClawBridge: ObservableObject {
     var ambientCaptionService: AmbientCaptionService?
     var glassesDisplayService: GlassesDisplayService?
 
+    /// Optional callback to speak text (for "speak" action from Maia).
+    var onSpeak: ((String) -> Void)?
+
     /// Returns the list of actions this device currently supports, based on hardware (via official MWDAT SDK).
     /// Used for device.capabilities handshake and degradation logic on Maia.
     private func currentGlassesCapabilities() -> [String] {
@@ -96,6 +99,13 @@ class OpenClawBridge: ObservableObject {
         connectionState == .connected || webSocketReady || wsConnected
     }
 
+    /// Strict ready for Maia/OpenClaw voice and node.invoke — requires live WS with recent activity.
+    var isMaiaReady: Bool {
+        connectionState == .connected &&
+        webSocketReady &&
+        Date().timeIntervalSince(lastSuccessfulSend) < 30
+    }
+
     private let pingSession: URLSession
     private let lanPingSession: URLSession
     private var sessionKey: String
@@ -109,8 +119,14 @@ class OpenClawBridge: ObservableObject {
     private var keepaliveTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var lastConnectionAttempt = Date.distantPast
-    private var reconnectBackoffSeconds: TimeInterval = 1.0
-    private var lastSuccessfulSend = Date()
+    private var reconnectBackoffSeconds: TimeInterval = 2.0
+    @Published private var lastSuccessfulSend = Date()
+    private var shouldReconnect = true
+    /// Consecutive WebSocket failures since the last successful connect.
+    /// After a few in a row we drop the cached endpoint so the next resolve
+    /// re-probes from scratch and never gets stuck on a bad candidate (B1).
+    private var consecutiveWSFailures = 0
+    private static let maxWSFailuresBeforeEndpointReset = 3
 
     /// WebSocket for chat (`chat.send`)
     private var webSocketTask: URLSessionWebSocketTask?
@@ -315,27 +331,27 @@ class OpenClawBridge: ObservableObject {
                     let workingBase = url.deletingLastPathComponent().absoluteString
                     NSLog(
                         "[OpenClaw] Health %@ (%@) → HTTP %d (%@)",
-                        url.absoluteString,
+                        Self.redactToken(in: url.absoluteString),
                         style.label,
                         http.statusCode,
                         String(body.prefix(100))
                     )
                     if (200...299).contains(http.statusCode) {
-                        return .success(workingBase: workingBase, lastURL: url.absoluteString)
+                        return .success(workingBase: workingBase, lastURL: Self.redactToken(in: url.absoluteString))
                     }
                     lastHTTPDetail = "HTTP \(http.statusCode) (\(style.label)) em \(url.host ?? url.absoluteString)"
                     lastHTTPBase = workingBase
                 }
             } catch {
-                lastNetworkDetail = "\(url.host ?? url.absoluteString): \(friendlyNetworkError(error))"
-                NSLog("[OpenClaw] Health %@ (%@) failed: %@", url.absoluteString, style.label, error.localizedDescription)
+                lastNetworkDetail = "\(url.host ?? Self.redactToken(in: url.absoluteString)): \(friendlyNetworkError(error))"
+                NSLog("[OpenClaw] Health %@ (%@) failed: %@", Self.redactToken(in: url.absoluteString), style.label, error.localizedDescription)
             }
         }
 
         if gotHTTPResponse {
             return .serverResponded(
                 detail: lastHTTPDetail,
-                lastURL: requests.last?.url.absoluteString ?? endpoint,
+                lastURL: Self.redactToken(in: requests.last?.url.absoluteString ?? endpoint),
                 workingBase: lastHTTPBase
             )
         }
@@ -344,7 +360,7 @@ class OpenClawBridge: ObservableObject {
         let detail = lastNetworkDetail.isEmpty
             ? "Sem resposta do servidor. Tentou: \(triedHosts)"
             : "\(lastNetworkDetail). Tentou: \(triedHosts)"
-        return .networkFailure(detail: detail, lastURL: requests.last?.url.absoluteString ?? endpoint)
+        return .networkFailure(detail: detail, lastURL: Self.redactToken(in: requests.last?.url.absoluteString ?? endpoint))
     }
 
     private func friendlyNetworkError(_ error: Error) -> String {
@@ -421,6 +437,21 @@ class OpenClawBridge: ObservableObject {
             lastConnectionDetail = Self.webSocketFailureHint(endpoint: workingBase, error: error)
             NSLog("[OpenClaw] HTTP OK but WebSocket failed: %@", lastConnectionDetail)
         }
+    }
+
+    /// Redact any auth token from a URL before logging (H5). Strips/masks
+    /// `token`/`access_token`/`key` query items so secrets never reach
+    /// NSLog / console / crash logs.
+    static func redactToken(in urlString: String) -> String {
+        guard var components = URLComponents(string: urlString),
+              let items = components.queryItems, !items.isEmpty else { return urlString }
+        let sensitive: Set<String> = ["token", "access_token", "auth", "key", "api_key"]
+        components.queryItems = items.map { item in
+            sensitive.contains(item.name.lowercased())
+                ? URLQueryItem(name: item.name, value: "***")
+                : item
+        }
+        return components.url?.absoluteString ?? urlString
     }
 
     private static func webSocketFailureHint(endpoint: String, error: Error) -> String {
@@ -504,14 +535,19 @@ class OpenClawBridge: ObservableObject {
             "permissions": [:] as [String: Any],
             "client": [
                 "id": "cli",
-                "displayName": "OpenGlasses",
+                "displayName": "iMetaClaw",
                 "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
                 "platform": "ios",
-                "mode": "ui"
+                "mode": "node"  // per contract for glasses node
             ] as [String: Any],
+            "policy": [
+                "tickIntervalMs": 15000
+            ] as [String: Any],
+            // device.capabilities for handshake per contract (Maia uses to degrade)
+            "deviceCapabilities": ["capture_photo", "see", "record_audio", "stop_audio", "start_video", "stop_video", "start_translation", "stop_translation", "transcribe_start", "transcribe_stop", "status", "speak", "display_show", "display_clear", "display_caption_start", "display_caption_stop"] as [String],
             "auth": ["token": token],
             "locale": Locale.current.identifier,
-            "userAgent": "OpenGlasses/ios"
+            "userAgent": "iMetaClaw/ios"
         ]
         if let nonce = challengeNonce, !nonce.isEmpty,
            let device = OpenClawDeviceIdentity.connectDevice(token: token, nonce: nonce) {
@@ -552,7 +588,7 @@ class OpenClawBridge: ObservableObject {
             throw NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "URL WebSocket inválida — verifique o host do gateway."])
         }
 
-        NSLog("[OpenClaw] WS connecting to %@", url.absoluteString)
+        NSLog("[OpenClaw] WS connecting to %@", Self.redactToken(in: url.absoluteString))
         connectChallengeReceived = false
         connectChallengeNonce = nil
         connectChallengeWaiter = nil
@@ -589,6 +625,15 @@ class OpenClawBridge: ObservableObject {
         webSocketReady = true
         sessionCompacted = false
         storeDeviceTokenIfPresent(from: connectResponse)
+        self.reconnectBackoffSeconds = 2.0  // reset after successful res
+        self.shouldReconnect = true
+        self.consecutiveWSFailures = 0  // healthy link — clear failure streak
+
+        // Restore high-level state if it was marked unreachable due to previous drop
+        if self.connectionState != .connected {
+            self.connectionState = .connected
+        }
+
         NSLog("[OpenClaw] WS connected as operator (chat.send ready)")
 
         // Push initial device.event for connection (per contract)
@@ -617,7 +662,7 @@ class OpenClawBridge: ObservableObject {
         reconnectBackoffSeconds = 1.0
         keepaliveTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 10_000_000_000) // 10s — more frequent to beat proxy idle (~6s symptoms)
+                try? await Task.sleep(nanoseconds: 15_000_000_000) // 15s official tick to match server policy and prevent 30s client close
                 guard let self = self,
                       !Task.isCancelled,
                       let task = self.webSocketTask else { break }
@@ -847,13 +892,19 @@ class OpenClawBridge: ObservableObject {
                         let params = json["params"] as? [String: Any] ?? [:]
                         Task {
                             let response = await self.handleIncomingRequest(method: method, params: params)
-                            // Follow the contract: res with ok + payload
-                            let resMsg: [String: Any] = [
+                            let isOk = response["ok"] as? Bool ?? false
+                            var resMsg: [String: Any] = [
                                 "type": "res",
                                 "id": id,
-                                "ok": response["ok"] as? Bool ?? false,
-                                "payload": response["payload"] ?? [:]
+                                "ok": isOk
                             ]
+                            if isOk {
+                                resMsg["payload"] = response["payload"] ?? [:]
+                            } else {
+                                // per contract, error at top level
+                                let errPayload = response["payload"] as? [String: Any] ?? ["message": "unknown error"]
+                                resMsg["error"] = errPayload["error"] ?? errPayload
+                            }
                             if let data = try? JSONSerialization.data(withJSONObject: resMsg),
                                let str = String(data: data, encoding: .utf8) {
                                 try? await self.webSocketTask?.send(.string(str))
@@ -869,6 +920,11 @@ class OpenClawBridge: ObservableObject {
                     self.wsConnected = false
                     self.webSocketReady = false
 
+                    // Reflect that the live link for Maia is down
+                    if self.connectionState == .connected {
+                        self.connectionState = .unreachable("WebSocket dropped, reconnecting...")
+                    }
+
                     await MainActor.run {
                         for (_, cont) in self.pendingResponses {
                             cont.resume(throwing: error)
@@ -881,16 +937,30 @@ class OpenClawBridge: ObservableObject {
                         self.pendingRunText.removeAll()
                     }
 
-                    // Increase backoff (cap at 30s) with jitter to avoid thundering herd
-                    self.reconnectBackoffSeconds = min(30.0, self.reconnectBackoffSeconds * 1.6 + Double.random(in: 0...0.8))
-                    NSLog("[OpenClaw] Scheduling reconnect in %.1fs (backoff)", self.reconnectBackoffSeconds)
+                    if self.shouldReconnect {
+                        // VisionClaw style: exponential backoff 2s base, ×2, cap 30s
+                        self.reconnectBackoffSeconds = min(30.0, self.reconnectBackoffSeconds * 2.0)
 
-                    // Schedule a single reconnect attempt (cancels previous)
-                    self.reconnectTask?.cancel()
-                    self.reconnectTask = Task { [weak self] in
-                        try? await Task.sleep(nanoseconds: UInt64(self?.reconnectBackoffSeconds ?? 3 * 1_000_000_000))
-                        guard let self = self, !Task.isCancelled else { return }
-                        try? await self.ensureWebSocket()
+                        // B1: after repeated failures, drop the cached endpoint so the
+                        // next resolve re-probes all candidates fresh instead of staying
+                        // pinned to a bad base (e.g. a stale internal :3600 candidate).
+                        self.consecutiveWSFailures += 1
+                        if self.consecutiveWSFailures >= Self.maxWSFailuresBeforeEndpointReset {
+                            NSLog("[OpenClaw] %d consecutive WS failures — clearing cached endpoint to force re-resolve", self.consecutiveWSFailures)
+                            self.cachedEndpoint = nil
+                            self.consecutiveWSFailures = 0
+                        }
+
+                        NSLog("[OpenClaw] Scheduling reconnect in %.1fs (backoff, VisionClaw style)", self.reconnectBackoffSeconds)
+
+                        self.reconnectTask?.cancel()
+                        self.reconnectTask = Task { [weak self] in
+                            try? await Task.sleep(nanoseconds: UInt64((self?.reconnectBackoffSeconds ?? 2) * 1_000_000_000))
+                            guard let self = self, !Task.isCancelled else { return }
+                            if self.shouldReconnect {
+                                try? await self.ensureWebSocket()
+                            }
+                        }
                     }
                     continue
                 }
@@ -1522,14 +1592,20 @@ class OpenClawBridge: ObservableObject {
         do {
             switch a {
             // PHOTO / VISION (already works end-to-end)
-            case "capture_photo", "take_photo", "photo", "tira_uma_foto", "tira_foto", "o_que_voce_ve", "que_que_e_isso":
+            case "capture_photo", "take_photo", "photo", "tira_uma_foto", "tira_foto", "o_que_voce_ve", "que_que_e_isso", "see":
                 guard let cam = cameraService else {
                     return ["ok": false, "payload": ["error": "No camera service"]]
                 }
                 let imageData = try await cam.capturePhoto()
                 let b64 = imageData.base64EncodedString()
-                // IMPORTANT: return imageBase64 so Maia can see (and validate server-side)
-                return ["ok": true, "payload": ["imageBase64": b64, "mimeType": "image/jpeg", "size": imageData.count]]
+                var width = 0
+                var height = 0
+                if let img = UIImage(data: imageData) {
+                    width = Int(img.size.width)
+                    height = Int(img.size.height)
+                }
+                // IMPORTANT: real frame only, per contract (no poison)
+                return ["ok": true, "payload": ["imageBase64": b64, "width": width, "height": height, "mimeType": "image/jpeg"]]
 
             // AUDIO RECORD (grava áudio / anota isso) + transcript on stop
             case "start_recording", "record_audio", "start_audio", "grava_um_audio", "grava_audio", "anota_isso", "grava_nota":
@@ -1544,7 +1620,8 @@ class OpenClawBridge: ObservableObject {
                     return ["ok": false, "payload": ["error": "No audio service"]]
                 }
                 if let url = await rec.stopRecording() {
-                    return ["ok": true, "payload": ["status": "stopped", "url": url.absoluteString, "transcript": rec.recordingTranscript]]
+                    // Local to iPhone only (Documents/Recordings) — not sent to Meta or VPS
+                    return ["ok": true, "payload": ["status": "stopped", "location": "iPhone local (Files app)", "note": "Recording stays on iPhone as extension, not uploaded."]]
                 }
                 return ["ok": true, "payload": ["status": "stopped"]]
 
@@ -1566,7 +1643,8 @@ class OpenClawBridge: ObservableObject {
                     return ["ok": false, "payload": ["error": "No video service"]]
                 }
                 if let url = await vid.stopRecording() {
-                    return ["ok": true, "payload": ["status": "stopped", "url": url.absoluteString]]
+                    // Local to iPhone only — not to Meta
+                    return ["ok": true, "payload": ["status": "stopped", "location": "iPhone Documents/Recordings (Files)", "note": "Long recording saved locally on iPhone."]]
                 }
                 return ["ok": true, "payload": ["status": "stopped"]]
 
@@ -1681,34 +1759,27 @@ class OpenClawBridge: ObservableObject {
             case "speak", "play_audio", "say", "tts":
                 let textToSpeak = payload["text"] as? String ?? payload["message"] as? String ?? ""
                 if !textToSpeak.isEmpty {
-                    // Note: actual TTS is handled by app's speech path; here we can trigger via notification or rely on Maia sending as normal response.
-                    // For explicit control, the app-level TTS can be invoked if we wire a closure, but for now acknowledge and let upstream handle speak.
-                    NSLog("[OpenClaw] Maia requested speak: %@", textToSpeak)
-                    return ["ok": true, "payload": ["status": "speak_requested", "text": textToSpeak]]
+                    NSLog("[OpenClaw] Maia speak proactive: %@", textToSpeak)
+                    if let speak = onSpeak, !textToSpeak.isEmpty {
+                        speak(textToSpeak)
+                    }
+                    return ["ok": true, "payload": ["spoken": true]]
                 }
                 return ["ok": false, "payload": ["error": "No text to speak"]]
 
-            // ENHANCED STATUS (includes display, more states)
+            // ENHANCED STATUS (includes display, more states) per contract
             case "status", "quanto_de_bateria", "quanto_bateria", "estado", "get_status", "bateria", "get_glasses_status":
                 UIDevice.current.isBatteryMonitoringEnabled = true
                 var p: [String: Any] = [
-                    "connected": isConnected,
-                    "ws_ready": webSocketReady,
-                    "audio_recording": audioRecordingService?.isRecording ?? false,
-                    "video_recording": videoRecorder?.isRecording ?? false,
-                    "translation_active": liveTranslationService?.isActive ?? false,
-                    "caption_active": ambientCaptionService?.isActive ?? false,
-                    "glasses_streaming": cameraService?.isStreaming ?? false,
-                    "display_active": glassesDisplayService?.isDisplayActive ?? false,
-                    "has_display_capability": glassesDisplayService?.hasDisplayCapability ?? false
+                    "battery": UIDevice.current.batteryLevel >= 0 ? Int(UIDevice.current.batteryLevel * 100) : nil,
+                    "recording": audioRecordingService?.isRecording ?? videoRecorder?.isRecording ?? false,
+                    "translating": liveTranslationService?.isActive ?? false,
+                    "transcribing": ambientCaptionService?.isActive ?? false,
+                    "camera": (cameraService?.isStreaming ?? false) ? "ready" : "busy"
                 ]
-                let bat = UIDevice.current.batteryLevel
-                if bat >= 0 {
-                    p["battery_level"] = Int(bat * 100)
-                    p["battery_unit"] = "% (iPhone)"
+                if let disp = glassesDisplayService {
+                    p["display"] = disp.hasDisplayCapability
                 }
-                // Glasses battery if exposed by connection service in future
-                p["note"] = "Full I/O via official SDK only (camera/mic/speakers/display overlays). No on-glasses execution or native Meta AI bypass."
                 return ["ok": true, "payload": p]
 
             // NOTES (from Maia or for later)

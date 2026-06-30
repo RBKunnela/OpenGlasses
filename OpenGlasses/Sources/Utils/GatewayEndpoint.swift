@@ -78,9 +78,17 @@ enum GatewayEndpoint {
 
         let isLAN = looksLikeLANHost(host)
 
-        // Remote hostname without explicit port → also try default gateway port.
-        // (Note: current Maia deployment listens on 3600 behind Caddy; this is mostly for legacy fallbacks)
-        if !isLAN, components.port == nil {
+        // Default gateway port (:3600) is the INTERNAL Maia port behind Caddy.
+        // It is only reachable on LAN / plain-http deployments. On an external
+        // `https://` host it is firewalled (Caddy terminates TLS on :443 and
+        // reverse-proxies to 127.0.0.1:3600), so probing it from the device just
+        // times out and falsely reports "Maia offline" (B1). Never append :3600
+        // for https hosts — the no-port (:443) primary candidate already covers them.
+        let allowDefaultPort = (components.scheme != "https")
+
+        // Remote hostname without explicit port → also try default gateway port
+        // (LAN / http only; the no-port :443 candidate stays first for https).
+        if !isLAN, allowDefaultPort, components.port == nil {
             var withPort = components
             withPort.port = defaultGatewayPort
             if let url = withPort.url {
@@ -95,13 +103,7 @@ enum GatewayEndpoint {
             if let url = https.url {
                 append(url.absoluteString)
             }
-            if components.port == nil {
-                var httpsPort = https
-                httpsPort.port = defaultGatewayPort
-                if let url = httpsPort.url {
-                    append(url.absoluteString)
-                }
-            }
+            // Do NOT add :3600 to the https-upgraded candidate — same B1 reason as above.
         }
 
         return candidates
@@ -147,16 +149,10 @@ enum GatewayEndpoint {
         for base in healthURLCandidates(from: endpoint) {
             append(base, .none)
             guard !token.isEmpty else { continue }
+            // Header auth only (H5). The token must never appear in the URL query —
+            // it leaks into server/proxy access logs and any URL logging on-device.
             append(base, .bearer)
             append(base, .headerToken)
-            if var components = URLComponents(url: base, resolvingAgainstBaseURL: false) {
-                var items = components.queryItems ?? []
-                items.append(URLQueryItem(name: "token", value: token))
-                components.queryItems = items
-                if let withToken = components.url {
-                    append(withToken, .queryToken)
-                }
-            }
         }
         return results
     }
@@ -174,19 +170,23 @@ enum GatewayEndpoint {
         }
     }
 
-    static func webSocketURL(from endpoint: String, token: String) -> URL? {
+    /// WebSocket URL for the gateway. The auth token is NOT placed in the query
+    /// string (H5) — it is sent via the `Authorization: Bearer` header by the
+    /// bridge when opening the socket. `token` is kept in the signature for
+    /// source compatibility but is intentionally ignored here.
+    static func webSocketURL(from endpoint: String, token: String = "") -> URL? {
+        _ = token
         let wsBase = sanitize(endpoint)
             .replacingOccurrences(of: "https://", with: "wss://")
             .replacingOccurrences(of: "http://", with: "ws://")
         guard !wsBase.isEmpty else { return nil }
-        var components = URLComponents(string: "\(wsBase)/ws")
-        components?.queryItems = [URLQueryItem(name: "token", value: token)]
+        let components = URLComponents(string: "\(wsBase)/ws")
         return components?.url
     }
 
-    static func webSocketURLString(from endpoint: String, token: String) -> String {
+    static func webSocketURLString(from endpoint: String, token: String = "") -> String {
         webSocketURL(from: endpoint, token: token)?.absoluteString
-            ?? "\(sanitize(endpoint))/ws?token=\(token)"
+            ?? "\(sanitize(endpoint).replacingOccurrences(of: "https://", with: "wss://").replacingOccurrences(of: "http://", with: "ws://"))/ws"
     }
 
     /// VPS / tunnel hosts need a signed device identity (not plain LAN).
