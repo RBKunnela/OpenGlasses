@@ -105,6 +105,7 @@ struct ConnectionBanner: View {
             case .connected: return (.green, "Connected")
             case .checking: return (.orange, "Checking")
             case .unreachable: return (.red, "Unreachable")
+            case .error: return (.red, "Disconnected")
             case .notConfigured: return (.gray, "Not Set Up")
             }
         }()
@@ -306,7 +307,7 @@ struct ConnectionBanner: View {
 
             if appState.registrationStateRaw < 3 {
                 Button {
-                    Task { await appState.completeAuthorizationInMetaAI() }
+                    Task { _ = await appState.performMetaRegistrationFlow() }
                     withAnimation { expandedPill = nil }
                 } label: {
                     Text("Complete in Meta AI")
@@ -381,7 +382,7 @@ struct ConnectionBanner: View {
 
             if !appState.isConnected {
                 Button {
-                    Task { await appState.glassesService.connect() }
+                    Task { await appState.connectAndListen() }
                     withAnimation { expandedPill = nil }
                 } label: {
                     Text("Connect Glasses")
@@ -576,17 +577,51 @@ struct ConnectionBanner: View {
                 }
             case .unreachable(let reason):
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Server unreachable")
+                    Text("Gateway offline para o iPhone")
                         .font(.system(size: 12))
                         .foregroundStyle(.red.opacity(0.8))
                     Text(reason)
                         .font(.system(size: 11))
                         .foregroundStyle(.white.opacity(0.5))
-                        .lineLimit(2)
+                        .lineLimit(4)
+                    if let url = openClawBridge.lastCheckedURL {
+                        Text(url)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .lineLimit(2)
+                    }
                 }
 
                 Button {
-                    Task { await openClawBridge.checkConnection() }
+                    Task {
+                        await openClawBridge.refreshConnectionForChat()
+                    }
+                } label: {
+                    Text("Try Again")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(accent)
+                }
+            case .error(let reason):
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Gateway desconectado — reconexões esgotadas")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.red.opacity(0.8))
+                    Text(reason)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.5))
+                        .lineLimit(4)
+                    if let url = openClawBridge.lastCheckedURL {
+                        Text(url)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .lineLimit(2)
+                    }
+                }
+
+                Button {
+                    Task {
+                        await openClawBridge.refreshConnectionForChat()
+                    }
                 } label: {
                     Text("Try Again")
                         .font(.system(size: 13, weight: .semibold))

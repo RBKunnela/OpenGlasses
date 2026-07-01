@@ -17,7 +17,7 @@ struct BiometricLockView: View {
                     .font(.system(size: 60))
                     .foregroundStyle(AppAccent.aiCoral)
 
-                Text("OpenGlasses")
+                Text(AppBranding.name)
                     .font(.title.bold())
                     .foregroundStyle(.white)
 
@@ -64,7 +64,7 @@ struct BiometricLockView: View {
             ? .deviceOwnerAuthenticationWithBiometrics
             : .deviceOwnerAuthentication
 
-        context.evaluatePolicy(policy, localizedReason: "Unlock OpenGlasses to access protected health data") { success, _ in
+        context.evaluatePolicy(policy, localizedReason: "Desbloqueie o \(AppBranding.name) para acessar dados protegidos") { success, _ in
             DispatchQueue.main.async {
                 isAuthenticating = false
                 if success {

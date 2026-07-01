@@ -91,9 +91,19 @@ struct ModelPickerSheet: View {
     }
 
     private func selectModel(_ model: ModelConfig) {
+        guard !Config.simpleMode else {
+            dismiss()
+            return
+        }
+
         Config.setActiveModelId(model.id)
         appState.llmService.clearHistory()
         appState.llmService.refreshActiveModel()
+
+        guard !Config.blocksRealtimeModes else {
+            dismiss()
+            return
+        }
 
         let isRealtimeModel = model.llmProvider == .openai
             && model.model.lowercased().contains("realtime")

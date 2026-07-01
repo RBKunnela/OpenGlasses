@@ -34,11 +34,11 @@ struct LaunchScreen: View {
                         )
 
                     // Vector logo — template-rendered so it picks up the coral tint.
-                    Image("OpenGlassesLogo")
+                    Image("iMetaClawLogo")
                         .renderingMode(.template)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .foregroundStyle(AppAccent.aiCoral)
+                        .foregroundStyle(AppAccent.brandColor)
                         .frame(maxWidth: 240)
                         .scaleEffect(isAnimating ? 1.0 : 0.85)
                         .opacity(isAnimating ? 1.0 : 0)
@@ -47,12 +47,12 @@ struct LaunchScreen: View {
                 Spacer()
                     .frame(height: 32)
 
-                Text("OpenGlasses")
+                Text(AppBranding.name)
                     .font(.system(size: 36, weight: .bold, design: .rounded))
                     .foregroundStyle(.primary)
                     .opacity(isAnimating ? 1.0 : 0)
 
-                Text("Voice-Powered AI Assistant")
+                Text(AppBranding.taglineEN)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.secondary)
                     .padding(.top, 8)

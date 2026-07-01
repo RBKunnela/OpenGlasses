@@ -9,9 +9,11 @@ enum LLMProvider: String, CaseIterable {
     case openai = "openai"
     case gemini = "gemini"
     case groq = "groq"
+    case nvidia = "nvidia"
     case zai = "zai"
     case qwen = "qwen"
     case minimax = "minimax"
+    case xai = "xai"
     case openrouter = "openrouter"
     case custom = "custom"
     case local = "local"
@@ -23,7 +25,9 @@ enum LLMProvider: String, CaseIterable {
         case .openai: return "OpenAI (GPT)"
         case .gemini: return "Google (Gemini)"
         case .groq: return "Groq"
-        case .zai: return "Z.ai (Subscription)"
+        case .xai: return "xAI Grok (Subscription)"
+        case .nvidia: return "NVIDIA NIM"
+        case .zai: return "Z.ai GLM (Subscription)"
         case .qwen: return "Qwen (Subscription)"
         case .minimax: return "MiniMax (Subscription)"
         case .openrouter: return "OpenRouter (500+ models)"
@@ -40,6 +44,8 @@ enum LLMProvider: String, CaseIterable {
         case .openai: return URL(string: "https://platform.openai.com/api-keys")
         case .gemini: return URL(string: "https://aistudio.google.com/apikey")
         case .groq: return URL(string: "https://console.groq.com/keys")
+        case .xai: return URL(string: "https://console.x.ai")
+        case .nvidia: return URL(string: "https://build.nvidia.com/settings/api-keys")
         case .minimax: return URL(string: "https://platform.minimaxi.com")
         case .openrouter: return URL(string: "https://openrouter.ai/keys")
         case .qwen: return URL(string: "https://dashscope.console.aliyun.com/apiKey")
@@ -51,7 +57,7 @@ enum LLMProvider: String, CaseIterable {
     var isOpenAICompatible: Bool {
         switch self {
         case .anthropic, .gemini, .local, .appleOnDevice: return false
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom: return true
+        case .openai, .groq, .xai, .nvidia, .zai, .qwen, .minimax, .openrouter, .custom: return true
         }
     }
 
@@ -62,6 +68,8 @@ enum LLMProvider: String, CaseIterable {
         case .openai: return "https://api.openai.com/v1/chat/completions"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
         case .groq: return "https://api.groq.com/openai/v1/chat/completions"
+        case .xai: return "https://api.x.ai/v1/chat/completions"
+        case .nvidia: return "https://integrate.api.nvidia.com/v1/chat/completions"
         case .zai: return "https://api.z.ai/api/coding/paas/v4/chat/completions"
         case .qwen: return "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions"
         case .minimax: return "https://api.minimax.io/v1/chat/completions"
@@ -79,12 +87,14 @@ enum LLMProvider: String, CaseIterable {
         case .openai: return "gpt-4o"
         case .gemini: return "gemini-2.0-flash"
         case .groq: return "llama-3.3-70b-versatile"
+        case .xai: return "grok-3-mini"
+        case .nvidia: return "meta/llama-3.1-70b-instruct"
         case .zai: return "glm-4.5"
         case .qwen: return "qwen3.5-plus"
         case .minimax: return "MiniMax-M2.7"
         case .openrouter: return "anthropic/claude-sonnet-4"
         case .custom: return "gpt-4o"
-        case .local: return "mlx-community/gemma-4-e2b-it-4bit"
+        case .local: return "mlx-community/Qwen2.5-3B-Instruct-4bit"
         case .appleOnDevice: return "apple-foundation-model"
         }
     }
@@ -92,7 +102,7 @@ enum LLMProvider: String, CaseIterable {
     /// Whether the base URL field should be shown (editable endpoint)
     var showBaseURL: Bool {
         switch self {
-        case .custom, .zai, .qwen, .minimax: return true
+        case .custom, .zai, .qwen, .minimax, .xai: return true
         default: return false
         }
     }
@@ -102,6 +112,44 @@ enum LLMProvider: String, CaseIterable {
         switch self {
         case .local, .appleOnDevice: return false
         default: return true
+        }
+    }
+
+    /// Whether this provider uses a subscription token instead of a raw API key
+    var isSubscriptionBased: Bool {
+        switch self {
+        case .xai, .zai, .qwen, .minimax: return true
+        default: return false
+        }
+    }
+
+    /// Whether this provider uses a browser-based OAuth login flow (ASWebAuthenticationSession)
+    /// instead of a raw API key paste.
+    var isOAuthProvider: Bool {
+        switch self {
+        case .anthropic: return true  // claude.ai subscription uses OAuth
+        default: return false
+        }
+    }
+
+    /// The OAuth authorization URL to open in ASWebAuthenticationSession.
+    /// Returns nil for providers that don't use OAuth.
+    var oauthAuthURL: URL? {
+        switch self {
+        case .anthropic:
+            // Claude.ai subscription OAuth — opens the sign-in page.
+            // The redirect URI is clawglasses://oauth/callback
+            return URL(string: "https://claude.ai/login?return_to=%2Fauth%2Fapp-token&utm_source=app")
+        default:
+            return nil
+        }
+    }
+
+    /// The label shown on the OAuth sign-in button.
+    var oauthButtonLabel: String {
+        switch self {
+        case .anthropic: return "Sign in with Claude"
+        default: return "Sign in"
         }
     }
 
@@ -120,6 +168,28 @@ enum LLMProvider: String, CaseIterable {
 class LLMService: ObservableObject {
     @Published var isProcessing: Bool = false
     @Published var activeModelName: String = Config.activeModel?.name ?? "No Model"
+    /// When the last reply was routed to OpenClaw (Maia on VPS) instead of the active on-device model.
+    @Published private(set) var lastResponseViaGateway = false
+
+    /// Which agent answers voice. In OpenClaw-exclusive mode it is always Maia (or offline).
+    func resolvedVoiceRoute() -> (label: String, usesGateway: Bool, isOffline: Bool) {
+        if Config.isOpenClawExclusive || shouldRouteVoiceToOpenClaw() {
+            let gatewayReady = openClawBridge?.webSocketReady == true
+                && openClawBridge?.connectionState == .connected
+            if gatewayReady || lastResponseViaGateway {
+                return (Config.agentName, true, false)
+            }
+            return (Config.agentName, true, true)
+        }
+        return (activeModelName, false, false)
+    }
+
+    /// Label for the brain button.
+    var voiceRouteLabel: String {
+        let route = resolvedVoiceRoute()
+        if route.isOffline { return "\(Config.agentName) (offline)" }
+        return route.label
+    }
     @Published var toolCallStatus: ToolCallStatus = .idle
 
     /// Last chain-of-thought reasoning from <think> tags (nil if none).
@@ -471,6 +541,33 @@ class LLMService: ObservableObject {
         if includeOpenClaw { toolsLabel += " [OpenClaw]" }
         print("🤖 Using model: \(modelConfig.name) (\(modelConfig.model) via \(provider.displayName))\(toolsLabel)")
 
+        if Config.isOpenClawExclusive || shouldRouteVoiceToOpenClaw() {
+            guard Config.isAnyGatewayConfigured, openClawBridge != nil else {
+                throw LLMError.gatewayError(
+                    "\(Config.agentName) só funciona com o gateway OpenClaw. Configure em Settings → Gateways."
+                )
+            }
+
+            func appendAndReturn(_ response: String) -> String {
+                conversationHistory.append(["role": "user", "content": text])
+                conversationHistory.append(["role": "assistant", "content": response])
+                trimHistory()
+                return response
+            }
+
+            print("🌐 OpenClaw only — \(Config.agentName) no VPS (sem fallback no iPhone)")
+            lastResponseViaGateway = true
+            do {
+                let gatewayResponse = try await sendViaOpenClawGateway(text, imageData: imageData)
+                return appendAndReturn(gatewayResponse)
+            } catch {
+                lastResponseViaGateway = false
+                throw LLMError.gatewayError(
+                    "\(Config.agentName) não respondeu. OpenClaw offline — o iPhone não usa Qwen nem API na nuvem. Verifique o gateway (pill vermelho)."
+                )
+            }
+        }
+
         // Plan-then-execute (Plan S): for a multi-step request in agent mode, plan deliberately and
         // run each step through the supervisor-gated router, instead of the single-shot tool loop.
         // The planner sees the request alone (not chat history), and tool output never re-enters
@@ -486,19 +583,13 @@ class LLMService: ObservableObject {
             print("🧭 Agent plan loop yielded no plan — falling back to single-shot")
         }
 
-        let rawResponse: String
-        switch provider {
-        case .anthropic:
-            rawResponse = try await sendAnthropic(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
-        case .gemini:
-            rawResponse = try await sendGemini(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
-        case .local:
-            rawResponse = try await sendLocal(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
-        case .appleOnDevice:
-            rawResponse = try await sendAppleOnDevice(text, systemPrompt: fullPrompt)
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
-            rawResponse = try await sendOpenAICompatible(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
-        }
+        let rawResponse = try await sendWithModelConfig(
+            modelConfig,
+            text: text,
+            systemPrompt: fullPrompt,
+            includeTools: includeTools,
+            imageData: imageData
+        )
 
         // Strip <think> tags: keep reasoning in history but don't speak it
         if Config.agentModeEnabled {
@@ -561,7 +652,7 @@ class LLMService: ObservableObject {
             return try await sendLocal(text, systemPrompt: system, config: config, includeTools: false, imageData: nil)
         case .appleOnDevice:
             return try await sendAppleOnDevice(text, systemPrompt: system)
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai, .nvidia:
             return try await sendOpenAICompatible(text, systemPrompt: system, config: config, includeTools: false, imageData: nil)
         }
     }
@@ -788,7 +879,7 @@ class LLMService: ObservableObject {
                       let text = content.first?["text"] as? String else { return nil }
                 return text
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai, .nvidia:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -853,7 +944,11 @@ class LLMService: ObservableObject {
     /// Returns the raw model text, or nil on failure / unsupported provider (local, appleOnDevice).
     func analyzeFrame(systemPrompt: String, userText: String, imageData: Data, maxTokens: Int = 200) async -> String? {
         guard let modelConfig = Config.activeModel else { return nil }
-        let base64 = LLMImagePreparer.prepared(imageData).base64EncodedString()
+        guard let preparedImage = LLMImagePreparer.prepared(imageData) else {
+            NSLog("[LLMService] analyzeFrame: degenerate image dropped — skipping vision call")
+            return nil
+        }
+        let base64 = preparedImage.base64EncodedString()
         let provider = modelConfig.llmProvider
 
         do {
@@ -882,7 +977,7 @@ class LLMService: ObservableObject {
                       let text = content.first?["text"] as? String else { return nil }
                 return text
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai, .nvidia:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -957,7 +1052,11 @@ class LLMService: ObservableObject {
                                 jsonSchema: [String: Any], toolName: String = "assessment",
                                 maxTokens: Int = 1024) async -> [String: Any]? {
         guard let modelConfig = Config.activeModel else { return nil }
-        let base64 = LLMImagePreparer.prepared(imageData).base64EncodedString()
+        guard let preparedImage = LLMImagePreparer.prepared(imageData) else {
+            NSLog("[LLMService] analyzeFrameStructured: degenerate image dropped — skipping vision call")
+            return nil
+        }
+        let base64 = preparedImage.base64EncodedString()
         let provider = modelConfig.llmProvider
         let toolDescription = "Return the structured assessment for the image."
 
@@ -986,7 +1085,7 @@ class LLMService: ObservableObject {
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
                 return StructuredVisionParser.anthropic(data, toolName: toolName)
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai, .nvidia:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -1080,7 +1179,7 @@ class LLMService: ObservableObject {
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
                 return StructuredVisionParser.anthropic(data, toolName: toolName)
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai, .nvidia:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -1156,7 +1255,7 @@ class LLMService: ObservableObject {
             return try await sendGemini(text, systemPrompt: systemPrompt, config: config, includeTools: includeTools, imageData: nil)
         case .local, .appleOnDevice:
             throw LLMError.missingAPIKey("Local providers cannot be used as cloud agent")
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai, .nvidia:
             return try await sendOpenAICompatible(text, systemPrompt: systemPrompt, config: config, includeTools: includeTools, imageData: nil)
         }
     }
@@ -1168,8 +1267,8 @@ class LLMService: ObservableObject {
         }
 
         // Add user message to history
-        if let imageData = imageData {
-            let base64String = LLMImagePreparer.prepared(imageData).base64EncodedString()
+        if let imageData = imageData, let preparedImage = LLMImagePreparer.prepared(imageData) {
+            let base64String = preparedImage.base64EncodedString()
             let content: [[String: Any]] = [
                 [
                     "type": "image",
@@ -1359,8 +1458,8 @@ class LLMService: ObservableObject {
         // with a heuristic fallback in `ModelConfig.visionEnabled`.
         let supportsVision = config.visionEnabled
         
-        if let imageData = imageData, supportsVision {
-            let base64String = LLMImagePreparer.prepared(imageData).base64EncodedString()
+        if let imageData = imageData, supportsVision, let preparedImage = LLMImagePreparer.prepared(imageData) {
+            let base64String = preparedImage.base64EncodedString()
             // Custom providers proxying to Anthropic API need type:image with base64 source,
             // not OpenAI's type:image_url format.
             let isAnthropicProxy = provider == .custom && config.model.lowercased().contains("claude")
@@ -1403,7 +1502,7 @@ class LLMService: ObservableObject {
             // OpenRouter requires additional headers for tracking
             if provider == .openrouter {
                 request.setValue("https://github.com/straff2002/OpenGlasses", forHTTPHeaderField: "HTTP-Referer")
-                request.setValue("OpenGlasses", forHTTPHeaderField: "X-Title")
+                request.setValue(AppBranding.name, forHTTPHeaderField: "X-Title")
             }
 
             // OpenAI format: system prompt is a message in the array.
@@ -1559,8 +1658,8 @@ class LLMService: ObservableObject {
         }
 
         // Add user message to history
-        if let imageData = imageData {
-            let base64String = LLMImagePreparer.prepared(imageData).base64EncodedString()
+        if let imageData = imageData, let preparedImage = LLMImagePreparer.prepared(imageData) {
+            let base64String = preparedImage.base64EncodedString()
             let parts: [[String: Any]] = [
                 ["text": text],
                 ["inlineData": ["mimeType": "image/jpeg", "data": base64String]]
@@ -1799,14 +1898,141 @@ class LLMService: ObservableObject {
     }
     #endif
 
+    /// Whether the next voice turn will hit the OpenClaw gateway (vs cloud API / local).
+    func prefersGatewayRouting() -> Bool {
+        shouldPreferOpenClawGateway()
+    }
+
+    /// Whether voice and chat should route to the OpenClaw gateway (Maia on VPS).
+    /// Matches VoiceTab: "Voz via Maia no VPS — modelo local só para offline".
+    func shouldRouteVoiceToOpenClaw() -> Bool {
+        guard Config.isAnyGatewayConfigured, openClawBridge != nil else { return false }
+        switch Config.phoneAIStrategy {
+        case .vpsOnly, .hybridVPSLocal:
+            return true
+        case .hybridLocalCloud, .cloudOnly:
+            return false
+        }
+    }
+
+    /// VPS-only / hybrid modes prefer the OpenClaw gateway when configured — unless the user
+    /// selected a cloud API model (e.g. NVIDIA NIM) or the gateway WebSocket is not ready.
+    private func shouldPreferOpenClawGateway() -> Bool {
+        if Config.isOpenClawExclusive {
+            return Config.isAnyGatewayConfigured
+        }
+        return shouldRouteVoiceToOpenClaw()
+    }
+
+    /// Route a single turn through a specific model configuration (cloud, local, or gateway redirect).
+    private func sendWithModelConfig(
+        _ modelConfig: ModelConfig,
+        text: String,
+        systemPrompt: String,
+        includeTools: Bool,
+        imageData: Data?
+    ) async throws -> String {
+        switch modelConfig.llmProvider {
+        case .anthropic:
+            lastResponseViaGateway = false
+            return try await sendAnthropic(text, systemPrompt: systemPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
+        case .gemini:
+            lastResponseViaGateway = false
+            return try await sendGemini(text, systemPrompt: systemPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
+        case .local:
+            if shouldRouteLocalToOpenClaw(modelConfig: modelConfig) {
+                localLLMService?.cancelActiveLoad()
+                print("🌐 Local model not ready — routing to OpenClaw (\(Config.agentName))")
+                do {
+                    lastResponseViaGateway = true
+                    return try await sendViaOpenClawGateway(text, imageData: imageData)
+                } catch {
+                    if let cloud = Config.usableCloudModel() {
+                        print("🌐 Gateway failed — falling back to \(cloud.name)")
+                        lastResponseViaGateway = false
+                        return try await sendOpenAICompatible(text, systemPrompt: systemPrompt, config: cloud, includeTools: includeTools, imageData: imageData)
+                    }
+                    throw error
+                }
+            }
+            lastResponseViaGateway = false
+            return try await sendLocal(text, systemPrompt: systemPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
+        case .appleOnDevice:
+            lastResponseViaGateway = false
+            return try await sendAppleOnDevice(text, systemPrompt: systemPrompt)
+        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom, .xai, .nvidia:
+            lastResponseViaGateway = false
+            return try await sendOpenAICompatible(text, systemPrompt: systemPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
+        }
+    }
+
+    /// Hybrid / VPS-only setups should talk to OpenClaw (Maia) when the on-device model
+    /// isn't already loaded — don't block the user on a multi-minute MLX load.
+    private func shouldRouteLocalToOpenClaw(modelConfig: ModelConfig) -> Bool {
+        guard modelConfig.llmProvider == .local else { return false }
+        switch Config.phoneAIStrategy {
+        case .hybridVPSLocal, .vpsOnly:
+            break
+        case .hybridLocalCloud, .cloudOnly:
+            return false
+        }
+        guard Config.isAnyGatewayConfigured, openClawBridge != nil else { return false }
+        guard let local = localLLMService else { return true }
+        let ready = local.isModelLoaded && local.loadedModelId == modelConfig.model
+        return !ready
+    }
+
+    /// Send the user's message straight to the OpenClaw gateway (same path as Telegram).
+    private func sendViaOpenClawGateway(_ text: String, imageData: Data? = nil) async throws -> String {
+        guard let bridge = openClawBridge else {
+            throw LLMError.missingAPIKey("OpenClaw gateway not initialized")
+        }
+        // For persistent connection (iMetaClaw), avoid forced refresh on every send.
+        // Reconnect only if needed via ensure inside send.
+        if bridge.connectionState != .connected || !bridge.webSocketReady {
+            await bridge.checkConnection()
+        }
+        if case .unreachable(let reason) = bridge.connectionState {
+            NSLog("[OpenClaw] Health check failed — tentando WebSocket mesmo assim: %@", reason)
+        }
+        toolCallStatus = .executing("OpenClaw")
+        defer { toolCallStatus = .idle }
+
+        let result = await bridge.delegateTask(task: text, imageData: imageData)
+        switch result {
+        case .success(let content):
+            // chat.send may ack with a runId while chunks stream via onStreamChunk.
+            if content.hasPrefix("Task dispatched") || content == "OK" {
+                return ""
+            }
+            return content
+        case .failure(let err):
+            throw LLMError.gatewayError(err)
+        }
+    }
+
     private func sendLocal(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data? = nil) async throws -> String {
+        if Config.isOpenClawExclusive || shouldRouteVoiceToOpenClaw() {
+            throw LLMError.gatewayError(
+                "Modo OpenClaw: o iPhone não responde com modelo local. Conecte \(Config.agentName) no VPS."
+            )
+        }
+
         guard let localService = localLLMService else {
             throw LLMError.missingAPIKey("Local LLM service not initialized")
         }
 
-        // Load the configured model (no auto-swap — user picks one model)
+        // Require an explicit load (home-screen "Carregar") — don't auto-load on first query.
         if !localService.isModelLoaded || localService.loadedModelId != config.model {
-            try await localService.loadModel(config.model)
+            if shouldRouteLocalToOpenClaw(modelConfig: config) {
+                return try await sendViaOpenClawGateway(text, imageData: imageData)
+            }
+            if localService.isLoadingModel {
+                throw LLMError.invalidResponse("O modelo local ainda está carregando. Aguarde ou use a Maia no VPS.")
+            }
+            throw LLMError.invalidResponse(
+                "Modelo local não está na memória. Toque em \"Carregar\" na tela principal, ou configure o VPS OpenClaw."
+            )
         }
 
         // Build tool instructions — use minimal set for local models
@@ -1937,6 +2163,19 @@ class LLMService: ObservableObject {
     /// Used for fast-tier queries when agentic mode is enabled.
     /// Builds its own lightweight prompt and routes through sendLocal().
     func sendViaLocalAgent(_ text: String, locationContext: String? = nil, memoryContext: String? = nil) async throws -> String {
+        if Config.isOpenClawExclusive || shouldPreferOpenClawGateway() {
+            print("🌐 Agent path → OpenClaw only (\(Config.agentName))")
+            lastResponseViaGateway = true
+            do {
+                return try await sendViaOpenClawGateway(text)
+            } catch {
+                lastResponseViaGateway = false
+                throw LLMError.gatewayError(
+                    "\(Config.agentName) não respondeu — OpenClaw offline. O iPhone não usa agente local."
+                )
+            }
+        }
+
         let agentModelId = Config.agentModelId
 
         let hasNativeTools = nativeToolRouter != nil
@@ -2035,6 +2274,7 @@ extension LLMService {
 enum LLMError: LocalizedError {
     case missingAPIKey(String)
     case invalidResponse(String)
+    case gatewayError(String)
     case invalidConfiguration(String)
     case apiError(provider: String, statusCode: Int, message: String?)
 
@@ -2042,6 +2282,7 @@ enum LLMError: LocalizedError {
         switch self {
         case .missingAPIKey(let msg): return msg
         case .invalidResponse(let provider): return "Invalid response from \(provider)"
+        case .gatewayError(let msg): return msg
         case .invalidConfiguration(let msg): return msg
         case .apiError(let provider, let code, let msg):
             if let msg { return "\(provider) error \(code): \(msg)" }

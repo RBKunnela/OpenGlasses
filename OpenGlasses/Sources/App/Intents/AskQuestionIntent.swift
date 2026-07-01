@@ -25,9 +25,9 @@ import AppIntents
 /// rather than failing the instant it's nil. The answer is returned as a spoken
 /// `dialog`, so Siri — not the in-app TTS — reads it aloud (`speakResponse: false`).
 struct AskQuestionIntent: AppIntent {
-    static var title: LocalizedStringResource = "Ask OpenGlasses a Question"
+    static var title: LocalizedStringResource = "Ask iMetaClaw a Question"
     static var description = IntentDescription(
-        "Ask OpenGlasses anything by voice and hear the answer, without the wake word"
+        "Ask iMetaClaw anything by voice and hear the answer, without the wake word"
     )
 
     // By default, run in the background so Siri can speak the answer without forcing
@@ -39,7 +39,7 @@ struct AskQuestionIntent: AppIntent {
 
     @Parameter(
         title: "Question",
-        description: "What you want to ask OpenGlasses",
+        description: "What you want to ask iMetaClaw",
         requestValueDialog: "What would you like to ask?"
     )
     var question: String
@@ -85,7 +85,7 @@ struct AskQuestionIntent: AppIntent {
         var localizedStringResource: LocalizedStringResource {
             switch self {
             case .busy:
-                return "OpenGlasses is still working on something. Try again in a moment."
+                return "\(AppBranding.name) is still working on something. Try again in a moment."
             case .emptyQuestion:
                 return "I didn't catch a question."
             case .noResponse:

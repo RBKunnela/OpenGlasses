@@ -72,7 +72,7 @@ struct QuickVisionIntent: AppIntent {
         case appNotRunning
 
         var localizedStringResource: LocalizedStringResource {
-            "OpenGlasses is not running. Open the app first."
+            AppBranding.appNotRunningLocalized
         }
     }
 }
@@ -96,7 +96,7 @@ struct ReadTextIntent: AppIntent {
 
     enum IntentError: Error, CustomLocalizedStringResourceConvertible {
         case appNotRunning
-        var localizedStringResource: LocalizedStringResource { "OpenGlasses is not running." }
+        var localizedStringResource: LocalizedStringResource { AppBranding.appNotRunningShortLocalized }
     }
 }
 
@@ -119,7 +119,7 @@ struct AnalyzeFoodIntent: AppIntent {
 
     enum IntentError: Error, CustomLocalizedStringResourceConvertible {
         case appNotRunning
-        var localizedStringResource: LocalizedStringResource { "OpenGlasses is not running." }
+        var localizedStringResource: LocalizedStringResource { AppBranding.appNotRunningShortLocalized }
     }
 }
 
@@ -142,6 +142,6 @@ struct DescribeEnvironmentIntent: AppIntent {
 
     enum IntentError: Error, CustomLocalizedStringResourceConvertible {
         case appNotRunning
-        var localizedStringResource: LocalizedStringResource { "OpenGlasses is not running." }
+        var localizedStringResource: LocalizedStringResource { AppBranding.appNotRunningShortLocalized }
     }
 }

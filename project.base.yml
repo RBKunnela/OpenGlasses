@@ -98,12 +98,7 @@ targets:
       - path: GlassesActivityWidget/SharedAppState.swift
     entitlements:
       path: OpenGlasses/OpenGlasses.entitlements
-      properties:
-        com.apple.developer.homekit: true
-        com.apple.developer.carplay-voice-based-conversation: true
-        com.apple.developer.kernel.increased-memory-limit: true
-        com.apple.security.application-groups:
-          - group.com.openglasses.app
+      properties: {}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openglasses.app
@@ -161,9 +156,7 @@ targets:
       - path: OpenGlasses/Sources/Models/GlassesActivityAttributes.swift
     entitlements:
       path: GlassesActivityWidget/GlassesActivityWidget.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.openglasses.app
+      properties: {}
     info:
       path: GlassesActivityWidget/Info.plist
       properties:
@@ -193,9 +186,7 @@ targets:
       - path: OpenGlasses/Sources/Shared/SharedTeleprompterInbox.swift
     entitlements:
       path: OpenGlassesShareExtension/OpenGlassesShareExtension.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.openglasses.app
+      properties: {}
     info:
       path: OpenGlassesShareExtension/Info.plist
       properties:

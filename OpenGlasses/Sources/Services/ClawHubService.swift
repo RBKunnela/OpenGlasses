@@ -470,6 +470,7 @@ struct SkillCompatibilityChecker {
             "google": Config.savedModels.contains { $0.provider == "gemini" && !$0.apiKey.isEmpty },
             "gemini": Config.savedModels.contains { $0.provider == "gemini" && !$0.apiKey.isEmpty },
             "groq": Config.savedModels.contains { $0.provider == "groq" && !$0.apiKey.isEmpty },
+            "nvidia": Config.savedModels.contains { $0.provider == "nvidia" && !$0.apiKey.isEmpty },
             "perplexity": !Config.perplexityAPIKey.isEmpty,
             "eleven": !Config.elevenLabsAPIKey.isEmpty,
         ]

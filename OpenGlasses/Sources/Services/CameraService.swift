@@ -8,6 +8,17 @@ import UIKit
 
 /// Service for capturing photos and streaming video from Ray-Ban Meta smart glasses.
 ///
+/// IMPORTANT (official Meta Wearables Device Access Toolkit limits, mid-2026):
+/// - Glasses are a locked Bluetooth peripheral. Third-party apps get a deliberately
+///   limited, phone-mediated surface only.
+/// - You MUST have the official Meta AI (Meta View) companion app installed for
+///   pairing and Developer Mode. Your app cannot replace or bypass it for core connectivity.
+/// - Camera: real-time POV streaming + capture (frames must be forwarded immediately
+///   to the phone; no heavy on-glasses buffering/storage).
+/// - This app follows the recommended architecture: use official SDK here on the phone
+///   as a bridge, stream frames/mic to remote agent (Maia), and let the agent orchestrate
+///   via OpenClaw node.invoke.
+///
 /// Uses a persistent `DeviceSession` + `Stream` pair for both photo capture and
 /// video streaming, following Meta's official sample app pattern (DAT SDK 0.7+).
 @MainActor

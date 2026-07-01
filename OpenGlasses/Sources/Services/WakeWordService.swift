@@ -82,7 +82,15 @@ class WakeWordService: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        refreshSpeechRecognizer()
+    }
+
+    private func refreshSpeechRecognizer() {
+        let locale = SpeechRecognitionLocale.locale
+        if speechRecognizer?.locale.identifier != locale.identifier {
+            speechRecognizer = SFSpeechRecognizer(locale: locale)
+            print("🎤 Wake-word speech locale: \(locale.identifier)")
+        }
     }
 
     /// Force reconfigure audio session (e.g. when mic source changes)
@@ -353,9 +361,12 @@ class WakeWordService: NSObject, ObservableObject {
             throw WakeWordError.microphonePermissionDenied
         }
 
+        refreshSpeechRecognizer()
+
         guard let recognizer = speechRecognizer, recognizer.isAvailable else {
-            errorMessage = "Speech recognition not available"
-            throw WakeWordError.configurationError("Speech recognizer not available")
+            let localeId = SpeechRecognitionLocale.preferredIdentifier
+            errorMessage = "Reconhecimento de fala indisponível (\(localeId)). Baixe o idioma em Ajustes → Geral → Teclado → Ditado."
+            throw WakeWordError.configurationError("Speech recognizer not available for \(localeId)")
         }
 
         // Ensure audio session is configured
@@ -683,6 +694,13 @@ class WakeWordService: NSObject, ObservableObject {
             }
         }
         if lower.contains(wakePhrase) { return wakePhrase }
+
+        // Pass 1b: "oi maia" spoken as one word
+        let collapsed = lower.replacingOccurrences(of: " ", with: "")
+        let targetCollapsed = wakePhrase.replacingOccurrences(of: " ", with: "")
+        if !targetCollapsed.isEmpty, collapsed.contains(targetCollapsed) {
+            return wakePhrase
+        }
 
         // Pass 2: Fuzzy match — check sliding window of word pairs/triples against wake phrases
         let allPhrases: [(phrase: String, primary: String)] = Config.enabledPersonas.flatMap { persona in

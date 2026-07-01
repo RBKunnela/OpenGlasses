@@ -14,6 +14,10 @@ struct ToggleGeminiLiveIntent: AppIntent {
             throw IntentError.appNotRunning
         }
 
+        if Config.blocksRealtimeModes {
+            throw IntentError.terminalModeOnly
+        }
+
         if appState.currentMode != .geminiLive {
             appState.switchMode(to: .geminiLive)
             try await Task.sleep(nanoseconds: 600_000_000)
@@ -30,9 +34,14 @@ struct ToggleGeminiLiveIntent: AppIntent {
 
     enum IntentError: Error, CustomLocalizedStringResourceConvertible {
         case appNotRunning
+        case terminalModeOnly
 
         var localizedStringResource: LocalizedStringResource {
-            "OpenGlasses is not running. Open the app first."
+            switch self {
+            case .appNotRunning: return AppBranding.appNotRunningLocalized
+            case .terminalModeOnly:
+                return LocalizedStringResource("Gemini Live is disabled — \(Config.agentName) answers only via OpenClaw on your VPS.")
+            }
         }
     }
 }

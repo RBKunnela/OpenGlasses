@@ -90,4 +90,10 @@ final class ModelFetcherTests: XCTestCase {
         XCTAssertTrue(inferredVision(.openrouter, "meta-llama/llava-13b"))
         XCTAssertFalse(inferredVision(.openrouter, "mistralai/mistral-7b"))
     }
+
+    func testInferredVisionNVIDIAHeuristic() {
+        XCTAssertTrue(inferredVision(.nvidia, "nvidia/nvila-15b"))
+        XCTAssertTrue(inferredVision(.nvidia, "meta/llama-3.2-11b-vision-instruct"))
+        XCTAssertFalse(inferredVision(.nvidia, "meta/llama-3.1-70b-instruct"))
+    }
 }

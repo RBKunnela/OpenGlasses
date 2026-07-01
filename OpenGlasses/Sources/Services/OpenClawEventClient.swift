@@ -51,7 +51,9 @@ class OpenClawEventClient {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         session = URLSession(configuration: config)
-        webSocketTask = session?.webSocketTask(with: url)
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(gateway.token)", forHTTPHeaderField: "Authorization")
+        webSocketTask = session?.webSocketTask(with: request)
         webSocketTask?.resume()
 
         NSLog("[OpenClawWS] Connecting to %@ (gateway: %@)", url.absoluteString, gateway.name)
@@ -82,35 +84,20 @@ class OpenClawEventClient {
         return nil
     }
 
-    /// Build a WebSocket URL from a gateway config.
+    /// Build a WebSocket URL from a gateway config (auto mode prefers LAN, like OpenClawBridge).
     private static func webSocketURL(for gateway: GatewayConfig) -> String {
         let mode = gateway.connectionModeEnum
         switch mode {
         case .tunnel:
-            return tunnelWebSocketURL(for: gateway)
+            return GatewayEndpoint.webSocketURLString(from: gateway.tunnelURL, token: gateway.token)
         case .lan:
-            return lanWebSocketURL(for: gateway)
+            return GatewayEndpoint.webSocketURLString(from: gateway.lanURL, token: gateway.token)
         case .auto:
-            if !gateway.tunnelHost.isEmpty {
-                return tunnelWebSocketURL(for: gateway)
+            if !gateway.lanURL.isEmpty {
+                return GatewayEndpoint.webSocketURLString(from: gateway.lanURL, token: gateway.token)
             }
-            return lanWebSocketURL(for: gateway)
+            return GatewayEndpoint.webSocketURLString(from: gateway.tunnelURL, token: gateway.token)
         }
-    }
-
-    private static func tunnelWebSocketURL(for gateway: GatewayConfig) -> String {
-        let base = gateway.tunnelHost
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            .replacingOccurrences(of: "https://", with: "wss://")
-            .replacingOccurrences(of: "http://", with: "ws://")
-        return "\(base)/ws?token=\(gateway.token)"
-    }
-
-    private static func lanWebSocketURL(for gateway: GatewayConfig) -> String {
-        let host = gateway.lanHost
-            .replacingOccurrences(of: "http://", with: "")
-            .replacingOccurrences(of: "https://", with: "")
-        return "ws://\(host):\(gateway.port)/ws?token=\(gateway.token)"
     }
 
     private func startReceiving() {
@@ -176,23 +163,27 @@ class OpenClawEventClient {
     }
 
     private func sendConnectHandshake() {
+        guard let gateway = Self.activeGateway() else { return }
+        let token = gateway.token
         let connectMsg: [String: Any] = [
             "type": "req",
             "id": UUID().uuidString,
             "method": "connect",
             "params": [
                 "minProtocol": 3,
-                "maxProtocol": 3,
+                "maxProtocol": 4,
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write"],
                 "client": [
-                    "id": "gateway-client",
+                    "id": "openclaw-ios-events",
                     "displayName": "OpenGlasses",
                     "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
                     "platform": "ios",
-                    "mode": "node"
+                    "mode": "operator"
                 ] as [String: Any],
-                "auth": [
-                    "token": Config.openClawGatewayToken
-                ]
+                "auth": ["token": token],
+                "locale": Locale.current.identifier,
+                "userAgent": "OpenGlasses/ios-events"
             ] as [String: Any]
         ]
 

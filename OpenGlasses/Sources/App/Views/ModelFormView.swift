@@ -1,4 +1,5 @@
 import SwiftUI
+import AuthenticationServices
 
 /// Shared form content for adding and editing AI model configurations.
 /// Used by both `AddModelView` and `ModelEditorView` to eliminate duplication.
@@ -23,6 +24,10 @@ struct ModelFormView: View {
     @State private var isTestingConnection = false
     @State private var connectionStatus: String?
     @State private var connectionOK = false
+
+    // OAuth login state
+    @State private var isOAuthSessionActive = false
+    @State private var oauthError: String?
 
     var body: some View {
         Section {
@@ -94,17 +99,53 @@ struct ModelFormView: View {
                 }
             }
         } else {
-            // MARK: Cloud API key section
+            // MARK: Cloud API key / subscription token section
             Section {
-                SecureField(selectedProvider == .custom ? "API Key (optional for local servers)" : "API Key", text: $apiKey)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .onChange(of: apiKey) { _, _ in resetModelList() }
+                // OAuth sign-in button (e.g. Claude subscription via claude.ai)
+                if selectedProvider.isOAuthProvider {
+                    Button {
+                        startOAuthSession()
+                    } label: {
+                        HStack {
+                            if isOAuthSessionActive {
+                                ProgressView().scaleEffect(0.8)
+                                Text("Opening browser…")
+                            } else if !apiKey.isEmpty {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                                Text("Signed in · tap to re-authenticate")
+                            } else {
+                                Image(systemName: "person.badge.key")
+                                Text(selectedProvider.oauthButtonLabel)
+                            }
+                        }
+                    }
+                    .disabled(isOAuthSessionActive)
+
+                    if let oauthError {
+                        Label(oauthError, systemImage: "xmark.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                // Manual token / API key field (always shown so user can paste if OAuth fails)
+                PasteableFormSecretField(
+                    title: selectedProvider == .custom
+                        ? "API Key (optional for local servers)"
+                        : selectedProvider.isOAuthProvider ? "Token (auto-filled after sign-in)"
+                        : selectedProvider.isSubscriptionBased ? "Subscription Token" : "API Key",
+                    text: $apiKey,
+                    onTextChange: { resetModelList() }
+                )
 
                 if let url = selectedProvider.consoleURL {
                     Link(destination: url) {
                         HStack {
-                            Label("Get API Key", systemImage: "arrow.up.right.square")
+                            Label(
+                                selectedProvider.isSubscriptionBased ? "Manage Subscription" : "Get API Key",
+                                systemImage: selectedProvider.isSubscriptionBased ? "creditcard" : "arrow.up.right.square"
+                            )
                             Spacer()
                             Text(url.host ?? "")
                                 .font(.caption)
@@ -185,7 +226,7 @@ struct ModelFormView: View {
                     }
                 }
             } header: {
-                Text("API Key")
+                Text(selectedProvider.isSubscriptionBased ? "Subscription Token" : "API Key")
             } footer: {
                 Text(providerHelpText)
             }
@@ -265,15 +306,83 @@ struct ModelFormView: View {
         }
     }
 
+    // MARK: - OAuth
+
+    /// Opens ASWebAuthenticationSession for providers that use browser-based OAuth login.
+    /// The session redirects back to clawglasses://oauth/callback?token=...
+    /// and the token is extracted and stored in apiKey.
+    private func startOAuthSession() {
+        guard let authURL = selectedProvider.oauthAuthURL else { return }
+        isOAuthSessionActive = true
+        oauthError = nil
+
+        let callbackScheme = "clawglasses"
+
+        let session = ASWebAuthenticationSession(
+            url: authURL,
+            callbackURLScheme: callbackScheme
+        ) { callbackURL, error in
+            isOAuthSessionActive = false
+
+            if let error {
+                // User cancelled is not a real error
+                if (error as NSError).code != ASWebAuthenticationSessionError.canceledLogin.rawValue {
+                    oauthError = error.localizedDescription
+                }
+                return
+            }
+
+            guard let callbackURL else {
+                oauthError = "No callback URL received."
+                return
+            }
+
+            // Extract token from callback URL query params:
+            // clawglasses://oauth/callback?token=sk-ant-...
+            // or from the URL fragment: #token=sk-ant-...
+            let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)
+            if let token = components?.queryItems?.first(where: { $0.name == "token" })?.value,
+               !token.isEmpty {
+                apiKey = token
+                resetModelList()
+            } else if let fragment = components?.fragment,
+                      let tokenRange = fragment.range(of: "token=") {
+                let token = String(fragment[tokenRange.upperBound...])
+                    .components(separatedBy: "&").first ?? ""
+                if !token.isEmpty {
+                    apiKey = token
+                    resetModelList()
+                }
+            } else {
+                // Fallback: if the callback URL itself contains the session token
+                // (some providers put it in the path), surface the full URL for manual copy.
+                oauthError = "Sign-in completed but no token was found in the callback URL. Please copy your API key manually from console.anthropic.com."
+            }
+        }
+
+        // ASWebAuthenticationSession requires a presentation anchor on iOS 13+
+        // We use the key window's scene as the anchor.
+        if let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) {
+            session.presentationContextProvider = WindowSceneAnchor(scene: windowScene)
+        }
+
+        session.prefersEphemeralWebBrowserSession = false  // keep cookies so user stays logged in
+        session.start()
+    }
+
     private var providerHelpText: String {
         switch selectedProvider {
-        case .anthropic: return "Get your API key at console.anthropic.com"
+        case .anthropic: return "Tap \"Sign in with Claude\" to log in with your claude.ai subscription. Your session token is stored automatically. Alternatively, paste an API key from console.anthropic.com."
         case .openai: return "Get your API key at platform.openai.com"
         case .gemini: return "Get your API key at aistudio.google.com"
         case .groq: return "Get your API key at console.groq.com"
-        case .zai: return "Z.ai subscription — OpenAI-compatible API"
-        case .qwen: return "Coding Plan subscription — coding-intl.dashscope.aliyuncs.com"
-        case .minimax: return "MiniMax subscription — platform.minimaxi.com"
+        case .nvidia: return "NVIDIA NIM — paste your API key from build.nvidia.com/settings/api-keys. Uses Llama, Nemotron, and other NIM models via the OpenAI-compatible endpoint."
+        case .xai: return "xAI Grok subscription — paste your API key from console.x.ai. Works with Grok 3, Grok 3 Mini, and Grok 2 Vision."
+        case .zai: return "Z.ai GLM subscription — paste your token from z.ai. Uses GLM-4.5 and other GLM models via the coding endpoint."
+        case .qwen: return "Qwen subscription — paste your token from the Alibaba Cloud DashScope console. Uses the international coding endpoint."
+        case .minimax: return "MiniMax subscription — paste your token from platform.minimaxi.com. Uses MiniMax-M2.7 and other MiniMax models."
         case .openrouter: return "500+ models with one API key — openrouter.ai/keys"
         case .custom: return "Any OpenAI-compatible endpoint — a cloud API or a self-hosted Ollama / llama.cpp / LM Studio / vLLM / LocalAI server. For a local server, set the Base URL to e.g. http://your-mac.local:11434/v1 and leave the API Key blank. Use the host's .local name or a Tailscale address — a raw 192.168.x.x IP over http may be blocked by App Transport Security."
         case .local: return "On-device inference — no internet needed"
@@ -294,5 +403,17 @@ struct ModelFormView: View {
         return String(name)
             .replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "_", with: " ")
+    }
+}
+
+// MARK: - ASWebAuthenticationSession presentation anchor
+
+/// Provides the UIWindowScene as the presentation anchor for ASWebAuthenticationSession.
+private final class WindowSceneAnchor: NSObject, ASWebAuthenticationPresentationContextProviding {
+    let scene: UIWindowScene
+    init(scene: UIWindowScene) { self.scene = scene }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        scene.windows.first(where: \.isKeyWindow) ?? scene.windows.first ?? ASPresentationAnchor()
     }
 }

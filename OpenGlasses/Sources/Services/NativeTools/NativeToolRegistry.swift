@@ -55,7 +55,9 @@ final class NativeToolRegistry {
         register(AppleRemindersTool())
         register(AlarmTool())
         register(BrightnessTool())
-        register(HomeKitTool())
+        if !Config.simpleMode {
+            register(HomeKitTool())
+        }
         register(SiriShortcutsTool())
         register(QuickActionTool())
         if let store = conversationStore {

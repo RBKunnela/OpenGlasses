@@ -39,12 +39,20 @@ class TranscriptionService: ObservableObject {
     private var captureSampleRate: Double = 16000
 
     init() {
-        speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        refreshSpeechRecognizer()
+    }
+
+    private func refreshSpeechRecognizer() {
+        let locale = SpeechRecognitionLocale.locale
+        if speechRecognizer?.locale.identifier != locale.identifier {
+            speechRecognizer = SFSpeechRecognizer(locale: locale)
+        }
     }
 
     func startRecording() {
         guard !isRecording else { return }
 
+        refreshSpeechRecognizer()
         didReceiveSpeech = false
         currentTranscription = ""
 

@@ -178,14 +178,17 @@ struct GatewayConfig: Codable, Identifiable, Equatable {
 
     /// Build the LAN URL from host + port.
     var lanURL: String {
-        let host = lanHost.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let host = lanHost.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty else { return "" }
-        return "\(host):\(port)"
+        if host.contains("://") {
+            return GatewayEndpoint.sanitize(host)
+        }
+        return GatewayEndpoint.sanitize("\(host):\(port)")
     }
 
     /// The tunnel URL (already includes port usually).
     var tunnelURL: String {
-        tunnelHost.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        GatewayEndpoint.sanitize(tunnelHost)
     }
 
     var isConfigured: Bool {
@@ -230,6 +233,18 @@ struct ModelConfig: Codable, Identifiable, Equatable {
         supportsVision ?? Self.inferredSupportsVision(provider: llmProvider, model: model, baseURL: baseURL)
     }
 
+    /// Cloud or custom OpenAI-compatible endpoint ready to call (not on-device local / Apple FM).
+    var isUsableCloudAPI: Bool {
+        switch llmProvider {
+        case .local, .appleOnDevice:
+            return false
+        case .custom:
+            return !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        default:
+            return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
     static func inferredSupportsVision(provider: LLMProvider, model: String, baseURL: String) -> Bool {
         switch provider {
         case .anthropic, .gemini, .openai:
@@ -244,7 +259,10 @@ struct ModelConfig: Codable, Identifiable, Equatable {
             // OpenRouter supports vision for many models
             let lowerModel = model.lowercased()
             return lowerModel.contains("claude") || lowerModel.contains("gpt-4") || lowerModel.contains("gemini") || lowerModel.contains("vision") || lowerModel.contains("llava")
-        case .zai, .minimax, .custom:
+        case .nvidia:
+            let lowerModel = model.lowercased()
+            return lowerModel.contains("vision") || lowerModel.contains("vl") || lowerModel.contains("nvila")
+        case .zai, .minimax, .custom, .xai:
             let lowerModel = model.lowercased()
             let lowerBaseURL = baseURL.lowercased()
 
@@ -459,23 +477,206 @@ struct Config {
         UserDefaults.standard.set(completed, forKey: "hasCompletedOnboarding")
     }
 
-    /// True when the user hasn't completed onboarding and has no configured API keys.
+    /// True when the setup wizard should be shown (independent of saved API keys —
+    /// upgrades from OpenGlasses keep keys but still need the iMetaClaw onboarding).
     static var needsOnboarding: Bool {
-        !hasCompletedOnboarding && savedModels.allSatisfy { $0.apiKey.isEmpty }
+        !hasCompletedOnboarding
     }
 
-    // MARK: - Wake Word
+    /// Clears onboarding flags so the first-run wizard and agent intro questions run again.
+    /// Keeps API keys and gateway settings — only resets the setup / intro flow.
+    static func resetOnboardingForFreshStart() {
+        setHasCompletedOnboarding(false)
+        setAgentOnboardingComplete(false)
+        setAgentModeEnabled(true)
+        UserDefaults.standard.removeObject(forKey: "agentName")
+        syncWakePhraseFromAgentName()
+        NSLog("[Config] Onboarding reset — fresh setup will show on next launch")
+    }
 
-    /// The primary wake word phrase (user-configurable)
+    // MARK: - Phone AI strategy (iMetaClaw)
+
+    static var phoneAIStrategy: PhoneAIStrategy {
+        if simpleMode { return .vpsOnly }
+        guard let raw = UserDefaults.standard.string(forKey: "phoneAIStrategy"),
+              let strategy = PhoneAIStrategy(rawValue: raw) else {
+            return .vpsOnly
+        }
+        return strategy
+    }
+
+    /// True when the phone must not answer with local MLX or cloud APIs — OpenClaw only.
+    static var isOpenClawExclusive: Bool {
+        phoneAIStrategy.isOpenClawExclusive
+    }
+
+    static func setPhoneAIStrategy(_ strategy: PhoneAIStrategy) {
+        let resolved = simpleMode ? PhoneAIStrategy.vpsOnly : strategy
+        UserDefaults.standard.set(resolved.rawValue, forKey: "phoneAIStrategy")
+    }
+
+    /// Simple mode is a VPS terminal — lock routing to OpenClaw direct voice only.
+    static var blocksRealtimeModes: Bool {
+        simpleMode || isOpenClawExclusive
+    }
+
+    /// Re-apply terminal defaults (call on launch after migrations).
+    static func enforceTerminalMode() {
+        guard simpleMode else { return }
+        migrateHermesGatewayToMaiaIfNeeded()
+        setPhoneAIStrategy(.vpsOnly)
+        setAppMode(.direct)
+    }
+
+    /// iMetaClaw talks to Maia on KVM2 only — never Hermes/KVM4 (aicontexteng.com).
+    static func migrateHermesGatewayToMaiaIfNeeded() {
+        var gateways = savedGateways
+        var changed = false
+
+        for index in gateways.indices {
+            let tunnel = gateways[index].tunnelHost
+            let lan = gateways[index].lanHost
+            if GatewayEndpoint.isHermesHost(tunnel) || GatewayEndpoint.isHermesHost(lan) {
+                gateways[index].tunnelHost = GatewayEndpoint.defaultMaiaGatewayURL
+                gateways[index].lanHost = ""
+                gateways[index].connectionMode = OpenClawConnectionMode.tunnel.rawValue
+                if gateways[index].name.lowercased().contains("hermes")
+                    || gateways[index].name == "OpenClaw" {
+                    gateways[index].name = "\(agentName) VPS"
+                }
+                changed = true
+            }
+        }
+
+        if GatewayEndpoint.isHermesHost(openClawTunnelHost) {
+            setOpenClawTunnelHost(GatewayEndpoint.defaultMaiaGatewayURL)
+            changed = true
+        }
+
+        if changed {
+            setSavedGateways(gateways)
+            NSLog("[Config] Migrated Hermes/KVM4 gateway URL → Maia KVM2")
+        }
+    }
+
+    /// When true, long transcription / recording analysis prefers the OpenClaw VPS agent.
+    static var heavyWorkOnVPS: Bool {
+        if UserDefaults.standard.object(forKey: "heavyWorkOnVPS") == nil {
+            return isAnyGatewayConfigured
+        }
+        return UserDefaults.standard.bool(forKey: "heavyWorkOnVPS")
+    }
+
+    static func setHeavyWorkOnVPS(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: "heavyWorkOnVPS")
+    }
+
+    // MARK: - Simple mode (iMetaClaw)
+
+    /// When true, hides upstream OpenGlasses complexity (Field Assist, persona catalog, MCP, etc.).
+    /// Defaults to on — iMetaClaw is a thin client for one OpenClaw agent.
+    static var simpleMode: Bool {
+        if UserDefaults.standard.object(forKey: "simpleMode") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "simpleMode")
+    }
+
+    static func setSimpleMode(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: "simpleMode")
+    }
+
+    /// Keep a single primary persona aligned with the OpenClaw agent name and wake phrase.
+    static func ensurePrimaryAgentPersona() {
+        guard simpleMode else { return }
+        let name = agentName
+        let phrase = wakePhrase
+        let alts = alternativeWakePhrases
+        var personas = savedPersonas
+
+        if personas.count == 1 {
+            personas[0].name = name
+            personas[0].wakePhrase = phrase
+            personas[0].alternativeWakePhrases = alts
+            personas[0].icon = "person.crop.circle.badge.checkmark"
+            personas[0].enabled = true
+            setSavedPersonas(personas)
+            return
+        }
+
+        let primary = Persona(
+            id: personas.first(where: { $0.name == name })?.id ?? personas.first?.id ?? UUID().uuidString,
+            name: name,
+            wakePhrase: phrase,
+            alternativeWakePhrases: alts,
+            modelId: activeModelId,
+            presetId: activePresetId,
+            enabled: true,
+            icon: "person.crop.circle.badge.checkmark"
+        )
+        setSavedPersonas([primary])
+    }
+
+    // MARK: - Agent & Wake Word (iMetaClaw)
+
+    /// User's OpenClaw agent / bot name (e.g. "Maia"). Drives the "Oi {name}" wake phrase.
+    static var agentName: String {
+        if let name = UserDefaults.standard.string(forKey: "agentName"),
+           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return name.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return AppBranding.defaultAgentName
+    }
+
+    static func setAgentName(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        UserDefaults.standard.set(trimmed, forKey: "agentName")
+        setWakePhrase(AppBranding.wakePhrase(for: trimmed))
+        setAlternativeWakePhrases(defaultAlternativesForPhrase(wakePhrase))
+    }
+
+    /// The primary wake phrase — defaults to "oi {agentName}" (e.g. "oi maia").
     static var wakePhrase: String {
         if let phrase = UserDefaults.standard.string(forKey: "wakePhrase"), !phrase.isEmpty {
             return phrase.lowercased()
         }
-        return "hey openglasses"
+        return AppBranding.wakePhrase(for: agentName)
     }
 
     static func setWakePhrase(_ phrase: String) {
         UserDefaults.standard.set(phrase.lowercased(), forKey: "wakePhrase")
+    }
+
+    /// Re-sync wake phrase from the current agent name (call after first launch migration).
+    static func syncWakePhraseFromAgentName() {
+        setWakePhrase(AppBranding.wakePhrase(for: agentName))
+        setAlternativeWakePhrases(defaultAlternativesForPhrase(wakePhrase))
+    }
+
+    private static let iMetaClawWakeMigrationKey = "iMetaClawWakeMigrated_v1"
+    private static let iMetaClawFreshStartKey = "iMetaClawFreshStart_v2"
+
+    /// One-time reset for users upgrading from OpenGlasses/ClawGlasses on the same bundle ID.
+    /// Shows the iMetaClaw onboarding wizard and re-runs agent intro questions.
+    static func migrateToIMetaClawFreshStartIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: iMetaClawFreshStartKey) else { return }
+        UserDefaults.standard.set(true, forKey: iMetaClawFreshStartKey)
+        resetOnboardingForFreshStart()
+        NSLog("[Config] iMetaClaw fresh-start migration applied")
+    }
+
+    /// One-time migration from legacy "hey openglasses" to "oi {agentName}".
+    static func migrateToIMetaClawWakePhraseIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: iMetaClawWakeMigrationKey) else { return }
+        let legacyPhrases: Set<String> = ["hey openglasses", "hey open glasses", ""]
+        if let stored = UserDefaults.standard.string(forKey: "wakePhrase"),
+           !legacyPhrases.contains(stored.lowercased()) {
+            UserDefaults.standard.set(true, forKey: iMetaClawWakeMigrationKey)
+            return
+        }
+        syncWakePhraseFromAgentName()
+        UserDefaults.standard.set(true, forKey: iMetaClawWakeMigrationKey)
     }
 
     /// Alternative spellings / misrecognitions of the wake phrase
@@ -506,6 +707,17 @@ struct Config {
         case "hey openglasses":
             return ["hey open glasses", "hey open glass", "hey openclass", "hey open class", "hey openglass"]
         default:
+            if phrase.hasPrefix("oi ") {
+                let name = String(phrase.dropFirst(3))
+                return [
+                    "oi \(name)",
+                    "oy \(name)",
+                    "oí \(name)",
+                    "oi, \(name)",
+                    "hoy \(name)",
+                    "oi \(name) ",
+                ]
+            }
             return []
         }
     }
@@ -714,6 +926,35 @@ struct Config {
         return models
     }
 
+    /// Bump light local models (0.5B / 2B / 3B) to the heaviest MLX model this iPhone supports.
+    static func upgradeLocalModelsToPreferredIfNeeded() {
+        guard let data = KeychainService.data(for: modelsKey),
+              var models = try? JSONDecoder().decode([ModelConfig].self, from: data),
+              !models.isEmpty else { return }
+
+        let preferredId = LocalLLMService.preferredDefaultModelId
+        let preferredName = LocalLLMService.displayName(forModelId: preferredId)
+        let legacyLightIds: Set<String> = [
+            "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+            "mlx-community/gemma-2-2b-it-4bit",
+            "mlx-community/Qwen2.5-3B-Instruct-4bit",
+        ]
+
+        var changed = false
+        for index in models.indices where models[index].llmProvider == .local {
+            let currentId = models[index].model
+            guard legacyLightIds.contains(currentId), currentId != preferredId else { continue }
+            models[index].model = preferredId
+            models[index].name = preferredName
+            changed = true
+        }
+
+        guard changed else { return }
+        setSavedModels(models)
+        setLocalTextModelId(preferredId)
+        NSLog("[Config] Local model upgraded to %@ (%@)", preferredName, preferredId)
+    }
+
     /// Pre-configured Apple Intelligence model — zero setup, on-device.
     static let appleIntelligenceDefault = ModelConfig(
         id: "apple-intelligence",
@@ -751,6 +992,15 @@ struct Config {
         let id = activeModelId
         return savedModels.first(where: { $0.id == id }) ?? savedModels.first
     }
+
+    /// Best cloud API model for voice when the VPS gateway is down or the user picked a cloud model.
+    /// Prefers the active model when it is a ready cloud endpoint; otherwise any saved cloud model.
+    static func usableCloudModel() -> ModelConfig? {
+        if let active = activeModel, active.isUsableCloudAPI { return active }
+        return savedModels.first(where: \.isUsableCloudAPI)
+    }
+
+    static var hasUsableCloudModel: Bool { usableCloudModel() != nil }
 
     /// Migrate from old single-provider config to multi-model array
     private static func migrateFromLegacy() -> [ModelConfig] {
@@ -813,7 +1063,7 @@ struct Config {
     // MARK: - Custom System Prompt
 
     static let defaultSystemPrompt = """
-    You are OpenGlasses, a voice assistant running on Ray-Ban Meta smart glasses. Your responses will be spoken aloud via text-to-speech. Your name is OpenGlasses and the user activates you by saying "Hey OpenGlasses".
+    You are \(AppBranding.name), a voice assistant running on Ray-Ban Meta smart glasses, connected to the user's OpenClaw agent on their server. Your responses will be spoken aloud via text-to-speech. The user activates you with their wake phrase (for example "\(AppBranding.wakePhraseDisplay(for: AppBranding.defaultAgentName))").
 
     RESPONSE STYLE:
     - Keep responses CONCISE but COMPLETE — typically 2-4 sentences, longer for complex topics.
@@ -900,7 +1150,7 @@ struct Config {
         return [
             PromptPreset(id: "preset-default", name: "Default", prompt: defaultSystemPrompt, isBuiltIn: true),
             PromptPreset(id: "preset-tokens", name: "Tokens Saver", prompt: """
-            You are OpenGlasses, a voice assistant on Ray-Ban Meta smart glasses. Responses are spoken via TTS.
+            You are \(AppBranding.name), a voice assistant on Ray-Ban Meta smart glasses. Responses are spoken via TTS.
 
             RULES:
             - Reply naturally, directly, and briefly by default. Be complete.
@@ -913,7 +1163,7 @@ struct Config {
             - Use location only when relevant.
             """, isBuiltIn: true),
             PromptPreset(id: "preset-concise", name: "Concise", prompt: """
-            You are OpenGlasses, a voice assistant on Ray-Ban Meta smart glasses. Responses are spoken via TTS.
+            You are \(AppBranding.name), a voice assistant on Ray-Ban Meta smart glasses. Responses are spoken via TTS.
 
             RULES:
             - Maximum 1-2 sentences per response. No exceptions unless the user says "explain more."
@@ -924,7 +1174,7 @@ struct Config {
             - You CAN see images from the glasses camera when provided.
             """, isBuiltIn: true),
             PromptPreset(id: "preset-technical", name: "Technical", prompt: """
-            You are OpenGlasses, a voice assistant on Ray-Ban Meta smart glasses. Responses are spoken via TTS.
+            You are \(AppBranding.name), a voice assistant on Ray-Ban Meta smart glasses. Responses are spoken via TTS.
 
             RESPONSE STYLE:
             - Be precise and technical. Use correct terminology.
@@ -936,7 +1186,7 @@ struct Config {
             - You CAN see images from the glasses camera when provided.
             """, isBuiltIn: true),
             PromptPreset(id: "preset-creative", name: "Creative", prompt: """
-            You are OpenGlasses, a witty and warm voice assistant on Ray-Ban Meta smart glasses. Responses are spoken via TTS.
+            You are \(AppBranding.name), a witty and warm voice assistant on Ray-Ban Meta smart glasses. Responses are spoken via TTS.
 
             PERSONALITY:
             - Be playful, expressive, and engaging — like a clever friend.
@@ -1295,7 +1545,7 @@ struct Config {
     private static func chineseBuiltInPresets() -> [PromptPreset] {
         [
             PromptPreset(id: "preset-default", name: "默认", prompt: """
-            你是 OpenGlasses，一个运行在 Ray-Ban Meta 智能眼镜上的语音助手。所有回复都通过语音合成（TTS）朗读。
+            你是 \(AppBranding.name)，一个运行在 Ray-Ban Meta 智能眼镜上的语音助手。所有回复都通过语音合成（TTS）朗读。
 
             回复规则：
             - 始终用中文回复。
@@ -1308,7 +1558,7 @@ struct Config {
             - 当用户说"看看这个"、"这是什么"、"拍张照"等，会自动拍照发送给你。
             """, isBuiltIn: true),
             PromptPreset(id: "preset-tokens", name: "代币节省者", prompt: """
-            你是 OpenGlasses，Ray-Ban Meta 智能眼镜上的语音助手。回复通过 TTS 朗读。
+            你是 \(AppBranding.name)，Ray-Ban Meta 智能眼镜上的语音助手。回复通过 TTS 朗读。
 
             规则：
             - 用中文自然回复，默认简洁但完整。
@@ -1321,7 +1571,7 @@ struct Config {
             - 仅在相关时使用位置信息。
             """, isBuiltIn: true),
             PromptPreset(id: "preset-concise", name: "简洁", prompt: """
-            你是 OpenGlasses，Ray-Ban Meta 智能眼镜上的语音助手。回复通过 TTS 朗读。
+            你是 \(AppBranding.name)，Ray-Ban Meta 智能眼镜上的语音助手。回复通过 TTS 朗读。
 
             规则：
             - 用中文回复，每次最多1-2句话。
@@ -1330,7 +1580,7 @@ struct Config {
             - 你可以看到眼镜相机的图片。
             """, isBuiltIn: true),
             PromptPreset(id: "preset-technical", name: "技术", prompt: """
-            你是 OpenGlasses，运行在 Ray-Ban Meta 智能眼镜上的技术型语音助手。
+            你是 \(AppBranding.name)，运行在 Ray-Ban Meta 智能眼镜上的技术型语音助手。
 
             风格要求：
             - 用中文回复，精确专业。
@@ -1341,7 +1591,7 @@ struct Config {
             - 你可以看到眼镜相机的图片。
             """, isBuiltIn: true),
             PromptPreset(id: "preset-creative", name: "创意", prompt: """
-            你是 OpenGlasses，Ray-Ban Meta 智能眼镜上有趣又机智的语音助手。
+            你是 \(AppBranding.name)，Ray-Ban Meta 智能眼镜上有趣又机智的语音助手。
 
             风格：
             - 用中文回复，活泼有趣。
@@ -1540,12 +1790,13 @@ struct Config {
         // Migration: create a persona from current config
         let migrated = Persona(
             id: UUID().uuidString,
-            name: "OpenGlasses",
+            name: simpleMode ? agentName : AppBranding.name,
             wakePhrase: wakePhrase,
             alternativeWakePhrases: alternativeWakePhrases,
             modelId: activeModelId,
             presetId: activePresetId,
-            enabled: true
+            enabled: true,
+            icon: simpleMode ? "person.crop.circle.badge.checkmark" : nil
         )
         let personas = [migrated]
         setSavedPersonas(personas)
@@ -1656,6 +1907,12 @@ struct Config {
     static var ttsEnginePreference: TTSEnginePreference {
         guard let raw = UserDefaults.standard.string(forKey: "ttsEnginePreference"),
               let preference = TTSEnginePreference(rawValue: raw) else {
+            // For iMetaClaw / Brazilian users (pt-BR + simpleMode) default to free built-in voice
+            // (no ElevenLabs cost). User can change to Kokoro after downloading the model.
+            let isPT = Locale.preferredLanguages.first?.lowercased().hasPrefix("pt") == true
+            if isPT || simpleMode {
+                return .system
+            }
             return .auto
         }
         return preference
@@ -1683,6 +1940,7 @@ struct Config {
     // MARK: - App Mode
 
     static var appMode: AppMode {
+        if simpleMode { return .direct }
         if let raw = UserDefaults.standard.string(forKey: "appMode"),
            let mode = AppMode(rawValue: raw) {
             return mode
@@ -1691,7 +1949,8 @@ struct Config {
     }
 
     static func setAppMode(_ mode: AppMode) {
-        UserDefaults.standard.set(mode.rawValue, forKey: "appMode")
+        let resolved = simpleMode ? AppMode.direct : mode
+        UserDefaults.standard.set(resolved.rawValue, forKey: "appMode")
     }
 
     // MARK: - LiveAI Mode
@@ -1875,7 +2134,11 @@ struct Config {
 
     /// Enabled gateways only, in priority order.
     static var enabledGateways: [GatewayConfig] {
-        savedGateways.filter { $0.enabled && $0.isConfigured }
+        let configured = savedGateways.filter { $0.enabled && $0.isConfigured }
+        guard simpleMode else { return configured }
+        return configured.filter {
+            !GatewayEndpoint.isHermesHost($0.tunnelURL) && !GatewayEndpoint.isHermesHost($0.lanURL)
+        }
     }
 
     /// Whether any gateway is configured and enabled.
@@ -2252,7 +2515,8 @@ struct Config {
 
     static var useGlassesMicForWakeWord: Bool {
         let key = "useGlassesMicForWakeWord"
-        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        // iMetaClaw: default to iPhone mic — more reliable until glasses BT audio route is active.
+        if UserDefaults.standard.object(forKey: key) == nil { return !simpleMode }
         return UserDefaults.standard.bool(forKey: key)
     }
 
@@ -2826,9 +3090,10 @@ struct Config {
 
     // MARK: - Local Model Roles
 
-    /// Preferred local model for text conversation (e.g. "mlx-community/Qwen2.5-3B-Instruct-4bit").
+    /// Preferred local model for text conversation (heaviest compatible MLX model by default).
     static var localTextModelId: String {
-        UserDefaults.standard.string(forKey: "localTextModelId") ?? ""
+        let stored = UserDefaults.standard.string(forKey: "localTextModelId") ?? ""
+        return stored.isEmpty ? LocalLLMService.preferredDefaultModelId : stored
     }
 
     static func setLocalTextModelId(_ id: String) {

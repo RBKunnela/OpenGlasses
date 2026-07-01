@@ -33,16 +33,14 @@ struct AgentHarnessSettingsView: View {
             } header: {
                 Text("Custom endpoint")
             } footer: {
-                Text("Point OpenGlasses at any agent endpoint you already run. {id} is replaced with the run id, e.g. https://host/runs/{id}.")
+                Text("Aponte o \(AppBranding.name) para um endpoint de agente que você já executa. {id} é substituído pelo id da execução, ex.: https://host/runs/{id}.")
             }
 
             Section("Authentication") {
                 TextField("Header name", text: $config.authHeader)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
-                SecureField("Header value (e.g. Bearer …)", text: $config.authValue)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                PasteableFormSecretField(title: "Header value (e.g. Bearer …)", text: $config.authValue)
             }
 
             Section {

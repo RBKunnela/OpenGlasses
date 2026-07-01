@@ -84,6 +84,18 @@ struct VisionIntentDetector {
         // Explicit camera
         "take a look", "check this out", "see this", "see that",
         "can you see", "do you see",
+
+        // Brazilian Portuguese (pt-BR) equivalents for iMetaClaw / "Oi Maia"
+        "tira uma foto", "tira foto", "tira uma imagem", "captura", "captura foto",
+        "o que é isso", "o que é aquilo", "o que você vê", "o que você está vendo",
+        "descreve o que", "descreva o que", "olha isso", "olha aqui", "olha pra isso",
+        "lê isso", "lê o texto", "lê a placa", "lê o menu", "o que está escrito",
+        "traduz isso", "traduz o texto", "traduz a placa", "traduz o menu",
+        "identifica isso", "o que é esse", "qual é esse", "que objeto é",
+        "que cor é", "de que cor",
+        "escaneia", "scan", "qr", "código de barras",
+        "o que estou olhando", "o que tem na frente", "ao meu redor",
+        "grava", "começa a gravar", "grava áudio", "grava vídeo", // for audio/video record
     ]
 
     /// Deictic references combined with action words that suggest visual context.

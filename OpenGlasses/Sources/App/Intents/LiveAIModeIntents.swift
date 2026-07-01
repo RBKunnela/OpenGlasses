@@ -1,5 +1,19 @@
 import AppIntents
 
+private enum LiveAIIntentGuard {
+    enum Error: Swift.Error, CustomLocalizedStringResourceConvertible {
+        case terminalModeOnly
+
+        var localizedStringResource: LocalizedStringResource {
+            LocalizedStringResource("Live AI modes are disabled — \(Config.agentName) answers only via OpenClaw on your VPS.")
+        }
+    }
+
+    static func rejectIfTerminalMode() throws {
+        if Config.blocksRealtimeModes { throw Error.terminalModeOnly }
+    }
+}
+
 /// LiveAI mode enum for Siri — maps to the built-in LiveAIMode presets.
 enum LiveAIModeParam: String, AppEnum {
     case standard = "standard"
@@ -37,6 +51,7 @@ struct StartLiveAIModeIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
+        try LiveAIIntentGuard.rejectIfTerminalMode()
         guard let appState = AppStateProvider.shared else {
             throw IntentError.appNotRunning
         }
@@ -62,7 +77,7 @@ struct StartLiveAIModeIntent: AppIntent {
 
     enum IntentError: Error, CustomLocalizedStringResourceConvertible {
         case appNotRunning
-        var localizedStringResource: LocalizedStringResource { "OpenGlasses is not running. Open the app first." }
+        var localizedStringResource: LocalizedStringResource { AppBranding.appNotRunningLocalized }
     }
 }
 
@@ -76,6 +91,7 @@ struct StartMuseumModeIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
+        try LiveAIIntentGuard.rejectIfTerminalMode()
         guard let appState = AppStateProvider.shared else {
             throw IntentError.appNotRunning
         }
@@ -94,7 +110,7 @@ struct StartMuseumModeIntent: AppIntent {
 
     enum IntentError: Error, CustomLocalizedStringResourceConvertible {
         case appNotRunning
-        var localizedStringResource: LocalizedStringResource { "OpenGlasses is not running." }
+        var localizedStringResource: LocalizedStringResource { AppBranding.appNotRunningShortLocalized }
     }
 }
 
@@ -108,6 +124,7 @@ struct StartAccessibilityModeIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
+        try LiveAIIntentGuard.rejectIfTerminalMode()
         guard let appState = AppStateProvider.shared else {
             throw IntentError.appNotRunning
         }
@@ -126,7 +143,7 @@ struct StartAccessibilityModeIntent: AppIntent {
 
     enum IntentError: Error, CustomLocalizedStringResourceConvertible {
         case appNotRunning
-        var localizedStringResource: LocalizedStringResource { "OpenGlasses is not running." }
+        var localizedStringResource: LocalizedStringResource { AppBranding.appNotRunningShortLocalized }
     }
 }
 
@@ -140,6 +157,7 @@ struct StartTranslatorModeIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
+        try LiveAIIntentGuard.rejectIfTerminalMode()
         guard let appState = AppStateProvider.shared else {
             throw IntentError.appNotRunning
         }
@@ -158,6 +176,6 @@ struct StartTranslatorModeIntent: AppIntent {
 
     enum IntentError: Error, CustomLocalizedStringResourceConvertible {
         case appNotRunning
-        var localizedStringResource: LocalizedStringResource { "OpenGlasses is not running." }
+        var localizedStringResource: LocalizedStringResource { AppBranding.appNotRunningShortLocalized }
     }
 }

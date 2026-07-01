@@ -29,6 +29,7 @@ struct TranscriptOverlay: View {
     private var aiLabel: String {
         if isGemini { return "Gemini" }
         if isOpenAI { return "GPT" }
+        if appState.llmService.lastResponseViaGateway { return Config.agentName }
         return appState.llmService.activeModelName
     }
 

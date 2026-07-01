@@ -59,7 +59,10 @@ final class PhotoLogTool: NativeTool {
 
         let sizeKB = imageData.count / 1024
         // Archive the full-res original (attachPhoto above); cap only the copy bound for the LLM.
-        let base64 = LLMImagePreparer.prepared(imageData).base64EncodedString()
+        guard let prepared = LLMImagePreparer.prepared(imageData) else {
+            return "Photo was logged to the session (\(sizeKB) KB) but the frame was too small to send to the vision model. The camera may still be initialising — try again in a moment."
+        }
+        let base64 = prepared.base64EncodedString()
         let captionNote = caption.map { " Caption: \($0)." } ?? ""
         return "[IMAGE_CAPTURED:\(base64)] Photo logged to the session (\(sizeKB) KB).\(captionNote) Analyze the image to read any values, then continue."
     }
