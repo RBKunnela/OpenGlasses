@@ -22,6 +22,10 @@ enum OpenClawConnectionState: Equatable {
     case checking
     case connected
     case unreachable(String)
+    /// Terminal state: reconnect attempts exhausted (see `maxReconnectAttempts`).
+    /// Distinct from `.unreachable` (transient, still retrying) — no further
+    /// automatic reconnect will be scheduled until an explicit reconnect.
+    case error(String)
 }
 
 enum ResolvedConnection: Equatable {
@@ -127,6 +131,13 @@ class OpenClawBridge: ObservableObject {
     /// re-probes from scratch and never gets stuck on a bad candidate (B1).
     private var consecutiveWSFailures = 0
     private static let maxWSFailuresBeforeEndpointReset = 3
+    /// Reconnect attempts since the last successful connect. Capped by
+    /// `maxReconnectAttempts` so an accept-then-drop (e.g. a 401 that closes the
+    /// socket right after opening) can't cause an infinite reconnect storm on the
+    /// wearable. Reset to 0 on every successful connect. Matches the peers
+    /// (`GeminiLiveService` / `OpenAIRealtimeService`).
+    private var reconnectAttempts = 0
+    private let maxReconnectAttempts = 10
 
     /// WebSocket for chat (`chat.send`)
     private var webSocketTask: URLSessionWebSocketTask?
@@ -628,6 +639,7 @@ class OpenClawBridge: ObservableObject {
         self.reconnectBackoffSeconds = 2.0  // reset after successful res
         self.shouldReconnect = true
         self.consecutiveWSFailures = 0  // healthy link — clear failure streak
+        self.reconnectAttempts = 0  // healthy link — clear reconnect-attempt cap counter
 
         // Restore high-level state if it was marked unreachable due to previous drop
         if self.connectionState != .connected {
@@ -659,7 +671,11 @@ class OpenClawBridge: ObservableObject {
 
     private func startKeepalive() {
         keepaliveTask?.cancel()
-        reconnectBackoffSeconds = 1.0
+        // H4: do NOT reset reconnectBackoffSeconds here. The backoff base is owned
+        // by the connect site (set to 2.0 on successful connect, ~line 628) and the
+        // disconnect path (reset on teardown). Resetting it to 1.0 here clobbered
+        // the 2.0 base set moments earlier at connect time, so the H4 precedence fix
+        // never actually held.
         keepaliveTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 15_000_000_000) // 15s official tick to match server policy and prevent 30s client close
@@ -757,6 +773,8 @@ class OpenClawBridge: ObservableObject {
             lines.append("HTTP /health: OK")
         case .unreachable(let reason):
             lines.append("HTTP /health: FALHOU — \(reason)")
+        case .error(let reason):
+            lines.append("HTTP /health: FALHOU (reconexões esgotadas) — \(reason)")
         case .checking:
             lines.append("HTTP /health: testando…")
         case .notConfigured:
@@ -795,7 +813,16 @@ class OpenClawBridge: ObservableObject {
             throw NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "Falha ao codificar handshake"])
         }
 
-        NSLog("[OpenClawWS] Sending connect: %@", String(connectJSON.prefix(500)))
+        // H5: never log the auth token. Serialize a redacted copy of the connect
+        // message (auth object masked) for the diagnostic log instead of connectJSON.
+        var redactedMsg = connectMsg
+        if var params = redactedMsg["params"] as? [String: Any] {
+            params["auth"] = ["token": "***"]
+            redactedMsg["params"] = params
+        }
+        let redactedLog = (try? JSONSerialization.data(withJSONObject: redactedMsg))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{\"type\":\"req\",\"method\":\"connect\"}"
+        NSLog("[OpenClawWS] Sending connect: %@", String(redactedLog.prefix(500)))
         let responseText: String = try await withCheckedThrowingContinuation { continuation in
             pendingResponses[connectId] = continuation
             Task { @MainActor in
@@ -938,6 +965,20 @@ class OpenClawBridge: ObservableObject {
                     }
 
                     if self.shouldReconnect {
+                        // H3: cap reconnect attempts (match the peers — Gemini/OpenAI use 10).
+                        // An accept-then-drop (e.g. a 401 that closes the socket right after
+                        // opening) would otherwise loop here forever, hammering the gateway and
+                        // draining the wearable. When the cap is hit, stop auto-reconnecting and
+                        // surface a terminal error state.
+                        self.reconnectAttempts += 1
+                        guard self.reconnectAttempts <= self.maxReconnectAttempts else {
+                            NSLog("[OpenClaw] Max reconnect attempts (%d) reached — giving up", self.maxReconnectAttempts)
+                            self.shouldReconnect = false
+                            self.reconnectTask?.cancel()
+                            self.connectionState = .error("Connection lost after \(self.maxReconnectAttempts) reconnect attempts")
+                            continue
+                        }
+
                         // VisionClaw style: exponential backoff 2s base, ×2, cap 30s
                         self.reconnectBackoffSeconds = min(30.0, self.reconnectBackoffSeconds * 2.0)
 

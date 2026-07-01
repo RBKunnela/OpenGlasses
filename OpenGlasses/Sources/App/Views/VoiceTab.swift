@@ -460,6 +460,7 @@ struct StatusPillsRow: View {
                     : (.orange, "HTTP só — WS pendente")
             case .checking: return (.orange, "Verificando…")
             case .unreachable: return (.red, "Offline")
+            case .error: return (.red, "Offline")
             case .notConfigured: return (.gray, "Não configurado")
             }
         }()
@@ -502,6 +503,13 @@ struct StatusPillsRow: View {
             msg += "\n\nDepois de conectado: veja o contrato em /opt/openclaw/SERVER-CONTRACT-FOR-GROK.md"
             return msg
         case .unreachable(let reason):
+            return """
+            \(reason)
+
+            Modo OpenClaw: o iPhone não usa Qwen nem NVIDIA quando \(Config.agentName) está offline.
+            Corrija o gateway para a voz funcionar.
+            """
+        case .error(let reason):
             return """
             \(reason)
 

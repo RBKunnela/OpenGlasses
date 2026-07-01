@@ -64,6 +64,7 @@ struct GatewaySettingsView: View {
                         return bridge.webSocketReady ? .green : .orange
                     case .checking: return .orange
                     case .unreachable: return .red
+                    case .error: return .red
                     case .notConfigured: return .gray
                     }
                 }()
@@ -80,6 +81,8 @@ struct GatewaySettingsView: View {
                         Text("Testando conexão…")
                     case .unreachable:
                         Text("Gateway offline para o iPhone")
+                    case .error(let reason):
+                        Text("Gateway desconectado — \(reason)")
                     case .notConfigured:
                         Text("Gateway não configurado")
                     }

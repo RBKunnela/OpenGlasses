@@ -515,8 +515,6 @@ class AppState: ObservableObject, AppStateProtocol {
     let speechService = TextToSpeechService()
     let cameraService = CameraService()
     let videoRecorder = VideoRecordingService()
-    // Inject for glasses button to toggle local video recording (iPhone extension mode)
-    cameraService.videoRecorder = videoRecorder
     let audioRecorder = AudioRecordingService()
     let meetingAssistant = MeetingAssistantService()
     let broadcastService = BroadcastService()
@@ -632,6 +630,9 @@ class AppState: ObservableObject, AppStateProtocol {
     }
 
     init() {
+        // Inject for glasses button to toggle local video recording (iPhone extension mode)
+        cameraService.videoRecorder = videoRecorder
+
         // Initialize native tool system
         nativeToolRegistry = NativeToolRegistry(
             locationService: locationService,
