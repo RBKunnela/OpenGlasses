@@ -11,6 +11,7 @@ class WatchConnectivityService: NSObject, ObservableObject {
     @Published var isConnected = false
     @Published var isListening = false
     @Published var isRecording = false
+    @Published var isVideoRecording = false
     @Published var isProcessing = false
     @Published var lastResponse = ""
     @Published var status = "idle"
@@ -104,6 +105,9 @@ class WatchConnectivityService: NSObject, ObservableObject {
                     self?.isRecording = recording
                     self?.persistSharedState()
                 }
+                if let videoRecording = reply["isVideoRecording"] as? Bool {
+                    self?.isVideoRecording = videoRecording
+                }
                 if let response = reply["response"] as? String {
                     self?.lastResponse = response
                     completion(nil)
@@ -156,6 +160,9 @@ extension WatchConnectivityService: WCSessionDelegate {
             }
             if let recording = applicationContext["isRecording"] as? Bool {
                 self.isRecording = recording
+            }
+            if let videoRecording = applicationContext["isVideoRecording"] as? Bool {
+                self.isVideoRecording = videoRecording
             }
             if let status = applicationContext["status"] as? String {
                 self.status = status

@@ -5,6 +5,11 @@ import Foundation
 /// and listens for heartbeat/cron events to speak through TTS.
 class OpenClawEventClient {
     var onNotification: ((String) -> Void)?
+    /// Surfaces live pairing/connection state to the gateway settings UI.
+    var onPairingStatusChange: ((PairingStatus) -> Void)?
+    /// Remote invoke (Plan BH): an unsolicited server→client request frame arrived. The handler
+    /// produces exactly one reply frame and passes it to the completion for sending.
+    var onRemoteRequest: (([String: Any], @escaping ([String: Any]) -> Void) -> Void)?
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var session: URLSession?
@@ -12,6 +17,11 @@ class OpenClawEventClient {
     private var shouldReconnect = false
     private var reconnectDelay: TimeInterval = 2
     private let maxReconnectDelay: TimeInterval = 30
+    /// The gateway resolved for the current connection — its credential drives the handshake.
+    private var currentGateway: GatewayConfig?
+    /// Nonce from the gateway's `connect.challenge` — signed into the device-identity block so
+    /// remote gateways grant real scopes (token-only connects can be granted zero scopes).
+    private var challengeNonce: String?
 
     func connect() {
         guard Config.isOpenClawConfigured else {
@@ -24,13 +34,29 @@ class OpenClawEventClient {
     }
 
     func disconnect() {
+        sendDeviceEvent(type: "connection", payload: ["status": "disconnected"])
         shouldReconnect = false
         isConnected = false
+        challengeNonce = nil
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         webSocketTask = nil
         session?.invalidateAndCancel()
         session = nil
+        onPairingStatusChange?(.disconnected)
         NSLog("[OpenClawWS] Disconnected")
+    }
+
+    /// Begin device pairing with a setup code: store it on the active gateway and reconnect, so
+    /// the handshake presents the bootstrap token. The gateway returns a per-device token once
+    /// the device is approved (captured in `handleConnectResponse` / the `device.paired` event).
+    func startPairing(setupCode: String) {
+        guard let gateway = Self.activeGateway() else {
+            onPairingStatusChange?(.error("No gateway configured"))
+            return
+        }
+        Config.setGatewaySetupCode(gatewayId: gateway.id, setupCode: setupCode)
+        disconnect()
+        connect()
     }
 
     // MARK: - Private
@@ -41,6 +67,8 @@ class OpenClawEventClient {
             NSLog("[OpenClawWS] No configured gateway found, skipping")
             return
         }
+        currentGateway = gateway
+        onPairingStatusChange?(.connecting)
 
         let wsURL = Self.webSocketURL(for: gateway)
         guard let url = URL(string: wsURL) else {
@@ -54,7 +82,7 @@ class OpenClawEventClient {
         webSocketTask = session?.webSocketTask(with: url)
         webSocketTask?.resume()
 
-        NSLog("[OpenClawWS] Connecting to %@ (gateway: %@)", url.absoluteString, gateway.name)
+        NSLog("[OpenClawWS] Connecting to %@ (gateway: %@)", LogRedaction.redact(url.absoluteString), gateway.name)
         startReceiving()
     }
 
@@ -98,19 +126,22 @@ class OpenClawEventClient {
         }
     }
 
+    // The gateway token is presented in the `connect` handshake (see `sendConnectHandshake`),
+    // never in the URL — keeping it out of the query string prevents it leaking into device,
+    // proxy, and server access logs.
     private static func tunnelWebSocketURL(for gateway: GatewayConfig) -> String {
         let base = gateway.tunnelHost
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             .replacingOccurrences(of: "https://", with: "wss://")
             .replacingOccurrences(of: "http://", with: "ws://")
-        return "\(base)/ws?token=\(gateway.token)"
+        return "\(base)/ws"
     }
 
     private static func lanWebSocketURL(for gateway: GatewayConfig) -> String {
         let host = gateway.lanHost
             .replacingOccurrences(of: "http://", with: "")
             .replacingOccurrences(of: "https://", with: "")
-        return "ws://\(host):\(gateway.port)/ws?token=\(gateway.token)"
+        return "ws://\(host):\(gateway.port)/ws"
     }
 
     private func startReceiving() {
@@ -145,18 +176,81 @@ class OpenClawEventClient {
         if type == "event" {
             handleEvent(json)
         } else if type == "res" {
-            let ok = json["ok"] as? Bool ?? false
-            if ok {
-                NSLog("[OpenClawWS] Connected and authenticated")
-                isConnected = true
-                reconnectDelay = 2
-            } else {
-                let error = json["error"] as? [String: Any]
-                let msg = error?["message"] as? String ?? "unknown"
-                let code = error?["code"] as? Int
-                NSLog("[OpenClawWS] Connect failed: %@ (code: %@, full response: %@)", msg, code.map { "\($0)" } ?? "nil", text)
+            handleConnectResponse(json, rawText: text)
+        } else if type == "req" {
+            handleRequestFrame(json)
+        }
+    }
+
+    /// Remote invoke (Plan BH): an unsolicited server→client request. The wired handler owns
+    /// parse/policy/execute and always produces exactly one reply frame; with no handler wired
+    /// we still answer (unsupported) rather than leave the gateway hanging.
+    private func handleRequestFrame(_ json: [String: Any]) {
+        guard let handler = onRemoteRequest else {
+            if let request = RemoteCommandParser.parse(json) {
+                sendFrame(RemoteInvokeReply.unsupported(id: request.id, action: "remote_invoke"))
+            }
+            return
+        }
+        handler(json) { [weak self] reply in
+            self?.sendFrame(reply)
+        }
+    }
+
+    private func sendFrame(_ frame: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: frame),
+              let string = String(data: data, encoding: .utf8) else { return }
+        webSocketTask?.send(.string(string)) { error in
+            if let error {
+                NSLog("[OpenClawWS] Reply send error: %@", error.localizedDescription)
             }
         }
+    }
+
+    /// Fire-and-forget `device.event` push (Plan BH follow-up): tell the gateway-side agent
+    /// something changed on the device without being asked — connection state, glasses
+    /// attach/detach, battery. The request/reply invoke path stays unchanged; this is the
+    /// outbound half of the bidirectional terminal. No-op unless the socket is authenticated.
+    func sendDeviceEvent(type: String, payload: [String: Any]) {
+        guard isConnected else { return }
+        var body: [String: Any] = [
+            "type": type,
+            "timestamp": Int(Date().timeIntervalSince1970),
+        ]
+        if !payload.isEmpty { body["data"] = payload }
+        sendFrame([
+            "type": "event",
+            "event": "device.event",
+            "payload": body,
+        ])
+        NSLog("[OpenClawWS] Sent device.event type=%@", type)
+    }
+
+    /// Map a connect `res` to a pairing outcome: persist a freshly-issued device token, update
+    /// connection state, and surface the status. Pure interpretation lives in
+    /// `PairingResponseInterpreter`; this applies its side effects.
+    private func handleConnectResponse(_ json: [String: Any], rawText: String) {
+        let outcome = PairingResponseInterpreter.interpretResponse(json)
+
+        if let token = outcome.deviceToken, let gatewayId = currentGateway?.id {
+            Config.setDeviceCredentials(gatewayId: gatewayId, deviceToken: token)
+            NSLog("[OpenClawWS] Device paired — per-device token saved")
+        }
+
+        switch outcome.status {
+        case .paired:
+            isConnected = true
+            reconnectDelay = 2
+            NSLog("[OpenClawWS] Connected and authenticated")
+            sendDeviceEvent(type: "connection", payload: ["status": "connected"])
+        case .waitingApproval:
+            NSLog("[OpenClawWS] Device pairing pending — awaiting approval on the gateway")
+        case .error(let msg):
+            NSLog("[OpenClawWS] Connect failed: %@ (full response: %@)", msg, LogRedaction.redact(rawText))
+        case .disconnected, .connecting:
+            break
+        }
+        onPairingStatusChange?(outcome.status)
     }
 
     private func handleEvent(_ json: [String: Any]) {
@@ -165,7 +259,15 @@ class OpenClawEventClient {
 
         switch event {
         case "connect.challenge":
+            challengeNonce = payload["nonce"] as? String
             sendConnectHandshake()
+        case "device.paired":
+            if let outcome = PairingResponseInterpreter.interpretPairedEvent(payload),
+               let token = outcome.deviceToken, let gatewayId = currentGateway?.id {
+                Config.setDeviceCredentials(gatewayId: gatewayId, deviceToken: token)
+                NSLog("[OpenClawWS] Device paired via event — token saved")
+                onPairingStatusChange?(.paired)
+            }
         case "heartbeat":
             handleHeartbeatEvent(payload)
         case "cron":
@@ -176,24 +278,37 @@ class OpenClawEventClient {
     }
 
     private func sendConnectHandshake() {
+        // Present the ACTIVE gateway's credential (device token > bootstrap > shared token),
+        // not the legacy global token — this both fixes wrong-credential sends on multi-gateway
+        // setups and enables device pairing. Falls back to the global token if no gateway was
+        // resolved, so the default path is unchanged.
+        let token: String
+        var deviceId = ""
+        if let gateway = currentGateway {
+            token = GatewayAuthSelector.credential(
+                deviceToken: gateway.deviceToken,
+                setupCode: gateway.setupCode,
+                sharedToken: gateway.token
+            )
+            deviceId = Config.deviceId(forGateway: gateway.id)
+        } else {
+            token = Config.openClawGatewayToken
+        }
+
+        // Shared builder (protocol v3/v4): role/scopes, capability advertisement, and — when the
+        // gateway issued a challenge nonce — the signed Ed25519 device-identity block.
         let connectMsg: [String: Any] = [
             "type": "req",
             "id": UUID().uuidString,
             "method": "connect",
-            "params": [
-                "minProtocol": 3,
-                "maxProtocol": 3,
-                "client": [
-                    "id": "gateway-client",
-                    "displayName": "OpenGlasses",
-                    "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
-                    "platform": "ios",
-                    "mode": "node"
-                ] as [String: Any],
-                "auth": [
-                    "token": Config.openClawGatewayToken
-                ]
-            ] as [String: Any]
+            "params": OpenClawConnectParams.build(
+                clientId: "gateway-client",
+                displayName: "OpenGlasses",
+                version: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
+                token: token,
+                challengeNonce: challengeNonce,
+                pairedDeviceId: deviceId.isEmpty ? nil : deviceId
+            )
         ]
 
         guard let data = try? JSONSerialization.data(withJSONObject: connectMsg),
@@ -232,8 +347,12 @@ class OpenClawEventClient {
 
     private func scheduleReconnect() {
         guard shouldReconnect else { return }
-        NSLog("[OpenClawWS] Reconnecting in %.0fs", reconnectDelay)
-        DispatchQueue.main.asyncAfter(deadline: .now() + reconnectDelay) { [weak self] in
+        // Jitter (±20%) so a fleet of clients doesn't stampede a recovering gateway in lockstep.
+        // The socket is load-bearing for inbound remote invoke (Plan BH), so we keep retrying
+        // forever — but connection state is surfaced via `onPairingStatusChange`, never silent.
+        let delay = reconnectDelay * Double.random(in: 0.8...1.2)
+        NSLog("[OpenClawWS] Reconnecting in %.1fs", delay)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.shouldReconnect else { return }
             self.reconnectDelay = min(self.reconnectDelay * 2, self.maxReconnectDelay)
             self.establishConnection()

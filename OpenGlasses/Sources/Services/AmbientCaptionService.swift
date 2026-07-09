@@ -15,11 +15,21 @@ class AmbientCaptionService: ObservableObject {
         let id = UUID()
         let text: String
         let timestamp: Date
+        /// Diarized speaker id (`nil` = unlabeled / single-speaker path). Resolve to a display
+        /// name via `speakerRegistry`.
+        var speaker: Int? = nil
     }
 
     private var recognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+
+    /// Live diarized provider, used instead of `SFSpeechRecognizer` when
+    /// `Config.isDiarizationConfigured`. Nil on the default (unlabeled) path.
+    private var diarizer: DeepgramSTTService?
+
+    /// Maps diarization speaker ids to names/colours for the caption chips.
+    let speakerRegistry = SpeakerRegistry()
 
     /// Presence-suspended (Plan W v2): captions stay user-`isActive` but the recognition session is
     /// torn down while the user is *away* (disconnected/backgrounded), auto-resuming on return. Never
@@ -47,7 +57,7 @@ class AmbientCaptionService: ObservableObject {
     private var lastFinalizedText = ""
 
     init() {
-        recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        recognizer = SFSpeechRecognizer(locale: SpeechLocaleResolver.current)
     }
 
     // MARK: - Public API
@@ -106,6 +116,14 @@ class AmbientCaptionService: ObservableObject {
         guard !presenceSuspended else { return }
         stopRecognitionSession()
 
+        // Diarized path (opt-in, keyed, non-HIPAA): label captions with speaker chips via
+        // Deepgram. When off/unconfigured this is skipped entirely and the on-device
+        // SFSpeechRecognizer path below runs exactly as before.
+        if Config.isDiarizationConfigured {
+            startDiarizedSession()
+            return
+        }
+
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.addsPunctuation = true
@@ -156,6 +174,28 @@ class AmbientCaptionService: ObservableObject {
         }
     }
 
+    /// Live diarized recognition via Deepgram, fed by the same shared-engine buffer fan-out the
+    /// SFSpeech path uses (no second mic session). Device-pending; the JSON→segment parsing it
+    /// relies on is unit-tested.
+    private func startDiarizedSession() {
+        let diarizer = DeepgramSTTService()
+        diarizer.onSegment = { [weak self] segment in
+            guard let self, self.isActive else { return }
+            self.currentCaption = segment.text
+            self.glassesDisplay?.showText(segment.text)
+            self.resetSilenceTimer()
+            if segment.isFinal {
+                self.finalizeCaption(segment.text, speaker: segment.speaker)
+            }
+        }
+        self.diarizer = diarizer
+        diarizer.start()
+
+        wakeWordService?.addAudioBufferConsumer(id: "ambient_captions") { [weak self] buffer in
+            Task { @MainActor in self?.diarizer?.sendAudio(buffer) }
+        }
+    }
+
     private func stopRecognitionSession() {
         silenceTimer?.invalidate()
         silenceTimer = nil
@@ -163,6 +203,8 @@ class AmbientCaptionService: ObservableObject {
         recognitionTask = nil
         recognitionRequest?.endAudio()
         recognitionRequest = nil
+        diarizer?.stop()
+        diarizer = nil
         wakeWordService?.removeAudioBufferConsumer(id: "ambient_captions")
     }
 
@@ -190,7 +232,7 @@ class AmbientCaptionService: ObservableObject {
         print("🎙️ Visual note inserted into caption history")
     }
 
-    private func finalizeCaption(_ text: String) {
+    private func finalizeCaption(_ text: String, speaker: Int? = nil) {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
 
         // Only add if it's meaningfully different from the last finalized text
@@ -198,7 +240,7 @@ class AmbientCaptionService: ObservableObject {
         guard trimmed != lastFinalizedText else { return }
 
         lastFinalizedText = trimmed
-        let entry = CaptionEntry(text: trimmed, timestamp: Date())
+        let entry = CaptionEntry(text: trimmed, timestamp: Date(), speaker: speaker)
         captionHistory.insert(entry, at: 0)
 
         // Trim history

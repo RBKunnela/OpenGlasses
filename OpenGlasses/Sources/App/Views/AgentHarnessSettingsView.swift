@@ -8,13 +8,19 @@ struct AgentHarnessSettingsView: View {
     @State private var defaultKind: AgentHarnessKind = Config.defaultAgentHarness
     @State private var config: CustomHarnessConfig = Config.customAgentHarness ?? CustomHarnessConfig()
     @State private var saved = false
+    // Codex / Claude Code remote (Plan N Phase 3)
+    @State private var codexToken: String = Config.codexAgentToken
+    @State private var codexBaseURL: String = Config.codexAgentBaseURL
+    @State private var claudeToken: String = Config.claudeRemoteToken
+    @State private var claudeBaseURL: String = Config.claudeRemoteBaseURL
 
     var body: some View {
         Form {
             Section {
                 Picker("Default backend", selection: $defaultKind) {
-                    Text(AgentHarnessKind.openclaw.displayName).tag(AgentHarnessKind.openclaw)
-                    Text(AgentHarnessKind.custom.displayName).tag(AgentHarnessKind.custom)
+                    ForEach(AgentHarnessKind.allCases) { kind in
+                        Text(kind.displayName).tag(kind)
+                    }
                 }
                 .onChange(of: defaultKind) { _, kind in
                     Config.setDefaultAgentHarness(kind)
@@ -23,6 +29,22 @@ struct AgentHarnessSettingsView: View {
                 Text("Default")
             } footer: {
                 Text("Which backend the “code_agent” voice tool dispatches to. OpenClaw uses your existing gateway connection; Custom uses the endpoint below.")
+            }
+
+            Section {
+                SecretInputField(placeholder: "OpenAI Codex API token", text: $codexToken)
+                urlField("Base URL (optional override)", text: $codexBaseURL)
+                SecretInputField(placeholder: "Claude Code API token", text: $claudeToken)
+                urlField("Base URL (optional override)", text: $claudeBaseURL)
+                Button {
+                    saveRemotePresets()
+                } label: {
+                    Label("Save Codex / Claude Code", systemImage: "square.and.arrow.down")
+                }
+            } header: {
+                Text("OpenAI Codex · Claude Code (remote)")
+            } footer: {
+                Text("Paste a token to enable the backend — the endpoints are pre-filled (override the base URL only if your deployment differs). Tokens are stored in the Keychain. Live dispatch is verified against your endpoint.")
             }
 
             Section {
@@ -40,9 +62,7 @@ struct AgentHarnessSettingsView: View {
                 TextField("Header name", text: $config.authHeader)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
-                SecureField("Header value (e.g. Bearer …)", text: $config.authValue)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                SecretInputField(placeholder: "Header value (e.g. Bearer …)", text: $config.authValue)
             }
 
             Section {
@@ -86,6 +106,14 @@ struct AgentHarnessSettingsView: View {
         Config.setCustomAgentHarness(config)
         appState.rebuildAgentHarnessRegistry()
         saved = true
+    }
+
+    private func saveRemotePresets() {
+        Config.setCodexAgentToken(codexToken.trimmingCharacters(in: .whitespaces))
+        Config.setCodexAgentBaseURL(codexBaseURL.trimmingCharacters(in: .whitespaces))
+        Config.setClaudeRemoteToken(claudeToken.trimmingCharacters(in: .whitespaces))
+        Config.setClaudeRemoteBaseURL(claudeBaseURL.trimmingCharacters(in: .whitespaces))
+        appState.rebuildAgentHarnessRegistry()
     }
 
     @ViewBuilder

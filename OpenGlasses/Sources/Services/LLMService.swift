@@ -12,6 +12,7 @@ enum LLMProvider: String, CaseIterable {
     case zai = "zai"
     case qwen = "qwen"
     case minimax = "minimax"
+    case xai = "xai"
     case openrouter = "openrouter"
     case custom = "custom"
     case local = "local"
@@ -26,6 +27,7 @@ enum LLMProvider: String, CaseIterable {
         case .zai: return "Z.ai (Subscription)"
         case .qwen: return "Qwen (Subscription)"
         case .minimax: return "MiniMax (Subscription)"
+        case .xai: return "xAI (Grok)"
         case .openrouter: return "OpenRouter (500+ models)"
         case .custom: return "Custom (OpenAI-compatible)"
         case .local: return "Local (On-Device MLX)"
@@ -41,6 +43,7 @@ enum LLMProvider: String, CaseIterable {
         case .gemini: return URL(string: "https://aistudio.google.com/apikey")
         case .groq: return URL(string: "https://console.groq.com/keys")
         case .minimax: return URL(string: "https://platform.minimaxi.com")
+        case .xai: return URL(string: "https://console.x.ai")
         case .openrouter: return URL(string: "https://openrouter.ai/keys")
         case .qwen: return URL(string: "https://dashscope.console.aliyun.com/apiKey")
         case .zai, .custom, .local, .appleOnDevice: return nil
@@ -51,7 +54,7 @@ enum LLMProvider: String, CaseIterable {
     var isOpenAICompatible: Bool {
         switch self {
         case .anthropic, .gemini, .local, .appleOnDevice: return false
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom: return true
+        case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom: return true
         }
     }
 
@@ -65,6 +68,7 @@ enum LLMProvider: String, CaseIterable {
         case .zai: return "https://api.z.ai/api/coding/paas/v4/chat/completions"
         case .qwen: return "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions"
         case .minimax: return "https://api.minimax.io/v1/chat/completions"
+        case .xai: return "https://api.x.ai/v1/chat/completions"
         case .openrouter: return "https://openrouter.ai/api/v1/chat/completions"
         case .custom: return "https://api.openai.com/v1/chat/completions"
         case .local: return ""
@@ -75,13 +79,14 @@ enum LLMProvider: String, CaseIterable {
     /// Default model for the provider
     var defaultModel: String {
         switch self {
-        case .anthropic: return "claude-sonnet-4-20250514"
+        case .anthropic: return "claude-sonnet-5"
         case .openai: return "gpt-4o"
         case .gemini: return "gemini-2.0-flash"
         case .groq: return "llama-3.3-70b-versatile"
         case .zai: return "glm-4.5"
         case .qwen: return "qwen3.5-plus"
         case .minimax: return "MiniMax-M2.7"
+        case .xai: return "grok-4"
         case .openrouter: return "anthropic/claude-sonnet-4"
         case .custom: return "gpt-4o"
         case .local: return "mlx-community/gemma-4-e2b-it-4bit"
@@ -169,7 +174,18 @@ class LLMService: ObservableObject {
     /// Build the full system prompt, optionally including location, tools, memory, and vision context.
     /// When `promptSections` is provided (from the ConversationClassifier), irrelevant sections are
     /// stripped to reduce token count. When nil, all sections are included (backward compatible).
-    private static func buildSystemPrompt(locationContext: String?, includeTools: Bool, includeOpenClaw: Bool, hasImage: Bool, nativeToolNames: [String] = [], gatewayToolNames: [String] = [], memoryContext: String? = nil, agentContext: String? = nil, playbookContext: String? = nil, nowPlayingContext: String? = nil, shortcutsContext: String? = nil, promptSections: ConversationClassifier.PromptSections? = nil) async -> String {
+    /// The lean system prompt for an on-device model: persona/behavior + location + memory, but
+    /// NOT the ~100 native-tool descriptions (~8k tokens) that OOM a 2B model on a phone, and none
+    /// of the heavy optional contexts (playbook/shortcuts/OpenClaw). `sendLocal` appends its own
+    /// reduced tool block, so the model still has usable tools. Used by every on-device path
+    /// (active-model `sendMessage` and fast-tier `sendViaLocalAgent`) so they can't diverge.
+    static func leanOnDevicePrompt(locationContext: String?, memoryContext: String?, hasImage: Bool, turn: String) async -> String {
+        await buildSystemPrompt(
+            locationContext: locationContext, includeTools: false, includeOpenClaw: false,
+            hasImage: hasImage, memoryContext: memoryContext, turn: turn)
+    }
+
+    private static func buildSystemPrompt(locationContext: String?, includeTools: Bool, includeOpenClaw: Bool, hasImage: Bool, nativeToolNames: [String] = [], nativeToolDescriptions: [(name: String, description: String)] = [], gatewayToolNames: [String] = [], memoryContext: String? = nil, agentContext: String? = nil, playbookContext: String? = nil, nowPlayingContext: String? = nil, shortcutsContext: String? = nil, promptSections: ConversationClassifier.PromptSections? = nil, turn: String? = nil) async -> String {
         // Agent personality mode: soul.md + skills.md + memory.md replace the standard prompt
         var prompt: String
         if Config.agentModeEnabled, let agentContext, !agentContext.isEmpty {
@@ -207,93 +223,12 @@ class LLMService: ObservableObject {
 
             if !nativeToolNames.isEmpty {
                 toolSection += "\nBuilt-in tools: \(nativeToolNames.joined(separator: ", "))."
-                toolSection += """
-
-            - get_weather: Get current weather and forecast.
-            - get_datetime: Get current date, time, day of week.
-            - daily_briefing: Combined daily briefing (date, weather, news) — use for "good morning" or "what's happening today".
-            - calculate: Evaluate math expressions.
-            - convert_units: Convert between units (length, weight, temp, volume, speed, etc).
-            - set_timer: Set a countdown timer with local notification.
-            - pomodoro: Start/stop/check a Pomodoro focus session (25 min work, 5 min break cycles).
-            - save_note / list_notes: Save and retrieve notes locally.
-            - web_search: Search the web via DuckDuckGo.
-            - get_news: Get latest news headlines, optionally by topic.
-            - translate: Translate text between languages.
-            - translate_sign_menu: Translate visible signs/menus from camera view. Returns ORIGINAL text first, then translation.
-            - ask_local_phrase: Generate traveler phrases in the local language with pronunciation and a polite variant.
-            - define_word: Look up word definitions.
-            - find_nearby: Search for nearby places (restaurants, cafes, pharmacies, gas stations, etc).
-            - where_am_i: Describe the user's current location with reverse-geocoded place context and GPS coordinates.
-            - open_app: Open iOS apps (Music, Podcasts, Maps, Google Maps, YouTube, Spotify, etc).
-            - get_directions: Directions via Apple Maps or Google Maps (set app='google' for Google Maps).
-            - identify_song: Identify a song playing nearby using Shazam.
-            - music_control: Play, pause, skip, previous track, or get now-playing info (Apple Music).
-            - convert_currency: Convert between currencies with live exchange rates.
-            - phone_call: Make a phone call to a number.
-            - send_message: Open Messages with a pre-filled text to a recipient.
-            - copy_to_clipboard: Copy text to clipboard (great after OCR, translation, or any result the user wants to keep).
-            - flashlight: Turn the device flashlight on/off.
-            - device_info: Check battery level, storage, and low power mode.
-            - save_location / list_saved_locations: Save current spot with a label ("remember where I parked") and find saved spots later with distance.
-            - step_count: Today's steps, walking distance, and floors climbed.
-            - emergency_info: Local emergency numbers for current country, exact GPS coordinates, and guidance to find nearest hospital.
-            - calendar: View today's schedule, next meeting, upcoming week, or create events. Events get a 15-min reminder notification.
-            - lookup_contact: Look up a contact by name to get their phone number or email. Use before phone_call or send_message.
-            - reminder: Create, list, or complete Apple Reminders with due dates and notifications. Syncs with iCloud.
-            - set_alarm: Set an alarm for a specific clock time (e.g. '7 AM tomorrow'). Also list or cancel alarms.
-            - brightness: Adjust screen brightness (0-100, or presets: max, min, dim, bright, up, down).
-            - smart_home: Control HomeKit smart home devices — lights, switches, fans, thermostats, locks, scenes. ALWAYS try this tool for smart home requests. Say 'list' to see devices.
-            - run_shortcut: Run an Apple Shortcut by name (e.g. 'Start Focus', 'Log Water', any user-created shortcut).
-            - summarize_conversation: Summarize current conversation, extract action items/to-dos. Use when user says "summarize", "recap", or "what did we discuss?"
-            - face_recognition: Remember faces ('remember this person as John'), forget faces, list known people, or toggle auto-recognition on/off.
-            - memory_rewind: Recall what was said recently. Transcribes last few minutes of ambient audio. Use for "what did they just say?" or "what happened?" Must be started first with action='start'.
-            - geofence: Location-based reminders. 'Remind me when I get to the office' or 'alert me when I leave home'. Create, list, delete geofenced alerts.
-            - send_via: Send messages via WhatsApp, Telegram, or Email. Specify channel ('whatsapp', 'telegram', 'email'), recipient, and body.
-            - meeting_summary: Summarize a recent meeting or conversation from ambient captions. Extracts key points, decisions, and action items. Requires ambient captions to be running.
-            - fitness_coach: Fitness coaching — start/stop workouts, log exercises (reps/sets/weight), check form via camera, get workout history from HealthKit, set step goals.
-            - openclaw_skills: Discover and manage OpenClaw skills. List available skills, check gateway status, search for capabilities. Only available when OpenClaw is configured.
-            - voice_skills: Voice-taught skills — save (teach a new trigger→action), list (show all), delete, clear. "Learn that when I say 'goodnight', turn off all lights."
-            - object_memory: Remember where physical objects are. Save ('remember my keys are on the counter'), find ('where are my keys?'), list, forget.
-            - contextual_note: Save notes with automatic location and time context. Search notes by keyword or location.
-            - social_context: Remember facts about people. Add facts ('remember John works at Stripe'), recall ('what do I know about John?'), list people.
-            - brain: Unified search across ALL on-device memory (facts, documents, people, notes, meetings, knowledge graph + encounter log). action 'query' for any "what do I know about…" when unsure where it lives; 'recall' to search PAST CONVERSATIONS — what you actually said in earlier sessions — and get a cited answer ("what did we decide about X?", "what did I say about Y last week?"); 'insights' for an on-device usage recap — top topics + activity over the last N days ("what have I been up to this week?"); 'person' for a dossier before/after meeting someone ("brief me on Alice"); 'link' to record relationships ('Alice works at Acme'); 'encounters' for recent sightings ("when did I last see Bob?"); 'save_need' for a follow-up ("Bob wants the deck"), 'needs' to list open follow-ups, 'resolve_need' to close one. Cites sources and says what's missing — answer only from its findings.
-            - home_assistant: Control Home Assistant smart home — toggle devices, check states, list entities, run automations, or use 'converse' action to send natural language commands directly to HA (e.g. action=converse, text="turn on the kitchen lights"). ALWAYS try this tool when asked about smart home control. Use entity IDs from the device list below when available; the tool also fuzzy-matches and falls back to HA's voice assistant.
-            - vehicle_status: Get the user's vehicle / EV charge %, range, charging state, and plug status. Reads live from Home Assistant — use for "what's my car's charge?", "is the car charging?", "how much range do I have?".
-            - scan_code: Scan QR codes or barcodes from the camera. Returns decoded content (URLs, text, product codes). Works offline.
-            - capture_photo: Capture a photo from the glasses camera for visual analysis. Use when you need to see what the user is looking at, or proactively when visual context would help your response.
-            - reading_assist: Read text in front of the user via the glasses camera (on-device OCR). Modes: read (clean + read aloud), simplify (rewrite at a reading level 1-5), translate (into target_language), define (plain-language definition of a term). Use for 'read this to me', 'simplify this', 'translate this sign', 'what does this word mean'.
-            - health_vault: Query or update the user's Personal Health Vault (their own notes on biometrics, conditions, diet, labs, medications, wearables). action 'query' (with question) grounds a health question in their data — cite the source file; action 'log' (file + entry) records a new entry. Never fabricate health data.
-            - notes_vault: The user's personal notes / second brain. 'log' to remember something ("note that…", "remember…"), 'query' to recall it ("what did I note about…"). Files: general, people, ideas, todos. Answers only from recorded notes.
-            - document_knowledge: Private on-device knowledge base of the user's documents (manuals, contracts, reports). action 'query' retrieves the most relevant passages to ground an answer — cite the document name and answer only from what's returned; 'ingest_scan' captures and saves a document seen through the glasses ("remember this manual"); 'ingest_text' saves provided text; 'list' shows saved documents; 'forget' deletes one. Use 'query' whenever the user asks about a document they've saved.
-            - study: Study Mode — turn a document into flashcards + a quiz and review hands-free with spaced repetition. Actions: scan (OCR a page through the glasses camera; repeat then make_deck), make_deck (from scanned pages, a document name via 'deck', or raw 'text'), list, quiz (start), answer (via 'value' — a number or the option), review (flashcards), flip, grade (right/wrong via 'value'), stop. Use for "study this page", "make flashcards from X", "quiz me".
-            - identify_medication: Read a medication label via the glasses camera (on-device OCR) and cross-check it against the user's recorded medications. Use for "what's this pill?", "is this my medication?". Reports the label text + match status; never makes clinical claims. Needs Medical Compliance.
-            - aircraft_overhead: Report aircraft flying near the user using live ADS-B data and their location. Use for "what's flying overhead?", "any planes nearby?". Param: radius_miles (1-200, default 25).
-            - live_coach: Real-time, one-sentence coaching feedback from the glasses camera. Use for "coach my squat form", "watch my knife technique", "help with my guitar". Actions: start (domain), stop, status. Domains: sports_tactics, cooking_form, posture, guitar, climbing, custom. Params: custom_prompt, interval_seconds, max_words, max_duration_minutes.
-            - code_agent: Hands-free control of a REMOTE coding agent (runs on the user's gateway, not the phone). Use for "have the agent add a dark-mode toggle", "ask the agent to fix the failing test". Actions: start (prompt, optional project), status, cancel, confirm, deny. Requires Agent Mode enabled in Settings. Progress and a final summary are spoken.
-            - network_calc: IP subnet/CIDR math for IT field work. operation 'subnet' with a 'cidr' (IPv4 or IPv6) returns network, broadcast, netmask, usable host range and count. Use for subnetting questions.
-            - navigation_assist: Spoken walking guidance for low-vision users — periodically calls out hazards/landmarks (steps, drop-offs, obstacles, oncoming people) using clock positions. Actions: start, stop, status. Use for "guide me", "navigation mode". An aid, not a cane/guide-dog replacement.
-            - first_aid: Hands-free first-aid coaching in an emergency — speaks step-by-step guidance and paces CPR with a metronome. Actions: start (protocol: cpr, choking, bleeding, recovery, march), next, back, aed (find nearest defibrillator), stop. Use for "start CPR", "someone is choking", "they're bleeding", "nearest AED". Advisory only — always reminds the user to call emergency services; not a substitute for professional care.
-            - identify_color: Name the dominant color of what the user is looking at (on-device, no network). Use for "what color is this?".
-            - identify_money: Identify a banknote's currency and denomination from the glasses camera, for low-vision support. Use for "how much is this note?", "what bill is this?".
-            - audio_recording: Start or stop audio-only recording (no camera — lighter on battery). Saves .m4a to Documents/Recordings with live transcription and a meeting assistant that sends lock screen summaries + suggested questions every 60 seconds. Saying 'take a picture' during recording adds a visual note to the transcript. Actions: start, stop, status. Use when the user says 'record this meeting', 'record audio', 'record this conversation', or 'start audio recording'.
-            - video_recording: Start or stop video+audio recording from the glasses camera and microphone. Recordings save to Photos with no time limit — ideal for interviews, meetings, procedures. Includes live transcription by default (saved as .txt alongside video). Actions: start, stop, status. Params: transcribe (bool, default true). Use when the user says 'start recording', 'record this', 'film this', 'watch what I'm doing', or 'stop recording'.
-            - medical_export: Export clinical transcripts to medical platforms or share manually. Actions: export_fhir (upload to FHIR server), export_file (create file), share (open share sheet), status (check config). Params: format (text/pdf/fhir_json/hl7), transcript (optional, uses latest recording). Use when the user says 'export the transcript', 'send to the EMR', 'share the notes', or 'upload to the health record'.
-            - qr_context: Scan a QR code and load its content as context (museum exhibits, venue info, procedures). Use at museums, venues, or workplaces. Can also load context from a URL directly.
-            - smart_capture: Capture a business card, receipt, or event flyer and extract structured details (mode: contact/receipt/event). Then chain to contacts/calendar/notes_vault to act. Use for "save this card", "log this receipt", "add this event from the flyer".
-            - vision_assess: Run a structured visual assessment of what the glasses camera sees and show a typed result card (kind selects the assessment). Use kind 'instrument_reading' to read a number off a gauge, thermometer, refractometer, scale, or meter ("what does this gauge read?", "read the thermometer"). Optional note adds context.
-            - golf_mode: Golf caddy assistant — track shots with GPS, get club recommendations, log scores, view round summary, and get course strategy. Actions: start_round, track_shot, club_recommendation, log_score, round_summary, strategy.
-            - live_translate: Start/stop continuous live translation. Listens to spoken foreign language and translates in real-time. Actions: start, stop, status, set_language.
-            - field_session: Start, pause, resume, end, or query a Field Assist session for grounded, domain-specific technical support (refrigeration, IT, electrical, automotive). Sessions load a domain knowledge vault and emit an audit log. Use 'start' when the technician begins work, 'end' when they finish, 'export' to generate a work-order PDF + audit JSON. Actions: start, pause, resume, end, status, list, escalate, export. Params: vault (e.g. 'refrigeration'), asset_id, mode ('ai_only' default), outcome, reason, format ('pdf'/'json'/'both').
-            - procedure_runner: Run a guided, step-by-step Field Assist procedure (diagnostics, checklists) inside an active session. Actions: list, start, next, previous, repeat, status, complete. When the active step offers choices, pass 'choice' with the branch id to 'next'. The current step and its choice ids are injected into this prompt under "ACTIVE PROCEDURE" — use those. Params: procedure_id, choice, outcome.
-            - capture_flow: Run a structured, typed capture flow (inspection / work-order form) inside an active session — each step collects a validated value (reading, enum choice, barcode, or photo) bound to a field, producing an audit-ready record. Actions: list, start, answer, skip, back, status, finish, cancel. After 'start', read the returned step prompt to the user; pass their spoken value verbatim to 'answer'. The runner range-checks numbers, maps spoken phrases to enum options, and re-prompts on a bad answer; 'finish' blocks until required fields are captured. Params: flow_id, asset_id, value.
-            - domain_calc: Refrigeration math grounded in the vault PT charts. Operations: pt_lookup (saturation temp at a pressure), superheat (suction line temp − sat temp at suction pressure), subcool (sat temp at liquid pressure − liquid line temp). Temps °F, pressures PSIG. Params: operation, refrigerant ('R-410A','R-32','R-454B','R-22'), pressure_psig, suction_pressure_psig, suction_line_temp_f, liquid_pressure_psig, liquid_line_temp_f.
-            - equipment_lookup: Look up an error code, fault, or model number in the active session's vault. The technician can read it aloud (query), or point the glasses at the nameplate/error display and omit query (or set use_camera) to read it via on-device OCR. Returns the matching reference section with its source. Params: query (optional), use_camera (optional bool), file (optional).
-            - safety_assessment: Run a High-Energy Control Assessment (HECA) on the current job-site view from the glasses camera — detects the 13 high-energy serious-injury/fatality hazards and whether each has a DIRECT control, and returns a summary + HECA score. Use for "assess this site", "is this safe?", "safety check". Actions: run, last, score, history, export (PDF of the latest report), ask (image-seeded safety-advisor follow-up — pass question). Advisory only — verify on site; not a certified inspection.
-            - photo_log: Capture a photo from the glasses camera and attach it to the active session's audit log with a caption (e.g. a gauge reading), and return the image for analysis. Use to document readings and evidence during a session. Params: caption.
-            - escalate_to_expert: Escalate the active Field Assist session to a human expert when you cannot safely resolve the issue or the technician asks for a person. Actions: request (with reason), status, resolve, cancel. Live expert video is not available yet — escalation is logged and the expert pool is notified.
-            - teleprompter: Hands-free teleprompter on the in-lens HUD — shows a script a window at a time and (audio-paced) auto-advances by listening to you read. Actions: start (text=the script, or script=a saved script name, or document=a saved knowledge-base document; optional mode audio_paced/voice/auto_scroll), stop, pause, resume, next, back, restart, faster, slower, list (saved scripts), save (text + optional title), scan (capture a printed page via the glasses camera + OCR — repeat for multiple pages, then start). Use for "start the teleprompter", "read my speech", "teleprompt my saved doc", "scan this script", "go faster/slower".
-            """
+                // Plan BG P1: the per-tool descriptions are generated from each NativeTool's own
+                // `description` (the same source as the machine-readable tool schemas), so this
+                // list can't drift from the real tool set or from the Gemini Live prompt.
+                if !nativeToolDescriptions.isEmpty {
+                    toolSection += "\n\n" + SystemPromptBuilder.toolLines(nativeToolDescriptions)
+                }
 
                 // Inject user-defined custom tool descriptions
                 let customTools = Config.customTools.filter { Config.isToolEnabled($0.name) }
@@ -409,7 +344,7 @@ class LLMService: ObservableObject {
             prompt += "\n\n\(nowPlaying)"
         }
         // Inject voice-taught skills
-        if shouldInclude(.tools), let skills = VoiceSkillStore.shared.promptContext() {
+        if shouldInclude(.tools), let skills = VoiceSkillStore.shared.promptContext(for: turn) {
             prompt += "\n\n\(skills)"
         }
         // Inject Field Assist vault content when a session is active.
@@ -417,12 +352,24 @@ class LLMService: ObservableObject {
         if let vaultContext = FieldSessionService.shared.promptContext() {
             prompt += "\n\n\(vaultContext)"
         }
+        // Inject the active project's knowledge-base grounding when it has documents (Plan AN).
+        if let projectContext = ProjectContextService.shared.promptContext() {
+            prompt += "\n\n\(projectContext)"
+        }
+        // Inject project-scoped notes for the active job (what the user is mid-way through).
+        if Config.projectMemoryEnabled,
+           let session = FieldSessionService.shared.activeSession, session.isActive {
+            let eligible = ProjectMemoryScope.eligible(
+                BrainStore.shared.projectMemories(for: session.id), activeProject: session.id)
+            let block = ProjectMemoryFormatter.block(eligible)
+            if !block.isEmpty { prompt += "\n\n\(block)" }
+        }
         // Inject social context (people the user knows)
         if shouldInclude(.social), let social = SocialContextStore.shared.promptContext() {
             prompt += "\n\n\(social)"
         }
         // Inject installed ClawHub skills
-        if shouldInclude(.openClaw), let skillContext = InstalledSkillStore.shared.promptContext() {
+        if shouldInclude(.openClaw), let skillContext = InstalledSkillStore.shared.promptContext(for: turn) {
             prompt += "\n\n\(skillContext)"
         }
         // Always append the prompt-injection / untrusted-content policy. This is a security
@@ -442,7 +389,30 @@ class LLMService: ObservableObject {
         return PromptInjectionPolicy.wrap(toolName: toolName, content: content)
     }
 
-    func sendMessage(_ text: String, locationContext: String? = nil, imageData: Data? = nil, memoryContext: String? = nil, agentContext: String? = nil, playbookContext: String? = nil, nowPlayingContext: String? = nil, shortcutsContext: String? = nil, promptSections: ConversationClassifier.PromptSections? = nil) async throws -> String {
+    /// The shared tool-dispatch step used by every provider's tool loop (Plan BG P3): native tools
+    /// via `NativeToolRouter`, else the OpenClaw bridge, else a failure. Status transitions flow to
+    /// the published `toolCallStatus`. Yield detection and the parse-error path live in the
+    /// `ToolDispatcher` value type so the whole step is unit-testable with a mock executor.
+    private func makeToolDispatcher() -> ToolDispatcher {
+        ToolDispatcher(
+            execute: { [weak self] name, args, rawArgs in
+                guard let self else { return .failure("Service unavailable") }
+                if let router = self.nativeToolRouter {
+                    return await router.handleToolCall(name: name, args: args)
+                } else if let bridge = self.openClawBridge {
+                    let taskDesc = args["task"] as? String ?? (rawArgs ?? String(describing: args))
+                    return await bridge.delegateTask(task: taskDesc, toolName: name)
+                }
+                return .failure("No tool handler available")
+            },
+            onStatus: { [weak self] status in self?.toolCallStatus = status }
+        )
+    }
+
+    /// - Parameter onToken: optional per-token callback for streaming the final assistant reply
+    ///   into the UI as it's generated. Currently honoured by the on-device (`local`) provider;
+    ///   cloud providers ignore it and return the full reply on completion.
+    func sendMessage(_ text: String, locationContext: String? = nil, imageData: Data? = nil, memoryContext: String? = nil, agentContext: String? = nil, playbookContext: String? = nil, nowPlayingContext: String? = nil, shortcutsContext: String? = nil, promptSections: ConversationClassifier.PromptSections? = nil, onToken: ((String) -> Void)? = nil) async throws -> String {
         isProcessing = true
         defer { isProcessing = false }
 
@@ -459,12 +429,27 @@ class LLMService: ObservableObject {
         }
 
         let provider = modelConfig.llmProvider
+        let isOnDevice = (provider == .local || provider == .appleOnDevice)
         let hasNativeTools = nativeToolRouter != nil
         let includeOpenClaw = Config.isOpenClawConfigured && openClawBridge != nil
         let includeTools = hasNativeTools || includeOpenClaw
-        let nativeToolNames = nativeToolRouter?.registry.toolNames ?? []
-        let gatewayToolNames = openClawBridge?.availableToolNames ?? []
-        let fullPrompt = await Self.buildSystemPrompt(locationContext: locationContext, includeTools: includeTools, includeOpenClaw: includeOpenClaw, hasImage: imageData != nil, nativeToolNames: nativeToolNames, gatewayToolNames: gatewayToolNames, memoryContext: memoryContext, agentContext: agentContext, playbookContext: playbookContext, nowPlayingContext: nowPlayingContext, shortcutsContext: shortcutsContext, promptSections: promptSections)
+        let nativeToolNames = nativeToolRouter?.registry.toolNames ?? []   // used by the agent-plan block too
+
+        // On-device models get a LEAN prompt regardless of how they were reached (active model or
+        // agent). The full ~100-tool prompt is ~8k tokens and OOM-kills a 2B model on a phone;
+        // `sendLocal` appends its own reduced tool block, so the model still has usable tools.
+        // Cloud providers get the full tool-laden prompt. (`sendLocal` keeps `includeTools` so it
+        // still adds the reduced set — only the PROMPT drops the ~100-tool dump.)
+        let fullPrompt: String
+        if isOnDevice {
+            fullPrompt = await Self.leanOnDevicePrompt(
+                locationContext: locationContext, memoryContext: memoryContext,
+                hasImage: imageData != nil, turn: text)
+        } else {
+            let nativeToolDescriptions = nativeToolRouter?.registry.toolDescriptions(for: nativeToolNames) ?? []
+            let gatewayToolNames = openClawBridge?.availableToolNames ?? []
+            fullPrompt = await Self.buildSystemPrompt(locationContext: locationContext, includeTools: includeTools, includeOpenClaw: includeOpenClaw, hasImage: imageData != nil, nativeToolNames: nativeToolNames, nativeToolDescriptions: nativeToolDescriptions, gatewayToolNames: gatewayToolNames, memoryContext: memoryContext, agentContext: agentContext, playbookContext: playbookContext, nowPlayingContext: nowPlayingContext, shortcutsContext: shortcutsContext, promptSections: promptSections, turn: text)
+        }
 
         var toolsLabel = ""
         if hasNativeTools { toolsLabel += " [NativeTools]" }
@@ -476,7 +461,7 @@ class LLMService: ObservableObject {
         // The planner sees the request alone (not chat history), and tool output never re-enters
         // planning — the structural prompt-injection defense. Falls back to single-shot when the
         // request can't be planned/validated (still safe; every call is supervised either way).
-        if Config.agentModeEnabled, hasNativeTools, imageData == nil, AgentComplexity.isMultiStep(text) {
+        if Config.agentModeEnabled, hasNativeTools, imageData == nil, await classifyMultiStep(text) {
             if let summary = await runAgentPlan(request: text, nativeToolNames: nativeToolNames) {
                 conversationHistory.append(["role": "user", "content": text])
                 conversationHistory.append(["role": "assistant", "content": summary])
@@ -489,15 +474,15 @@ class LLMService: ObservableObject {
         let rawResponse: String
         switch provider {
         case .anthropic:
-            rawResponse = try await sendAnthropic(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
+            rawResponse = try await sendAnthropic(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData, onToken: onToken)
         case .gemini:
             rawResponse = try await sendGemini(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
         case .local:
-            rawResponse = try await sendLocal(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
+            rawResponse = try await sendLocal(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData, onToken: onToken)
         case .appleOnDevice:
             rawResponse = try await sendAppleOnDevice(text, systemPrompt: fullPrompt)
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
-            rawResponse = try await sendOpenAICompatible(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
+        case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom:
+            rawResponse = try await sendOpenAICompatible(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData, onToken: onToken)
         }
 
         // Strip <think> tags: keep reasoning in history but don't speak it
@@ -515,6 +500,21 @@ class LLMService: ObservableObject {
     }
 
     // MARK: - Plan-then-execute (Plan S)
+
+    /// Decide whether to route `text` through the plan-then-execute loop (Plan S Phase 2).
+    /// The pure keyword heuristic decides for free; when the LLM classifier is enabled and
+    /// the request is ambiguous (`ComplexityClassifier.shouldConsultLLM`), a tiny history-free
+    /// completion breaks the tie. Any classifier failure falls back to the heuristic.
+    private func classifyMultiStep(_ text: String) async -> Bool {
+        let heuristic = AgentComplexity.isMultiStep(text)
+        guard Config.llmComplexityClassifierEnabled,
+              ComplexityClassifier.shouldConsultLLM(text) else {
+            return heuristic
+        }
+        let verdict = (try? await completeStateless(text, system: ComplexityClassifier.systemPrompt))
+            .flatMap(ComplexityClassifier.parseVerdict)
+        return ComplexityClassifier.decide(heuristic: heuristic, llmVerdict: verdict) == .multiStep
+    }
 
     /// Plan a multi-step request, validate it, and run each step through the supervisor-gated
     /// router. Returns the spoken summary, or nil to fall back to the single-shot tool loop.
@@ -561,7 +561,7 @@ class LLMService: ObservableObject {
             return try await sendLocal(text, systemPrompt: system, config: config, includeTools: false, imageData: nil)
         case .appleOnDevice:
             return try await sendAppleOnDevice(text, systemPrompt: system)
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+        case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom:
             return try await sendOpenAICompatible(text, systemPrompt: system, config: config, includeTools: false, imageData: nil)
         }
     }
@@ -596,19 +596,9 @@ class LLMService: ObservableObject {
     /// This ensures the agent doesn't "forget" mid-conversation decisions or user facts
     /// even as the raw message history is trimmed for token budget.
     private func compressContextWindowIfNeeded() {
-        let estimatedTokens = conversationHistory.reduce(0) { total, msg in
-            let content: String
-            if let text = msg["content"] as? String {
-                content = text
-            } else if let parts = msg["content"] as? [[String: Any]] {
-                // Multi-part content (images + text)
-                content = parts.compactMap { $0["text"] as? String }.joined()
-            } else {
-                content = ""
-            }
-            // ~4 chars per token, minimum 50 for overhead (tool calls, images)
-            return total + max(content.count / 4, 50)
-        }
+        // Image-aware estimate (Plan BF): a base64 image block is counted by its payload size, not
+        // the old 50-token floor, so image-heavy conversations actually trigger compaction.
+        let estimatedTokens = HistoryHygiene.estimatedTokens(conversationHistory)
 
         guard estimatedTokens > maxEstimatedTokens, conversationHistory.count > 6 else { return }
 
@@ -677,17 +667,7 @@ class LLMService: ObservableObject {
     /// Compress the context window using an LLM to summarize old messages.
     /// Falls back to the heuristic compressor on failure.
     private func compressContextWindowWithLLM() async {
-        let estimatedTokens = conversationHistory.reduce(0) { total, msg in
-            let content: String
-            if let text = msg["content"] as? String {
-                content = text
-            } else if let parts = msg["content"] as? [[String: Any]] {
-                content = parts.compactMap { $0["text"] as? String }.joined()
-            } else {
-                content = ""
-            }
-            return total + max(content.count / 4, 50)
-        }
+        let estimatedTokens = HistoryHygiene.estimatedTokens(conversationHistory)   // image-aware (Plan BF)
 
         guard estimatedTokens > maxEstimatedTokens, conversationHistory.count > 6 else { return }
 
@@ -771,8 +751,7 @@ class LLMService: ObservableObject {
                 var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue(modelConfig.apiKey, forHTTPHeaderField: "x-api-key")
-                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                AnthropicAuth.apply(credential: await AnthropicAuth.resolveCredential(apiKey: modelConfig.apiKey), to: &request)
                 request.timeoutInterval = 15
                 let body: [String: Any] = [
                     "model": modelConfig.model,
@@ -788,7 +767,7 @@ class LLMService: ObservableObject {
                       let text = content.first?["text"] as? String else { return nil }
                 return text
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -862,8 +841,7 @@ class LLMService: ObservableObject {
                 var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue(modelConfig.apiKey, forHTTPHeaderField: "x-api-key")
-                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                AnthropicAuth.apply(credential: await AnthropicAuth.resolveCredential(apiKey: modelConfig.apiKey), to: &request)
                 request.timeoutInterval = 20
                 let body: [String: Any] = [
                     "model": modelConfig.model,
@@ -882,7 +860,7 @@ class LLMService: ObservableObject {
                       let text = content.first?["text"] as? String else { return nil }
                 return text
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -967,8 +945,7 @@ class LLMService: ObservableObject {
                 var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue(modelConfig.apiKey, forHTTPHeaderField: "x-api-key")
-                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                AnthropicAuth.apply(credential: await AnthropicAuth.resolveCredential(apiKey: modelConfig.apiKey), to: &request)
                 request.timeoutInterval = 30
                 let body: [String: Any] = [
                     "model": modelConfig.model,
@@ -986,7 +963,7 @@ class LLMService: ObservableObject {
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
                 return StructuredVisionParser.anthropic(data, toolName: toolName)
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -1022,16 +999,19 @@ class LLMService: ObservableObject {
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.timeoutInterval = 30
-                // `responseMimeType` enforces a JSON object; the exact shape is conveyed by the schema's
-                // system prompt. (Translating a generic JSON Schema to Gemini `responseSchema` is a
-                // future refinement — the parser already handles a `functionCall` channel if added.)
+                // `responseMimeType` + a translated `responseSchema` enforce the exact JSON shape
+                // (not just "some JSON") — the Gemini equivalent of Anthropic/OpenAI forced tool-use.
                 let body: [String: Any] = [
                     "system_instruction": ["parts": [["text": systemPrompt]]],
                     "contents": [["role": "user", "parts": [
                         ["text": userText],
                         ["inlineData": ["mimeType": "image/jpeg", "data": base64]]
                     ]]],
-                    "generationConfig": ["maxOutputTokens": maxTokens, "responseMimeType": "application/json"]
+                    "generationConfig": [
+                        "maxOutputTokens": maxTokens,
+                        "responseMimeType": "application/json",
+                        "responseSchema": GeminiSchemaTranslator.translate(jsonSchema)
+                    ]
                 ]
                 request.httpBody = try JSONSerialization.data(withJSONObject: body)
                 let (data, response) = try await URLSession.shared.data(for: request)
@@ -1064,8 +1044,7 @@ class LLMService: ObservableObject {
                 var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue(modelConfig.apiKey, forHTTPHeaderField: "x-api-key")
-                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                AnthropicAuth.apply(credential: await AnthropicAuth.resolveCredential(apiKey: modelConfig.apiKey), to: &request)
                 request.timeoutInterval = 45
                 let body: [String: Any] = [
                     "model": modelConfig.model,
@@ -1080,7 +1059,7 @@ class LLMService: ObservableObject {
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
                 return StructuredVisionParser.anthropic(data, toolName: toolName)
 
-            case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+            case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom:
                 var baseURL = modelConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !baseURL.hasSuffix("/chat/completions") {
                     baseURL += baseURL.hasSuffix("/") ? "chat/completions" : "/chat/completions"
@@ -1116,7 +1095,11 @@ class LLMService: ObservableObject {
                 let body: [String: Any] = [
                     "system_instruction": ["parts": [["text": systemPrompt]]],
                     "contents": [["role": "user", "parts": [["text": userText]]]],
-                    "generationConfig": ["maxOutputTokens": maxTokens, "responseMimeType": "application/json"]
+                    "generationConfig": [
+                        "maxOutputTokens": maxTokens,
+                        "responseMimeType": "application/json",
+                        "responseSchema": GeminiSchemaTranslator.translate(jsonSchema)
+                    ]
                 ]
                 request.httpBody = try JSONSerialization.data(withJSONObject: body)
                 let (data, response) = try await URLSession.shared.data(for: request)
@@ -1156,15 +1139,35 @@ class LLMService: ObservableObject {
             return try await sendGemini(text, systemPrompt: systemPrompt, config: config, includeTools: includeTools, imageData: nil)
         case .local, .appleOnDevice:
             throw LLMError.missingAPIKey("Local providers cannot be used as cloud agent")
-        case .openai, .groq, .zai, .qwen, .minimax, .openrouter, .custom:
+        case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom:
             return try await sendOpenAICompatible(text, systemPrompt: systemPrompt, config: config, includeTools: includeTools, imageData: nil)
         }
     }
 
-    private func sendAnthropic(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data?) async throws -> String {
-        let apiKey = config.apiKey
+    /// Capture the token usage block from a provider's response JSON and hand it to
+    /// the cost tracker (Plan AU). Parsing is pure/synchronous here; only the resulting
+    /// integer counts cross to the main actor (the non-Sendable JSON does not). A
+    /// missing usage block is a silent no-op — never throws, never blocks the reply.
+    /// Streaming turns (Chat tab `onToken`) don't carry a usage block on this path and
+    /// are not yet captured.
+    private func recordUsage(provider: LLMProvider, model: String, json: [String: Any]) {
+        guard let tokens = UsageTracker.parseTokens(provider: provider, json: json) else { return }
+        recordUsage(provider: provider, model: model, tokensIn: tokens.tokensIn, tokensOut: tokens.tokensOut)
+    }
+
+    /// Record already-parsed token counts (the streaming paths accumulate their own).
+    private func recordUsage(provider: LLMProvider, model: String, tokensIn: Int, tokensOut: Int) {
+        guard tokensIn + tokensOut > 0 else { return }
+        Task { @MainActor in
+            UsageTracker.shared.record(provider: provider, model: model, tokensIn: tokensIn, tokensOut: tokensOut)
+        }
+    }
+
+    private func sendAnthropic(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data?, onToken: ((String) -> Void)? = nil) async throws -> String {
+        // An explicit API key wins; otherwise fall back to a connected Claude account (OAuth).
+        let apiKey = await AnthropicAuth.resolveCredential(apiKey: config.apiKey)
         guard !apiKey.isEmpty else {
-            throw LLMError.missingAPIKey("Anthropic API key not configured")
+            throw LLMError.missingAPIKey("Anthropic API key not configured — add a key or sign in with Claude")
         }
 
         // Add user message to history
@@ -1190,150 +1193,151 @@ class LLMService: ObservableObject {
         }
         trimHistory()
 
-        for iteration in 0..<maxToolCallIterations {
-            var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        // A tool_use block with an id but missing name/input can't be dispatched, yet still needs a
+        // tool_result or the next request 400s (Plan BF). Its id is carried per-turn and answered
+        // with a synthetic error alongside the real results.
+        final class TurnState { var malformedIds: [String] = [] }
+        let state = TurnState()
 
-            var body: [String: Any] = [
-                "model": config.model,
-                "max_tokens": includeTools ? 1024 : Config.maxTokens,
-                "system": systemPrompt,
-                "messages": conversationHistory
-            ]
+        let adapter = ProviderLoopAdapter(
+            label: "Anthropic",
+            dispatcher: makeToolDispatcher(),
+            performTurn: { [weak self] in
+                guard let self else { throw LLMError.invalidResponse("Anthropic") }
+                state.malformedIds = []
 
-            if includeTools {
-                let includeOpenClaw = Config.isOpenClawConfigured && openClawBridge != nil
-                let toolsData: Data = await MainActor.run {
-                    let tools = ToolDeclarations.anthropicTools(registry: nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: nativeToolRouter?.mcpClient)
-                    return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
+                var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                AnthropicAuth.apply(credential: apiKey, to: &request)  // already resolved above
+
+                // Turn hygiene (Plan BF): drop stale images that would otherwise re-upload every turn,
+                // and repair any dangling tool_use so a single interrupted tool call can't 400 the whole
+                // conversation. Applied to the sent copy AND written back so the fixes persist.
+                self.conversationHistory = HistoryHygiene.repairDanglingToolUse(
+                    HistoryHygiene.pruneImages(self.conversationHistory, keepLast: 1))
+
+                // Prompt caching (Plan BF): the system prompt + tool schemas are large and byte-stable
+                // within a session, so mark them ephemeral-cacheable. Anthropic then reads them from
+                // cache on every follow-up turn instead of re-billing full input tokens each time.
+                var body: [String: Any] = [
+                    "model": config.model,
+                    "max_tokens": includeTools ? 1024 : Config.maxTokens,
+                    "system": [[
+                        "type": "text",
+                        "text": systemPrompt,
+                        "cache_control": ["type": "ephemeral"]
+                    ]],
+                    "messages": self.conversationHistory
+                ]
+
+                if includeTools {
+                    let includeOpenClaw = Config.isOpenClawConfigured && self.openClawBridge != nil
+                    let toolsData: Data = await MainActor.run {
+                        let tools = ToolDeclarations.anthropicTools(registry: self.nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: self.nativeToolRouter?.mcpClient)
+                        return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
+                    }
+                    var tools = (try? JSONSerialization.jsonObject(with: toolsData)) as? [[String: Any]] ?? []
+                    // Cache-breakpoint on the final tool caches the whole tools array as one prefix.
+                    if !tools.isEmpty {
+                        tools[tools.count - 1]["cache_control"] = ["type": "ephemeral"]
+                    }
+                    body["tools"] = tools
                 }
-                let tools = (try? JSONSerialization.jsonObject(with: toolsData)) as? [[String: Any]] ?? []
-                body["tools"] = tools
-            }
 
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                if onToken != nil { body["stream"] = true }
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-            let (data, response) = try await URLSession.shared.data(for: request)
+                // Final-reply turns stream into the Chat tab when a streaming caller passes `onToken`;
+                // the reconstructed content blocks + stop reason feed the shared tool loop unchanged.
+                let content: [[String: Any]]
+                let stopReason: String?
+                if let onToken {
+                    (content, stopReason) = try await self.streamAnthropicContent(request: request, model: config.model, onToken: onToken)
+                } else {
+                    let (data, response) = try await URLSession.shared.data(for: request)
 
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else {
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let errorMsg = (errorJson["error"] as? [String: Any])?["message"] as? String {
-                    print("❌ Anthropic API error \(statusCode): \(errorMsg)")
-                    throw LLMError.apiError(provider: "Anthropic", statusCode: statusCode, message: errorMsg)
+                    guard let httpResponse = response as? HTTPURLResponse,
+                          httpResponse.statusCode == 200 else {
+                        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                        if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let errorMsg = (errorJson["error"] as? [String: Any])?["message"] as? String {
+                            print("❌ Anthropic API error \(statusCode): \(errorMsg)")
+                            throw LLMError.apiError(provider: "Anthropic", statusCode: statusCode, message: errorMsg)
+                        }
+                        throw LLMError.apiError(provider: "Anthropic", statusCode: statusCode, message: nil)
+                    }
+
+                    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let parsed = json["content"] as? [[String: Any]] else {
+                        throw LLMError.invalidResponse("Anthropic")
+                    }
+                    content = parsed
+                    stopReason = json["stop_reason"] as? String
+                    self.recordUsage(provider: .anthropic, model: config.model, json: json)
                 }
-                throw LLMError.apiError(provider: "Anthropic", statusCode: statusCode, message: nil)
-            }
 
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let content = json["content"] as? [[String: Any]] else {
-                throw LLMError.invalidResponse("Anthropic")
-            }
-
-            let stopReason = json["stop_reason"] as? String
-
-            // Check for tool use blocks
-            if stopReason == "tool_use", includeTools {
-                // Find tool_use blocks
-                var toolUseBlocks: [[String: Any]] = []
-                var textParts: [String] = []
-
-                for block in content {
-                    if let type = block["type"] as? String {
-                        if type == "tool_use" {
-                            toolUseBlocks.append(block)
-                        } else if type == "text", let t = block["text"] as? String {
-                            textParts.append(t)
+                var toolCalls: [ToolInvocation] = []
+                if stopReason == "tool_use", includeTools {
+                    for block in content where (block["type"] as? String) == "tool_use" {
+                        if let id = block["id"] as? String,
+                           let name = block["name"] as? String,
+                           let input = block["input"] as? [String: Any] {
+                            toolCalls.append(ToolInvocation(id: id, name: name, arguments: input))
+                        } else if let id = block["id"] as? String {
+                            state.malformedIds.append(id)
                         }
                     }
                 }
-
-                // Add assistant message with tool_use to history
-                conversationHistory.append(["role": "assistant", "content": content] as [String: Any])
-
-                // Execute each tool call via NativeToolRouter
-                for toolUse in toolUseBlocks {
-                    guard let toolId = toolUse["id"] as? String,
-                          let toolName = toolUse["name"] as? String,
-                          let input = toolUse["input"] as? [String: Any] else { continue }
-
-                    print("🔧 [Anthropic] Tool call: \(toolName)(\(String(describing: input).prefix(100))...)")
-                    toolCallStatus = .executing(toolName)
-
-                    let result: ToolResult
-                    if let router = nativeToolRouter {
-                        result = await router.handleToolCall(name: toolName, args: input)
-                    } else if let bridge = openClawBridge {
-                        let taskDesc = input["task"] as? String ?? String(describing: input)
-                        result = await bridge.delegateTask(task: taskDesc, toolName: toolName)
-                    } else {
-                        result = .failure("No tool handler available")
-                    }
-                    toolCallStatus = result.isSuccess ? .completed(toolName) : .failed(toolName, "Failed")
-
+                let text = content.compactMap { block -> String? in
+                    guard (block["type"] as? String) == "text" else { return nil }
+                    return block["text"] as? String
+                }.joined(separator: "\n")
+                return AssistantTurn(text: text, toolCalls: toolCalls, payload: content)
+            },
+            appendAssistantToolCall: { [weak self] turn in
+                guard let self, let content = turn.payload as? [[String: Any]] else { return }
+                self.conversationHistory.append(["role": "assistant", "content": content] as [String: Any])
+            },
+            appendToolResults: { [weak self] outcomes in
+                guard let self else { return }
+                for outcome in outcomes {
+                    guard let id = outcome.invocation.id else { continue }
                     let resultContent: String
-                    switch result {
+                    switch outcome.result {
                     case .success(let text): resultContent = text
                     case .failure(let error): resultContent = "Error: \(error)"
                     }
                     // Frame untrusted external content as data, not instructions.
-                    let framedContent = wrapToolResultForModel(toolName: toolName, content: resultContent)
-
-                    conversationHistory.append([
+                    let framed = self.wrapToolResultForModel(toolName: outcome.invocation.name, content: resultContent)
+                    self.conversationHistory.append([
                         "role": "user",
-                        "content": [
-                            [
-                                "type": "tool_result",
-                                "tool_use_id": toolId,
-                                "content": framedContent
-                            ]
-                        ]
+                        "content": [["type": "tool_result", "tool_use_id": id, "content": framed]]
                     ] as [String: Any])
-
-                    // Yield-to-human: break out of the tool loop so the user can act
-                    if toolName == "yield_to_human", case .success(let yieldText) = result,
-                       yieldText.hasPrefix("YIELD_TO_HUMAN:") {
-                        let reason = yieldText
-                            .replacingOccurrences(of: "YIELD_TO_HUMAN: ", with: "")
-                            .replacingOccurrences(of: "\nWaiting for you to say \"done\" or \"continue\" when ready.", with: "")
-                        toolCallStatus = .yielded(toolName)
-                        NSLog("[LLMService] Yielding to human: %@", reason)
-                        return reason
-                    }
                 }
-
-                print("🔄 [Anthropic] Continuing after tool call (iteration \(iteration + 1))")
-                continue // Loop back to get final response
+                for id in state.malformedIds {
+                    self.conversationHistory.append([
+                        "role": "user",
+                        "content": [["type": "tool_result", "tool_use_id": id,
+                                     "content": "Error: malformed tool call (missing name or arguments); nothing was run."]]
+                    ] as [String: Any])
+                }
+            },
+            finalize: { [weak self] turn in
+                guard let self else { throw LLMError.invalidResponse("Anthropic") }
+                guard !turn.text.isEmpty else { throw LLMError.invalidResponse("Anthropic") }
+                self.conversationHistory.append(["role": "assistant", "content": turn.text])
+                return turn.text
             }
+        )
 
-            // No tool calls — extract text response
-            let responseText = content.compactMap { block -> String? in
-                guard let type = block["type"] as? String, type == "text",
-                      let text = block["text"] as? String else { return nil }
-                return text
-            }.joined(separator: "\n")
-
-            guard !responseText.isEmpty else {
-                throw LLMError.invalidResponse("Anthropic")
-            }
-
-            conversationHistory.append(["role": "assistant", "content": responseText])
-            toolCallStatus = .idle
-            return responseText
-        }
-
-        // Exhausted iterations
-        toolCallStatus = .idle
-        throw LLMError.invalidResponse("Anthropic (tool call loop exceeded)")
+        return try await runToolLoop(maxIterations: maxToolCallIterations, adapter: adapter,
+                                     setStatus: { [weak self] in self?.toolCallStatus = $0 })
     }
 
     // MARK: - OpenAI-compatible
 
-    private func sendOpenAICompatible(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data?) async throws -> String {
+    private func sendOpenAICompatible(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data?, onToken: ((String) -> Void)? = nil) async throws -> String {
         let provider = config.llmProvider
         let apiKey = config.apiKey
         guard !apiKey.isEmpty else {
@@ -1393,155 +1397,283 @@ class LLMService: ObservableObject {
         }
         trimHistory()
 
-        for iteration in 0..<maxToolCallIterations {
-            try Task.checkCancellation()
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let adapter = ProviderLoopAdapter(
+            label: provider.displayName,
+            dispatcher: makeToolDispatcher(),
+            performTurn: { [weak self] in
+                guard let self else { throw LLMError.invalidResponse(provider.displayName) }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
-            // OpenRouter requires additional headers for tracking
-            if provider == .openrouter {
-                request.setValue("https://github.com/straff2002/OpenGlasses", forHTTPHeaderField: "HTTP-Referer")
-                request.setValue("OpenGlasses", forHTTPHeaderField: "X-Title")
-            }
-
-            // OpenAI format: system prompt is a message in the array.
-            // Groq's free tier has tight TPM limits — trim history aggressively.
-            let historySlice = provider == .groq ? Array(conversationHistory.suffix(6)) : conversationHistory
-            var messages: [[String: Any]] = [
-                ["role": "system", "content": systemPrompt]
-            ]
-            messages.append(contentsOf: historySlice)
-
-            var body: [String: Any] = [
-                "model": config.model,
-                "max_tokens": includeTools ? 1024 : Config.maxTokens,
-                "messages": messages
-            ]
-
-            // Only attach Tools if the provider reliably supports function calling.
-            // Custom endpoints (Ollama/LMStudio) often crash with 400 if `tools` array is in the payload.
-            let providerSupportsTools = provider == .openai || provider == .groq || provider == .zai || provider == .qwen || provider == .openrouter
-
-            if includeTools && providerSupportsTools {
-                let includeOpenClaw = Config.isOpenClawConfigured && openClawBridge != nil
-                let toolsData: Data = await MainActor.run {
-                    let tools = ToolDeclarations.openAITools(registry: nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: nativeToolRouter?.mcpClient)
-                    return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
+                // OpenRouter requires additional headers for tracking
+                if provider == .openrouter {
+                    request.setValue("https://github.com/straff2002/OpenGlasses", forHTTPHeaderField: "HTTP-Referer")
+                    request.setValue("OpenGlasses", forHTTPHeaderField: "X-Title")
                 }
-                let tools = (try? JSONSerialization.jsonObject(with: toolsData)) as? [[String: Any]] ?? []
-                body["tools"] = tools
-            }
 
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-            request.timeoutInterval = 60 // 60s timeout to prevent app freezing
+                // OpenAI format: system prompt is a message in the array.
+                // Groq's free tier has tight TPM limits — trim history aggressively.
+                let historySlice = provider == .groq ? Array(self.conversationHistory.suffix(6)) : self.conversationHistory
+                var messages: [[String: Any]] = [
+                    ["role": "system", "content": systemPrompt]
+                ]
+                messages.append(contentsOf: historySlice)
 
-            // Debug: log request details (redact base64 images)
-            let messageCount = (body["messages"] as? [[String: Any]])?.count ?? 0
-            let hasImage = imageData != nil && supportsVision
-            let bodySize = request.httpBody?.count ?? 0
-            print("🌐 \(provider.displayName) request: model=\(config.model) url=\(baseURL) messages=\(messageCount) hasImage=\(hasImage) bodySize=\(bodySize)")
+                var body: [String: Any] = [
+                    "model": config.model,
+                    "max_tokens": includeTools ? 1024 : Config.maxTokens,
+                    "messages": messages
+                ]
 
-            let (data, response) = try await URLSession.shared.data(for: request)
+                // Only attach Tools if the provider reliably supports function calling.
+                // Custom endpoints (Ollama/LMStudio) often crash with 400 if `tools` array is in the payload.
+                let providerSupportsTools = provider == .openai || provider == .groq || provider == .zai || provider == .qwen || provider == .openrouter
 
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else {
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                let rawBody = String(data: data, encoding: .utf8) ?? "(non-utf8)"
-                print("❌ \(provider.displayName) raw error response (\(statusCode)): \(rawBody.prefix(500))")
-                if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let errorObj = errorJson["error"] as? [String: Any],
-                   let errorMsg = errorObj["message"] as? String {
-                    print("❌ \(provider.displayName) API error \(statusCode): \(errorMsg)")
-                    throw LLMError.apiError(provider: provider.displayName, statusCode: statusCode, message: errorMsg)
-                }
-                if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let errorMsg = errorJson["error"] as? String {
-                    print("❌ \(provider.displayName) error \(statusCode): \(errorMsg)")
-                    throw LLMError.apiError(provider: provider.displayName, statusCode: statusCode, message: errorMsg)
-                }
-                throw LLMError.apiError(provider: provider.displayName, statusCode: statusCode, message: nil)
-            }
-
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = json["choices"] as? [[String: Any]],
-                  let message = choices.first?["message"] as? [String: Any] else {
-                throw LLMError.invalidResponse(provider.displayName)
-            }
-
-            _ = choices.first?["finish_reason"] as? String
-
-            // Check for tool calls
-            if let toolCalls = message["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty, includeTools {
-                // Add assistant message with tool_calls to history
-                conversationHistory.append(message)
-
-                for toolCall in toolCalls {
-                    guard let callId = toolCall["id"] as? String,
-                          let function = toolCall["function"] as? [String: Any],
-                          let functionName = function["name"] as? String,
-                          let argsString = function["arguments"] as? String else { continue }
-
-                    let args = (try? JSONSerialization.jsonObject(with: Data(argsString.utf8)) as? [String: Any]) ?? [:]
-
-                    print("🔧 [OpenAI] Tool call: \(functionName)(\(String(describing: args).prefix(100))...)")
-                    toolCallStatus = .executing(functionName)
-
-                    let result: ToolResult
-                    if let router = nativeToolRouter {
-                        result = await router.handleToolCall(name: functionName, args: args)
-                    } else if let bridge = openClawBridge {
-                        let taskDesc = args["task"] as? String ?? argsString
-                        result = await bridge.delegateTask(task: taskDesc, toolName: functionName)
-                    } else {
-                        result = .failure("No tool handler available")
+                if includeTools && providerSupportsTools {
+                    let includeOpenClaw = Config.isOpenClawConfigured && self.openClawBridge != nil
+                    let toolsData: Data = await MainActor.run {
+                        let tools = ToolDeclarations.openAITools(registry: self.nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: self.nativeToolRouter?.mcpClient)
+                        return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
                     }
-                    toolCallStatus = result.isSuccess ? .completed(functionName) : .failed(functionName, "Failed")
+                    let tools = (try? JSONSerialization.jsonObject(with: toolsData)) as? [[String: Any]] ?? []
+                    body["tools"] = tools
+                }
 
+                if onToken != nil {
+                    body["stream"] = true
+                    // Ask for a final usage chunk so the streamed path can record cost (Plan AU).
+                    // Servers that don't support it ignore the field; we then simply record nothing.
+                    body["stream_options"] = ["include_usage": true]
+                }
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                request.timeoutInterval = 60 // 60s timeout to prevent app freezing
+
+                // Debug: log request details (redact base64 images)
+                let messageCount = (body["messages"] as? [[String: Any]])?.count ?? 0
+                let hasImage = imageData != nil && supportsVision
+                let bodySize = request.httpBody?.count ?? 0
+                print("🌐 \(provider.displayName) request: model=\(config.model) url=\(baseURL) messages=\(messageCount) hasImage=\(hasImage) bodySize=\(bodySize)")
+
+                // Final-reply turns stream into the Chat tab when a streaming caller passes `onToken`;
+                // the reconstructed `message` (content + tool_calls) feeds the shared tool loop unchanged.
+                let message: [String: Any]
+                if let onToken {
+                    message = try await self.streamOpenAIMessage(request: request, provider: provider, model: config.model, onToken: onToken)
+                } else {
+                    let (data, response) = try await URLSession.shared.data(for: request)
+
+                    guard let httpResponse = response as? HTTPURLResponse,
+                          httpResponse.statusCode == 200 else {
+                        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                        let rawBody = String(data: data, encoding: .utf8) ?? "(non-utf8)"
+                        print("❌ \(provider.displayName) raw error response (\(statusCode)): \(rawBody.prefix(500))")
+                        if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let errorObj = errorJson["error"] as? [String: Any],
+                           let errorMsg = errorObj["message"] as? String {
+                            print("❌ \(provider.displayName) API error \(statusCode): \(errorMsg)")
+                            throw LLMError.apiError(provider: provider.displayName, statusCode: statusCode, message: errorMsg)
+                        }
+                        if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let errorMsg = errorJson["error"] as? String {
+                            print("❌ \(provider.displayName) error \(statusCode): \(errorMsg)")
+                            throw LLMError.apiError(provider: provider.displayName, statusCode: statusCode, message: errorMsg)
+                        }
+                        throw LLMError.apiError(provider: provider.displayName, statusCode: statusCode, message: nil)
+                    }
+
+                    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let choices = json["choices"] as? [[String: Any]],
+                          let m = choices.first?["message"] as? [String: Any] else {
+                        throw LLMError.invalidResponse(provider.displayName)
+                    }
+                    message = m
+                    self.recordUsage(provider: provider, model: config.model, json: json)
+                }
+
+                var toolCalls: [ToolInvocation] = []
+                if includeTools, let calls = message["tool_calls"] as? [[String: Any]] {
+                    for toolCall in calls {
+                        guard let callId = toolCall["id"] as? String,
+                              let function = toolCall["function"] as? [String: Any],
+                              let functionName = function["name"] as? String,
+                              let argsString = function["arguments"] as? String else { continue }
+                        // Malformed tool arguments (Plan BF): nil `arguments` → the dispatcher returns a
+                        // correctable parse error instead of running the tool with empty args.
+                        let parsedArgs = try? JSONSerialization.jsonObject(with: Data(argsString.utf8)) as? [String: Any]
+                        toolCalls.append(ToolInvocation(id: callId, name: functionName,
+                                                        arguments: parsedArgs, rawArguments: argsString))
+                    }
+                }
+                let text = message["content"] as? String ?? ""
+                return AssistantTurn(text: text, toolCalls: toolCalls, payload: message)
+            },
+            appendAssistantToolCall: { [weak self] turn in
+                guard let self, let message = turn.payload as? [String: Any] else { return }
+                self.conversationHistory.append(message)
+            },
+            appendToolResults: { [weak self] outcomes in
+                guard let self else { return }
+                for outcome in outcomes {
+                    guard let callId = outcome.invocation.id else { continue }
                     let resultContent: String
-                    switch result {
+                    switch outcome.result {
                     case .success(let text): resultContent = text
                     case .failure(let error): resultContent = "Error: \(error)"
                     }
                     // Frame untrusted external content as data, not instructions.
-                    let framedContent = wrapToolResultForModel(toolName: functionName, content: resultContent)
-
-                    conversationHistory.append([
+                    let framed = self.wrapToolResultForModel(toolName: outcome.invocation.name, content: resultContent)
+                    self.conversationHistory.append([
                         "role": "tool",
                         "tool_call_id": callId,
-                        "content": framedContent
+                        "content": framed
                     ])
-
-                    // Yield-to-human: break out of the tool loop so the user can act
-                    if functionName == "yield_to_human", case .success(let yieldText) = result,
-                       yieldText.hasPrefix("YIELD_TO_HUMAN:") {
-                        let reason = yieldText
-                            .replacingOccurrences(of: "YIELD_TO_HUMAN: ", with: "")
-                            .replacingOccurrences(of: "\nWaiting for you to say \"done\" or \"continue\" when ready.", with: "")
-                        toolCallStatus = .yielded(functionName)
-                        NSLog("[LLMService] Yielding to human: %@", reason)
-                        return reason
-                    }
                 }
-
-                print("🔄 [OpenAI] Continuing after tool call (iteration \(iteration + 1))")
-                continue // Loop back to get final response
+            },
+            finalize: { [weak self] turn in
+                guard let self else { throw LLMError.invalidResponse(provider.displayName) }
+                guard let message = turn.payload as? [String: Any],
+                      let responseText = message["content"] as? String else {
+                    throw LLMError.invalidResponse(provider.displayName)
+                }
+                self.conversationHistory.append(["role": "assistant", "content": responseText])
+                return responseText
             }
+        )
 
-            // No tool calls — extract text response
-            guard let responseText = message["content"] as? String else {
-                throw LLMError.invalidResponse(provider.displayName)
-            }
+        return try await runToolLoop(maxIterations: maxToolCallIterations, adapter: adapter,
+                                     setStatus: { [weak self] in self?.toolCallStatus = $0 })
+    }
 
-            conversationHistory.append(["role": "assistant", "content": responseText])
-            toolCallStatus = .idle
-            return responseText
+    // MARK: - Streaming (SSE) — Chat tab live token delivery
+
+    /// Stream an OpenAI-compatible chat-completions response, invoking `onToken` for each text
+    /// delta, and return a reconstructed `message` dict (same shape as `choices[].message`) so the
+    /// caller's tool loop runs identically to the buffered path. Only used when a streaming caller
+    /// (the Chat tab) passes `onToken`; every other caller keeps the buffered path.
+    private func streamOpenAIMessage(request: URLRequest, provider: LLMProvider, model: String, onToken: @escaping (String) -> Void) async throws -> [String: Any] {
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw LLMError.invalidResponse(provider.displayName) }
+        guard http.statusCode == 200 else {
+            var data = Data()
+            for try await b in bytes { data.append(b) }
+            let raw = String(data: data, encoding: .utf8) ?? "(non-utf8)"
+            let msg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+                .flatMap { ($0["error"] as? [String: Any])?["message"] as? String }
+            print("❌ \(provider.displayName) stream error \(http.statusCode): \(raw.prefix(300))")
+            throw LLMError.apiError(provider: provider.displayName, statusCode: http.statusCode, message: msg)
         }
 
-        // Exhausted iterations
-        toolCallStatus = .idle
-        throw LLMError.invalidResponse("\(provider.displayName) (tool call loop exceeded)")
+        var fullContent = ""
+        var toolAcc: [Int: (id: String, name: String, args: String)] = [:]  // tool_calls accumulate by index
+        var usage = StreamingUsageAccumulator()   // from the final include_usage chunk
+
+        for try await line in bytes.lines {
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload.isEmpty { continue }
+            if payload == "[DONE]" { break }
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] else { continue }
+            usage.consumeOpenAI(obj)   // the usage chunk has empty choices, so parse it before the guard
+            guard let choice = (obj["choices"] as? [[String: Any]])?.first,
+                  let delta = choice["delta"] as? [String: Any] else { continue }
+
+            if let chunk = delta["content"] as? String, !chunk.isEmpty {
+                fullContent += chunk
+                onToken(chunk)
+            }
+            if let calls = delta["tool_calls"] as? [[String: Any]] {
+                for call in calls {
+                    let idx = call["index"] as? Int ?? 0
+                    var entry = toolAcc[idx] ?? (id: "", name: "", args: "")
+                    if let id = call["id"] as? String { entry.id = id }
+                    if let fn = call["function"] as? [String: Any] {
+                        if let n = fn["name"] as? String { entry.name = n }
+                        if let a = fn["arguments"] as? String { entry.args += a }
+                    }
+                    toolAcc[idx] = entry
+                }
+            }
+        }
+
+        recordUsage(provider: provider, model: model, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut)
+
+        var message: [String: Any] = ["role": "assistant", "content": fullContent]
+        if !toolAcc.isEmpty {
+            message["tool_calls"] = toolAcc.sorted { $0.key < $1.key }.map { _, v in
+                ["id": v.id, "type": "function", "function": ["name": v.name, "arguments": v.args]] as [String: Any]
+            }
+        }
+        return message
+    }
+
+    /// Stream an Anthropic Messages response, invoking `onToken` for each text delta, and return
+    /// the reconstructed content blocks + stop reason so the caller's tool loop runs identically to
+    /// the buffered path. Only used when a streaming caller (the Chat tab) passes `onToken`.
+    private func streamAnthropicContent(request: URLRequest, model: String, onToken: @escaping (String) -> Void) async throws -> (content: [[String: Any]], stopReason: String?) {
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw LLMError.invalidResponse("Anthropic") }
+        guard http.statusCode == 200 else {
+            var data = Data()
+            for try await b in bytes { data.append(b) }
+            let msg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+                .flatMap { ($0["error"] as? [String: Any])?["message"] as? String }
+            throw LLMError.apiError(provider: "Anthropic", statusCode: http.statusCode, message: msg)
+        }
+
+        var blocks: [Int: [String: Any]] = [:]   // content blocks by index
+        var toolJSON: [Int: String] = [:]         // accumulated input_json per tool_use block
+        var stopReason: String?
+        var usage = StreamingUsageAccumulator()   // input from message_start, output from message_delta
+
+        for try await line in bytes.lines {
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload.isEmpty { continue }
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any],
+                  let type = obj["type"] as? String else { continue }
+            usage.consumeAnthropic(obj)
+
+            switch type {
+            case "content_block_start":
+                let idx = obj["index"] as? Int ?? 0
+                if let cb = obj["content_block"] as? [String: Any] {
+                    blocks[idx] = cb
+                    if (cb["type"] as? String) == "tool_use" { toolJSON[idx] = "" }
+                }
+            case "content_block_delta":
+                let idx = obj["index"] as? Int ?? 0
+                if let delta = obj["delta"] as? [String: Any], let dtype = delta["type"] as? String {
+                    if dtype == "text_delta", let t = delta["text"] as? String {
+                        var b = blocks[idx] ?? ["type": "text", "text": ""]
+                        b["text"] = ((b["text"] as? String) ?? "") + t
+                        blocks[idx] = b
+                        onToken(t)
+                    } else if dtype == "input_json_delta", let pj = delta["partial_json"] as? String {
+                        toolJSON[idx, default: ""] += pj
+                    }
+                }
+            case "message_delta":
+                if let delta = obj["delta"] as? [String: Any], let sr = delta["stop_reason"] as? String {
+                    stopReason = sr
+                }
+            default:
+                break
+            }
+        }
+
+        // Finalize tool_use blocks: parse the accumulated partial JSON into `input`.
+        for (idx, jsonStr) in toolJSON {
+            guard var b = blocks[idx] else { continue }
+            b["input"] = (try? JSONSerialization.jsonObject(with: Data(jsonStr.utf8)) as? [String: Any]) ?? [:]
+            blocks[idx] = b
+        }
+
+        recordUsage(provider: .anthropic, model: model, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut)
+
+        let content = blocks.sorted { $0.key < $1.key }.map { $0.value }
+        return (content, stopReason)
     }
 
     // MARK: - Google Gemini
@@ -1571,186 +1703,126 @@ class LLMService: ObservableObject {
         }
         trimHistory()
 
-        for iteration in 0..<maxToolCallIterations {
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let adapter = ProviderLoopAdapter(
+            label: "Gemini",
+            dispatcher: makeToolDispatcher(),
+            performTurn: { [weak self] in
+                guard let self else { throw LLMError.invalidResponse("Gemini") }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-            // Gemini format: system instruction + contents array
-            var contents: [[String: Any]] = []
-            for msg in conversationHistory {
-                let role = msg["role"] as? String ?? "user"
-                if role == "user" || role == "model" {
-                    let geminiRole = role == "assistant" ? "model" : role
-                    if let textContent = msg["content"] as? String {
-                        contents.append([
-                            "role": geminiRole,
-                            "parts": [["text": textContent]]
-                        ])
-                    } else if let parts = msg["parts"] as? [[String: Any]] {
-                        contents.append([
-                            "role": geminiRole,
-                            "parts": parts
-                        ])
-                    }
-                } else if role == "assistant" {
-                    if let textContent = msg["content"] as? String {
-                        contents.append([
-                            "role": "model",
-                            "parts": [["text": textContent]]
-                        ])
-                    } else if let parts = msg["parts"] as? [[String: Any]] {
-                        contents.append([
-                            "role": "model",
-                            "parts": parts
-                        ])
-                    }
-                } else if role == "function" {
-                    // Function response
-                    if let parts = msg["parts"] as? [[String: Any]] {
-                        contents.append([
-                            "role": "user",
-                            "parts": parts
-                        ])
+                // Gemini format: system instruction + contents array
+                var contents: [[String: Any]] = []
+                for msg in self.conversationHistory {
+                    let role = msg["role"] as? String ?? "user"
+                    if role == "user" || role == "model" {
+                        let geminiRole = role == "assistant" ? "model" : role
+                        if let textContent = msg["content"] as? String {
+                            contents.append(["role": geminiRole, "parts": [["text": textContent]]])
+                        } else if let parts = msg["parts"] as? [[String: Any]] {
+                            contents.append(["role": geminiRole, "parts": parts])
+                        }
+                    } else if role == "assistant" {
+                        if let textContent = msg["content"] as? String {
+                            contents.append(["role": "model", "parts": [["text": textContent]]])
+                        } else if let parts = msg["parts"] as? [[String: Any]] {
+                            contents.append(["role": "model", "parts": parts])
+                        }
+                    } else if role == "function" {
+                        // Function response
+                        if let parts = msg["parts"] as? [[String: Any]] {
+                            contents.append(["role": "user", "parts": parts])
+                        }
                     }
                 }
-            }
 
-            var body: [String: Any] = [
-                "system_instruction": [
-                    "parts": [["text": systemPrompt]]
-                ],
-                "contents": contents,
-                "generationConfig": [
-                    "maxOutputTokens": includeTools ? 1024 : Config.maxTokens
+                var body: [String: Any] = [
+                    "system_instruction": ["parts": [["text": systemPrompt]]],
+                    "contents": contents,
+                    "generationConfig": ["maxOutputTokens": includeTools ? 1024 : Config.maxTokens]
                 ]
-            ]
 
-            if includeTools {
-                let includeOpenClaw = Config.isOpenClawConfigured && openClawBridge != nil
-                let toolsData: Data = await MainActor.run {
-                    let tools = ToolDeclarations.geminiRESTTools(registry: nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: nativeToolRouter?.mcpClient)
-                    return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
-                }
-                let tools = (try? JSONSerialization.jsonObject(with: toolsData)) as? [[String: Any]] ?? []
-                body["tools"] = tools
-            }
-
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else {
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let errorObj = errorJson["error"] as? [String: Any],
-                   let errorMsg = errorObj["message"] as? String {
-                    print("❌ Gemini API error \(statusCode): \(errorMsg)")
-                    throw LLMError.apiError(provider: "Gemini", statusCode: statusCode, message: errorMsg)
-                }
-                throw LLMError.apiError(provider: "Gemini", statusCode: statusCode, message: nil)
-            }
-
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let candidates = json["candidates"] as? [[String: Any]],
-                  let content = candidates.first?["content"] as? [String: Any],
-                  let parts = content["parts"] as? [[String: Any]] else {
-                throw LLMError.invalidResponse("Gemini")
-            }
-
-            // Check for function calls in parts
-            let functionCallParts = parts.filter { $0["functionCall"] != nil }
-
-            if !functionCallParts.isEmpty, includeTools {
-                // Add model response with function call to history
-                conversationHistory.append([
-                    "role": "assistant",
-                    "parts": parts
-                ])
-
-                var functionResponseParts: [[String: Any]] = []
-
-                for part in functionCallParts {
-                    guard let funcCall = part["functionCall"] as? [String: Any],
-                          let name = funcCall["name"] as? String,
-                          let args = funcCall["args"] as? [String: Any] else { continue }
-
-                    print("🔧 [Gemini] Tool call: \(name)(\(String(describing: args).prefix(100))...)")
-                    toolCallStatus = .executing(name)
-
-                    let result: ToolResult
-                    if let router = nativeToolRouter {
-                        result = await router.handleToolCall(name: name, args: args)
-                    } else if let bridge = openClawBridge {
-                        let taskDesc = args["task"] as? String ?? String(describing: args)
-                        result = await bridge.delegateTask(task: taskDesc, toolName: name)
-                    } else {
-                        result = .failure("No tool handler available")
+                if includeTools {
+                    let includeOpenClaw = Config.isOpenClawConfigured && self.openClawBridge != nil
+                    let toolsData: Data = await MainActor.run {
+                        let tools = ToolDeclarations.geminiRESTTools(registry: self.nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: self.nativeToolRouter?.mcpClient)
+                        return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
                     }
-                    toolCallStatus = result.isSuccess ? .completed(name) : .failed(name, "Failed")
+                    let tools = (try? JSONSerialization.jsonObject(with: toolsData)) as? [[String: Any]] ?? []
+                    body["tools"] = tools
+                }
 
-                    // Frame untrusted external content as data, not instructions.
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+                let (data, response) = try await URLSession.shared.data(for: request)
+
+                guard let httpResponse = response as? HTTPURLResponse,
+                      httpResponse.statusCode == 200 else {
+                    let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let errorObj = errorJson["error"] as? [String: Any],
+                       let errorMsg = errorObj["message"] as? String {
+                        print("❌ Gemini API error \(statusCode): \(errorMsg)")
+                        throw LLMError.apiError(provider: "Gemini", statusCode: statusCode, message: errorMsg)
+                    }
+                    throw LLMError.apiError(provider: "Gemini", statusCode: statusCode, message: nil)
+                }
+
+                guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let candidates = json["candidates"] as? [[String: Any]],
+                      let content = candidates.first?["content"] as? [String: Any],
+                      let parts = content["parts"] as? [[String: Any]] else {
+                    throw LLMError.invalidResponse("Gemini")
+                }
+                self.recordUsage(provider: .gemini, model: config.model, json: json)
+
+                var toolCalls: [ToolInvocation] = []
+                if includeTools {
+                    for part in parts where part["functionCall"] != nil {
+                        guard let funcCall = part["functionCall"] as? [String: Any],
+                              let name = funcCall["name"] as? String,
+                              let args = funcCall["args"] as? [String: Any] else { continue }
+                        toolCalls.append(ToolInvocation(id: nil, name: name, arguments: args))
+                    }
+                }
+                let text = parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
+                return AssistantTurn(text: text, toolCalls: toolCalls, payload: parts)
+            },
+            appendAssistantToolCall: { [weak self] turn in
+                guard let self, let parts = turn.payload as? [[String: Any]] else { return }
+                self.conversationHistory.append(["role": "assistant", "parts": parts])
+            },
+            appendToolResults: { [weak self] outcomes in
+                guard let self else { return }
+                // Gemini batches all function responses into one `function` message.
+                var functionResponseParts: [[String: Any]] = []
+                for outcome in outcomes {
+                    let name = outcome.invocation.name
                     let resultContent: [String: Any]
-                    switch result {
+                    switch outcome.result {
                     case .success(let text):
-                        resultContent = ["result": wrapToolResultForModel(toolName: name, content: text)]
+                        // Frame untrusted external content as data, not instructions.
+                        resultContent = ["result": self.wrapToolResultForModel(toolName: name, content: text)]
                     case .failure(let error):
                         resultContent = ["error": error]
                     }
-
                     functionResponseParts.append([
-                        "functionResponse": [
-                            "name": name,
-                            "response": resultContent
-                        ]
+                        "functionResponse": ["name": name, "response": resultContent]
                     ])
                 }
-
-                // Add function responses as user role
-                conversationHistory.append([
-                    "role": "function",
-                    "parts": functionResponseParts
-                ])
-
-                // Yield-to-human: break out of the tool loop so the user can act
-                if functionCallParts.contains(where: {
-                    ($0["functionCall"] as? [String: Any])?["name"] as? String == "yield_to_human"
-                }) {
-                    if let yieldResponse = functionResponseParts.first(where: {
-                        ($0["functionResponse"] as? [String: Any])?["name"] as? String == "yield_to_human"
-                    }),
-                       let response = (yieldResponse["functionResponse"] as? [String: Any])?["response"] as? [String: Any],
-                       let yieldText = response["result"] as? String,
-                       yieldText.hasPrefix("YIELD_TO_HUMAN:") {
-                        let reason = yieldText
-                            .replacingOccurrences(of: "YIELD_TO_HUMAN: ", with: "")
-                            .replacingOccurrences(of: "\nWaiting for you to say \"done\" or \"continue\" when ready.", with: "")
-                        toolCallStatus = .yielded("yield_to_human")
-                        NSLog("[LLMService] Yielding to human: %@", reason)
-                        return reason
-                    }
-                }
-
-                print("🔄 [Gemini] Continuing after tool call (iteration \(iteration + 1))")
-                continue // Loop back to get final response
+                self.conversationHistory.append(["role": "function", "parts": functionResponseParts])
+            },
+            finalize: { [weak self] turn in
+                guard let self else { throw LLMError.invalidResponse("Gemini") }
+                guard !turn.text.isEmpty else { throw LLMError.invalidResponse("Gemini") }
+                self.conversationHistory.append(["role": "assistant", "content": turn.text])
+                return turn.text
             }
+        )
 
-            // No function calls — extract text response
-            let responseText = parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
-
-            guard !responseText.isEmpty else {
-                throw LLMError.invalidResponse("Gemini")
-            }
-
-            conversationHistory.append(["role": "assistant", "content": responseText])
-            toolCallStatus = .idle
-            return responseText
-        }
-
-        // Exhausted iterations
-        toolCallStatus = .idle
-        throw LLMError.invalidResponse("Gemini (tool call loop exceeded)")
+        return try await runToolLoop(maxIterations: maxToolCallIterations, adapter: adapter,
+                                     setStatus: { [weak self] in self?.toolCallStatus = $0 })
     }
 
     // MARK: - Local (On-Device MLX)
@@ -1794,12 +1866,31 @@ class LLMService: ObservableObject {
             appleSession = LanguageModelSession(instructions: systemPrompt)
         }
 
-        let response = try await appleSession!.respond(to: text)
-        return response.content
+        let session = appleSession!
+        let response = try await session.respond(to: text)
+
+        // Uncertainty gate (Plan BI): no tool channel is wired on the Apple on-device path, so a
+        // hedged or freshness-sensitive answer gets one transparent web-grounded re-ask.
+        var answer = response.content
+        if Config.localWebSearchFallbackEnabled,
+           UncertaintyDetector.assess(question: text, answer: answer).shouldSearch {
+            answer = await UncertaintyReask.answer(
+                question: text,
+                originalAnswer: answer,
+                search: { query in try await WebSearchTool().execute(args: ["query": query]) },
+                regenerate: { grounding in try await session.respond(to: grounding).content }
+            )
+        }
+        return answer
     }
     #endif
 
-    private func sendLocal(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data? = nil) async throws -> String {
+    // Unlike the cloud providers, the on-device path is deliberately NOT on the shared `runToolLoop`
+    // driver (Plan BG P3). On-device models don't expose a structured tool-use API — they emit
+    // `<tool_call>` markup — so this path is single-shot with a reduced tool set and one optional
+    // re-generation, not an iterate-until-done loop. Routing it through the iterative driver would
+    // change its behaviour, which the refactor explicitly avoids.
+    private func sendLocal(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data? = nil, onToken: ((String) -> Void)? = nil) async throws -> String {
         guard let localService = localLLMService else {
             throw LLMError.missingAPIKey("Local LLM service not initialized")
         }
@@ -1849,13 +1940,17 @@ class LLMService: ObservableObject {
         conversationHistory.append(["role": "user", "content": text])
         trimHistory()
 
-        // Generate response
+        // Generate response. Stream tokens to the UI as they're produced. In the (rare, the local
+        // tool prompt says "use sparingly") case where the model emits a <tool_call>, the preview
+        // briefly shows the markup before the cleaned final reply replaces it — acceptable for the
+        // common no-tool path, which streams cleanly.
         let response: String
         do {
             response = try await localService.generate(
                 userMessage: text,
                 systemPrompt: fullPrompt,
-                history: history
+                history: history,
+                onToken: onToken
             )
         } catch let error as LocalLLMError {
             // Propagate .backgrounded unwrapped so callers (e.g. AgentScheduler) can
@@ -1926,9 +2021,30 @@ class LLMService: ObservableObject {
         let cleanResponse = response
             .replacingOccurrences(of: #"<tool_call>.*?</tool_call>"#, with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        conversationHistory.append(["role": "assistant", "content": cleanResponse])
+
+        // Uncertainty gate (Plan BI): the local path can't reach `web_search` through a tool
+        // loop, so a hedged or freshness-sensitive answer gets one transparent web-grounded
+        // re-ask. Off-flag or confident answers pass straight through.
+        var finalAnswer = cleanResponse
+        if Config.localWebSearchFallbackEnabled,
+           UncertaintyDetector.assess(question: text, answer: cleanResponse).shouldSearch {
+            finalAnswer = await UncertaintyReask.answer(
+                question: text,
+                originalAnswer: cleanResponse,
+                search: { query in try await WebSearchTool().execute(args: ["query": query]) },
+                regenerate: { grounding in
+                    try await localService.generate(
+                        userMessage: grounding,
+                        systemPrompt: fullPrompt,
+                        history: history
+                    )
+                }
+            )
+        }
+
+        conversationHistory.append(["role": "assistant", "content": finalAnswer])
         trimHistory()
-        return cleanResponse
+        return finalAnswer
     }
 
     // MARK: - Local Agent Model
@@ -1938,28 +2054,35 @@ class LLMService: ObservableObject {
     /// Builds its own lightweight prompt and routes through sendLocal().
     func sendViaLocalAgent(_ text: String, locationContext: String? = nil, memoryContext: String? = nil) async throws -> String {
         let agentModelId = Config.agentModelId
-
         let hasNativeTools = nativeToolRouter != nil
-        let nativeToolNames = nativeToolRouter?.registry.toolNames ?? []
-        let fullPrompt = await Self.buildSystemPrompt(
-            locationContext: locationContext,
-            includeTools: hasNativeTools,
-            includeOpenClaw: false,
-            hasImage: false,
-            nativeToolNames: nativeToolNames,
-            memoryContext: memoryContext
-        )
 
-        // If a cloud model config is selected as the agent, route through it
+        // Cloud agent: build the full tool-laden system prompt — cloud models handle a large
+        // context and tool-call natively.
         if let cloudConfig = Config.savedModels.first(where: { $0.id == agentModelId }) {
+            let nativeToolNames = nativeToolRouter?.registry.toolNames ?? []
+            let nativeToolDescriptions = nativeToolRouter?.registry.toolDescriptions(for: nativeToolNames) ?? []
+            let fullPrompt = await Self.buildSystemPrompt(
+                locationContext: locationContext,
+                includeTools: hasNativeTools,
+                includeOpenClaw: false,
+                hasImage: false,
+                nativeToolNames: nativeToolNames,
+                nativeToolDescriptions: nativeToolDescriptions,
+                memoryContext: memoryContext,
+                turn: text
+            )
             print("🧠 Cloud agent: \(cloudConfig.name)")
             return try await sendCloud(text, systemPrompt: fullPrompt, config: cloudConfig, includeTools: hasNativeTools)
         }
 
-        // Otherwise use the local on-device model
+        // On-device agent: build a LEAN prompt (shared with the active-model path) — omits the
+        // ~100 native-tool descriptions (~8k tokens) that OOM-crash a 2B model on a phone.
+        // `sendLocal` appends its own reduced ~12-tool block, so the model still has usable tools.
         guard let localService = localLLMService else {
             throw LLMError.missingAPIKey("Local LLM service not initialized")
         }
+        let leanPrompt = await Self.leanOnDevicePrompt(
+            locationContext: locationContext, memoryContext: memoryContext, hasImage: false, turn: text)
         if !localService.isModelLoaded || localService.loadedModelId != agentModelId {
             try await localService.loadModel(agentModelId)
         }
@@ -1972,7 +2095,7 @@ class LLMService: ObservableObject {
             baseURL: ""
         )
         print("🧠 Local agent: \(agentModelId)")
-        return try await sendLocal(text, systemPrompt: fullPrompt, config: localConfig, includeTools: hasNativeTools)
+        return try await sendLocal(text, systemPrompt: leanPrompt, config: localConfig, includeTools: hasNativeTools)
     }
 
     // MARK: - Helpers

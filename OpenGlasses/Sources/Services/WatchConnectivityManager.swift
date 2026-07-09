@@ -57,6 +57,7 @@ class WatchConnectivityManager: NSObject, ObservableObject {
             "isProcessing": appState.isProcessing,
             "isListening": appState.isListening,
             "isRecording": appState.transcriptionService.isRecording,
+            "isVideoRecording": appState.videoRecorder.isRecording,
             "lastResponse": String(appState.lastResponse.prefix(200)),
             "deviceName": appState.glassesService.deviceName ?? "",
             "batteryLevel": appState.glassesService.batteryLevel ?? 0,
@@ -133,6 +134,9 @@ extension WatchConnectivityManager: WCSessionDelegate {
                 // injected into the caption stream.
                 await appState.capturePhotoSilently()
 
+            case "toggleVideo":
+                await appState.toggleRecording()
+
             default:
                 NSLog("[WatchConn] Unknown userInfo command: %@", command)
             }
@@ -193,6 +197,20 @@ extension WatchConnectivityManager: WCSessionDelegate {
                 replyHandler([
                     "status": "completed",
                     "response": appState.lastResponse
+                ])
+
+            case "capturePhoto":
+                // Silent glasses photo — no LLM, no TTS. Saved to Documents/Photos/ with a
+                // timestamped caption note. Transcription/listening keep running.
+                await appState.capturePhotoSilently()
+                replyHandler(["status": "captured"])
+
+            case "toggleVideo":
+                // Start/stop glasses video recording. Reflect the new state back to the Watch.
+                await appState.toggleRecording()
+                replyHandler([
+                    "status": appState.videoRecorder.isRecording ? "recording" : "stopped",
+                    "isVideoRecording": appState.videoRecorder.isRecording
                 ])
 
             case "connect":

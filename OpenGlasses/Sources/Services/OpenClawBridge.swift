@@ -296,11 +296,13 @@ class OpenClawBridge: ObservableObject {
             .replacingOccurrences(of: "http://", with: "ws://")
         let token = activeToken
 
-        guard let url = URL(string: "\(wsURL)/ws?token=\(token)") else {
+        // Token is presented in the `connect` handshake below, not in the URL query string —
+        // this keeps the credential out of device, proxy, and server access logs.
+        guard let url = URL(string: "\(wsURL)/ws") else {
             throw NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid WebSocket URL"])
         }
 
-        NSLog("[OpenClaw] WS connecting to %@", url.absoluteString)
+        NSLog("[OpenClaw] WS connecting to %@", LogRedaction.redact(url.absoluteString))
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         wsSession = URLSession(configuration: config)
@@ -311,35 +313,36 @@ class OpenClawBridge: ObservableObject {
         webSocketTask = wsSession?.webSocketTask(with: request)
         webSocketTask?.resume()
 
-        // Wait for connect.challenge
+        // Wait for connect.challenge and pull its nonce — signing it into the device-identity
+        // block is what earns real scopes on remote gateways (token-only can be zero-scoped).
         let challengeMsg = try await receiveMessage()
         NSLog("[OpenClaw] WS received: %@", String(challengeMsg.prefix(100)))
+        var challengeNonce: String?
+        if let data = challengeMsg.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let payload = json["payload"] as? [String: Any] {
+            challengeNonce = payload["nonce"] as? String
+        }
 
-        // Send connect handshake — register as "node" with device capabilities
+        // Send connect handshake — register as "node" via the shared params builder (protocol
+        // v3/v4, role/scopes, capability advertisement, signed device identity when challenged).
         let connectId = UUID().uuidString
         let connectMsg: [String: Any] = [
             "type": "req",
             "id": connectId,
             "method": "connect",
-            "params": [
-                "minProtocol": 3,
-                "maxProtocol": 3,
-                "client": [
-                    "id": "gateway-client",
-                    "displayName": "OpenGlasses",
-                    "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
-                    "platform": "ios",
-                    "mode": "node"
-                ] as [String: Any],
-                "auth": [
-                    "token": token
-                ]
-            ] as [String: Any]
+            "params": OpenClawConnectParams.build(
+                clientId: "gateway-client",
+                displayName: "OpenGlasses",
+                version: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
+                token: token,
+                challengeNonce: challengeNonce
+            )
         ]
 
         let connectData = try JSONSerialization.data(withJSONObject: connectMsg)
         let connectJSON = String(data: connectData, encoding: .utf8)!
-        NSLog("[OpenClawWS] Sending connect: %@", String(connectJSON.prefix(500)))
+        NSLog("[OpenClawWS] Sending connect: %@", LogRedaction.redact(String(connectJSON.prefix(500))))
         try await webSocketTask!.send(.string(connectJSON))
 
         // Wait for connect response

@@ -17,6 +17,14 @@ struct ConversationMessage: Codable, Identifiable {
     }
 }
 
+/// An assistant reply currently being streamed into a specific thread. Render-only — the
+/// persisted `ConversationMessage` is still appended on completion. `threadId` keys the live
+/// bubble to its thread so a reply never renders in the wrong conversation.
+struct StreamingTurn: Equatable {
+    let threadId: String
+    var text: String
+}
+
 /// A conversation thread with metadata.
 struct ConversationThread: Codable, Identifiable {
     let id: String
@@ -29,8 +37,11 @@ struct ConversationThread: Codable, Identifiable {
     /// LLM-generated summary of compressed messages. Prepended on session resume
     /// so the AI retains context from earlier in the conversation.
     var compressedSummary: String?
+    /// Project (Persona) this thread belongs to, or `nil` for legacy/global threads
+    /// (Plan AN). Optional so older persisted threads decode unchanged.
+    var personaId: String?
 
-    init(mode: String, title: String = "New Conversation") {
+    init(mode: String, title: String = "New Conversation", personaId: String? = nil) {
         self.id = UUID().uuidString
         self.title = title
         self.summary = nil
@@ -39,6 +50,7 @@ struct ConversationThread: Codable, Identifiable {
         self.updatedAt = Date()
         self.mode = mode
         self.compressedSummary = nil
+        self.personaId = personaId
     }
 }
 
@@ -69,8 +81,18 @@ class ConversationStore: ObservableObject {
     /// Key for persisting the active thread ID across restarts.
     private static let activeThreadKey = "conversationStore_activeThreadId"
 
-    init() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+    /// True after a read failure on an existing conversations file (e.g. file protection while
+    /// locked): the on-disk data may be intact, so saves are suppressed until a load succeeds.
+    private var saveBlocked = false
+
+    /// Serializes encrypted saves so an older snapshot can never finish after — and overwrite —
+    /// a newer one.
+    private var pendingSaveTask: Task<Void, Never>?
+
+    /// `directory` is injectable so tests can point at a temp folder instead of the app's documents.
+    init(directory: URL? = nil) {
+        let docs = directory
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         storageURL = docs.appendingPathComponent("conversations.json")
         loadThreads()
         restoreActiveSession()
@@ -109,15 +131,35 @@ class ConversationStore: ObservableObject {
 
     /// Start a new conversation thread.
     @discardableResult
-    func startThread(mode: String) -> ConversationThread {
-        let thread = ConversationThread(mode: mode)
+    func startThread(mode: String, personaId: String? = nil) -> ConversationThread {
+        let thread = ConversationThread(mode: mode, personaId: personaId)
         threads.insert(thread, at: 0)
         activeThreadId = thread.id
         trimOldThreads()
         save()
         persistActiveSession()
-        NSLog("[ConversationStore] Started thread %@", thread.id)
+        NSLog("[ConversationStore] Started thread %@ (project %@)", thread.id, personaId ?? "global")
         return thread
+    }
+
+    /// Threads belonging to a given project (Persona), newest-first (Plan AN).
+    /// Pass `nil` to get every thread (the "All" view). A non-nil id matches only
+    /// threads explicitly tagged with it — legacy/global threads (`personaId == nil`)
+    /// are excluded from a specific project's list.
+    func threads(forPersona personaId: String?) -> [ConversationThread] {
+        guard let personaId else { return threads }
+        return threads.filter { $0.personaId == personaId }
+    }
+
+    /// The most recent completed exchange in the active thread — the last assistant
+    /// reply and the user prompt that preceded it (Plan AW user-correction signal).
+    /// `nil` when there's no assistant turn yet.
+    func lastExchange() -> (prompt: String, response: String)? {
+        guard let thread = threads.first(where: { $0.id == activeThreadId }) else { return nil }
+        let msgs = thread.messages
+        guard let assistantIdx = msgs.lastIndex(where: { $0.role == "assistant" }) else { return nil }
+        let prompt = msgs[..<assistantIdx].last(where: { $0.role == "user" })?.content ?? ""
+        return (prompt, msgs[assistantIdx].content)
     }
 
     /// Append a message to the active thread.
@@ -177,6 +219,17 @@ class ConversationStore: ObservableObject {
         NSLog("[ConversationStore] Ended thread")
     }
 
+    /// Give a still-default thread a title derived from its first user message. Safe to call
+    /// repeatedly — it only acts while the title is the placeholder. Used by the live Chat tab,
+    /// which never calls `endThread()` (the thread stays open as the user keeps chatting).
+    func applyAutoTitleIfNeeded(_ threadId: String) {
+        guard let idx = threads.firstIndex(where: { $0.id == threadId }),
+              threads[idx].title == "New Conversation",
+              let firstUser = threads[idx].messages.first(where: { $0.role == "user" }) else { return }
+        threads[idx].title = Self.generateTitle(from: firstUser.content)
+        save()
+    }
+
     // MARK: - Recency (one-shot entry points like Siri)
 
     /// True when `last` is within `window` seconds of `now`. Pure — unit-testable
@@ -229,6 +282,16 @@ class ConversationStore: ObservableObject {
     func deleteThread(_ threadId: String) {
         threads.removeAll { $0.id == threadId }
         if activeThreadId == threadId { activeThreadId = nil }
+        save()
+    }
+
+    /// Remove the message with `messageId` and every message after it in the thread. Used by the
+    /// Chat tab's edit/regenerate, which truncate the thread back to a point and resend from there.
+    func truncate(from messageId: String, in threadId: String) {
+        guard let tIdx = threads.firstIndex(where: { $0.id == threadId }),
+              let mIdx = threads[tIdx].messages.firstIndex(where: { $0.id == messageId }) else { return }
+        threads[tIdx].messages.removeSubrange(mIdx...)
+        threads[tIdx].updatedAt = Date()
         save()
     }
 
@@ -350,7 +413,7 @@ class ConversationStore: ObservableObject {
             if FileManager.default.fileExists(atPath: storageURL.path),
                encryption.isFileEncrypted(at: storageURL) {
                 let plaintext = try await encryption.decryptFile(at: storageURL)
-                try plaintext.write(to: storageURL, options: .atomic)
+                try plaintext.write(to: storageURL, options: [.atomic, .completeFileProtection])
             }
             await encryption.deleteKey()
             Config.setConversationEncryptionEnabled(false)
@@ -390,25 +453,41 @@ class ConversationStore: ObservableObject {
     // MARK: - Persistence
 
     private func save() {
+        // While locked, `threads` is deliberately empty (or a lone session started pre-unlock) —
+        // writing now would encrypt that over the user's full history. Same for the async
+        // encrypted-load window, which also runs with `isLocked == true`.
+        guard !isLocked else {
+            NSLog("[ConversationStore] Save skipped — store is locked")
+            return
+        }
+        // After a failed read of an existing file, the on-disk data may be intact — never write.
+        guard !saveBlocked else {
+            NSLog("[ConversationStore] Save skipped — last load failed to read the existing file")
+            return
+        }
         do {
             let data = try JSONEncoder().encode(threads)
 
             if encryption.isEnabled {
-                // Encrypt async on background, write result
+                // Encrypt async on background, write result. Chained on the previous save so
+                // writes land in submission order.
                 let url = storageURL
                 let enc = encryption
-                Task {
+                pendingSaveTask = Task { [previous = pendingSaveTask] in
+                    await previous?.value
                     do {
                         let encrypted = try await enc.encrypt(data)
                         var output = Data("OGENC1".utf8)
                         output.append(encrypted)
-                        try output.write(to: url, options: .atomic)
+                        try output.write(to: url, options: [.atomic, .completeFileProtection])
                     } catch {
                         NSLog("[ConversationStore] Encrypted save failed: %@", error.localizedDescription)
                     }
                 }
             } else {
-                try data.write(to: storageURL, options: .atomic)
+                // Conversation history can hold sensitive content — encrypt at rest even when
+                // the optional biometric encryption layer is off.
+                try data.write(to: storageURL, options: [.atomic, .completeFileProtection])
             }
         } catch {
             NSLog("[ConversationStore] Save failed: %@", error.localizedDescription)
@@ -438,12 +517,23 @@ class ConversationStore: ObservableObject {
             return
         }
 
-        do {
-            let data = try Data(contentsOf: storageURL)
-            threads = try JSONDecoder().decode([ConversationThread].self, from: data)
-            NSLog("[ConversationStore] Loaded %d threads", threads.count)
-        } catch {
-            NSLog("[ConversationStore] Load failed: %@", error.localizedDescription)
+        switch JSONStore.loadArray(ConversationThread.self, at: storageURL, name: "conversations") {
+        case .loaded(let decoded):
+            threads = decoded
+            saveBlocked = false
+            NSLog("[ConversationStore] Loaded %d threads", decoded.count)
+        case .recovered(let decoded, _):
+            threads = decoded
+            saveBlocked = false
+            NSLog("[ConversationStore] Recovered %d threads (original blob backed up)", decoded.count)
+        case .corrupt:
+            // Original preserved in StoreRecovery — start fresh rather than crash-loop.
+            threads = []
+            saveBlocked = false
+        case .unreadable:
+            saveBlocked = true
+        case .absent:
+            break
         }
     }
 

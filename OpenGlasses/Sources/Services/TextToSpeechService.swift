@@ -102,15 +102,25 @@ class TextToSpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
     /// and the selector falls through to ElevenLabs/AVSpeech exactly as before.
     let kokoroEngine = KokoroTTSEngine()
 
+    /// Coexisting hold with the audio-session coordinator for the span of TTS playback. TTS is an
+    /// output rider under the current owner (it ducks other apps via `pauseOtherAudio`, it doesn't
+    /// own the mic), so it registers as non-exclusive — never preempting or deactivating the session.
+    private var coexistToken: UUID?
+
     private func beginPause() {
         guard !didHoldPause else { return }
         wakeWordService?.pauseOtherAudio()
+        coexistToken = AudioSessionCoordinator.shared.beginCoexisting(.textToSpeech)
         didHoldPause = true
     }
 
     private func endPause() {
         guard didHoldPause else { return }
         didHoldPause = false
+        if let token = coexistToken {
+            coexistToken = nil
+            AudioSessionCoordinator.shared.endCoexisting(token)
+        }
         wakeWordService?.resumeOtherAudio()
     }
 
@@ -755,8 +765,8 @@ class TextToSpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
 
             // Soft ambient breath every 2 seconds
             thinkingPlayer?.play()
-            thinkingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
-                Task { @MainActor [weak self] in
+            thinkingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                Task { @MainActor in
                     self?.thinkingPlayer?.currentTime = 0
                     self?.thinkingPlayer?.play()
                 }

@@ -34,6 +34,15 @@ class OpenAIRealtimeService: ObservableObject {
     private let maxReconnectAttempts = 10
     private let maxBackoffSeconds: Double = 30
     private var reconnectTask: Task<Void, Never>?
+    /// Coalesces duplicate `scheduleReconnect` triggers for one failure (Plan BD).
+    private var reconnectPending = false
+    /// Connect-timeout task, cancelled on resolve so a stale timer can't fail a later attempt.
+    private var connectTimeoutTask: Task<Void, Never>?
+    private var reconnectPolicy: RealtimeReconnect.Policy {
+        .init(maxAttempts: maxReconnectAttempts, maxBackoffSeconds: maxBackoffSeconds)
+    }
+    /// Terminal-death cue hook (Plan BD) — the session manager plays an audible cue.
+    var onReconnectExhausted: (() -> Void)?
 
     // Latency tracking
     private var lastUserSpeechEnd: Date?
@@ -132,14 +141,16 @@ class OpenAIRealtimeService: ObservableObject {
             self.webSocketTask = self.urlSession.webSocketTask(with: request)
             self.webSocketTask?.resume()
 
-            // Timeout after 15 seconds
-            Task {
+            // Timeout after 15 seconds. Stored + cancelled on resolve (Plan BD).
+            self.connectTimeoutTask?.cancel()
+            self.connectTimeoutTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self, !Task.isCancelled else { return }
                 await MainActor.run {
-                    self.resolveConnect(success: false)
                     if self.connectionState == .connecting || self.connectionState == .settingUp {
                         self.connectionState = .error("Connection timed out")
                     }
+                    self.resolveConnect(success: false)
                 }
             }
         }
@@ -152,6 +163,10 @@ class OpenAIRealtimeService: ObservableObject {
         reconnectTask?.cancel()
         reconnectTask = nil
         reconnecting = false
+        reconnectPending = false
+        reconnectAttempts = 0   // a fresh session must not inherit an exhausted counter (Plan BD)
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
         receiveTask?.cancel()
         receiveTask = nil
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
@@ -228,20 +243,26 @@ class OpenAIRealtimeService: ObservableObject {
 
     private func scheduleReconnect(reason: String?) {
         guard !intentionalDisconnect else { return }
-        guard reconnectAttempts < maxReconnectAttempts else {
+        // Coalesce the duplicate triggers a single failure fires (Plan BD).
+        guard !reconnectPending else { return }
+
+        guard let delay = reconnectPolicy.delay(forAttempt: reconnectAttempts + 1) else {
             connectionState = .error("Connection lost after \(maxReconnectAttempts) reconnect attempts")
             reconnecting = false
+            onReconnectExhausted?()
             return
         }
 
         reconnecting = true
+        reconnectPending = true
         reconnectAttempts += 1
-        let delay = min(pow(2.0, Double(reconnectAttempts - 1)), maxBackoffSeconds)
         NSLog("[OpenAI RT] Reconnect attempt %d/%d in %.0fs", reconnectAttempts, maxReconnectAttempts, delay)
 
+        reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard let self, !Task.isCancelled else { return }
+            self.reconnectPending = false
 
             self.receiveTask?.cancel()
             self.receiveTask = nil
@@ -253,6 +274,10 @@ class OpenAIRealtimeService: ObservableObject {
                 self.reconnectAttempts = 0
                 self.reconnecting = false
                 self.onReconnected?()
+            } else {
+                // Drive the next attempt ourselves so a connect-timeout with no close/error event
+                // can't stall the machine forever (Plan BD); coalesced if close/error already fired.
+                self.scheduleReconnect(reason: "retry failed")
             }
         }
     }
@@ -260,6 +285,8 @@ class OpenAIRealtimeService: ObservableObject {
     // MARK: - Private
 
     private func resolveConnect(success: Bool) {
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
         if let cont = connectContinuation {
             connectContinuation = nil
             cont.resume(returning: success)
@@ -316,15 +343,17 @@ class OpenAIRealtimeService: ObservableObject {
                 guard let task = self.webSocketTask else { break }
                 do {
                     let message = try await task.receive()
+                    let text: String?
                     switch message {
-                    case .string(let text):
-                        await self.handleMessage(text)
-                    case .data(let data):
-                        if let text = String(data: data, encoding: .utf8) {
-                            await self.handleMessage(text)
-                        }
-                    @unknown default:
-                        break
+                    case .string(let t): text = t
+                    case .data(let d): text = String(data: d, encoding: .utf8)
+                    @unknown default: text = nil
+                    }
+                    guard let text else { continue }
+                    // Parse JSON + decode the audio delta OFF the main actor, then apply on main —
+                    // response.audio.delta arrives many times/sec while the model speaks.
+                    if let parsed = await Self.parse(text) {
+                        self.handleMessage(parsed)
                     }
                 } catch {
                     if !Task.isCancelled {
@@ -343,12 +372,30 @@ class OpenAIRealtimeService: ObservableObject {
         }
     }
 
-    private func handleMessage(_ text: String) async {
+    /// A message parsed off the main actor: decoded JSON plus the pre-decoded audio delta.
+    /// `@unchecked Sendable` is safe — single-owner handoff, built off-main and consumed once on main.
+    private struct ParsedOpenAIMessage: @unchecked Sendable {
+        let json: [String: Any]
+        let type: String
+        let audioDelta: Data?
+    }
+
+    private nonisolated static func parse(_ text: String) async -> ParsedOpenAIMessage? {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = json["type"] as? String else {
-            return
+            return nil
         }
+        var audioDelta: Data?
+        if type == "response.audio.delta", let delta = json["delta"] as? String {
+            audioDelta = Data(base64Encoded: delta)
+        }
+        return ParsedOpenAIMessage(json: json, type: type, audioDelta: audioDelta)
+    }
+
+    private func handleMessage(_ parsed: ParsedOpenAIMessage) {
+        let json = parsed.json
+        let type = parsed.type
 
         switch type {
         case "session.created":
@@ -362,9 +409,8 @@ class OpenAIRealtimeService: ObservableObject {
             resolveConnect(success: true)
 
         case "response.audio.delta":
-            // Model audio chunk
-            if let delta = json["delta"] as? String,
-               let audioData = Data(base64Encoded: delta) {
+            // Model audio chunk — base64-decoded off the main actor in `parse`.
+            if let audioData = parsed.audioDelta {
                 if !isModelSpeaking {
                     isModelSpeaking = true
                     if let speechEnd = lastUserSpeechEnd, !responseLatencyLogged {
@@ -388,6 +434,14 @@ class OpenAIRealtimeService: ObservableObject {
             isModelSpeaking = false
             currentResponseId = nil
             responseLatencyLogged = false
+            // Record this response's token usage for the cost tracker (Plan AU).
+            if let usage = RealtimeUsage.openAIResponseUsage(json) {
+                let model = self.model
+                Task { @MainActor in
+                    UsageTracker.shared.record(provider: .openai, model: model,
+                                               tokensIn: usage.tokensIn, tokensOut: usage.tokensOut)
+                }
+            }
             onTurnComplete?()
 
         case "input_audio_buffer.speech_started":
@@ -408,10 +462,22 @@ class OpenAIRealtimeService: ObservableObject {
             }
 
         case "error":
-            if let error = json["error"] as? [String: Any],
-               let message = error["message"] as? String {
-                NSLog("[OpenAI RT] Error: %@", message)
-                connectionState = .error(message)
+            if let error = json["error"] as? [String: Any] {
+                let message = error["message"] as? String
+                let code = error["code"] as? String
+                // A recoverable error (most often a response.cancel that raced the end of a
+                // response — "no active response") must NOT flip the session into a terminal
+                // .error state, or the assistant goes silently deaf while the mic stays open
+                // (Plan BD). Only tear down + reconnect on a genuinely fatal error.
+                if RealtimeReconnect.isFatalOpenAIError(code: code, message: message) {
+                    NSLog("[OpenAI RT] Fatal error: %@ — reconnecting", message ?? code ?? "unknown")
+                    connectionState = .error(message ?? "Realtime error")
+                    isModelSpeaking = false
+                    onDisconnected?(message)
+                    scheduleReconnect(reason: message)
+                } else {
+                    NSLog("[OpenAI RT] Recoverable error (ignored): %@", message ?? code ?? "unknown")
+                }
             }
 
         case "rate_limits.updated":

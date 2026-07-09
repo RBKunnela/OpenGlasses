@@ -1,364 +1,5 @@
 import Foundation
 
-/// A LiveAI mode preset that changes the system instruction for realtime sessions.
-struct LiveAIMode: Codable, Identifiable, Hashable {
-    var id: String
-    var name: String
-    var icon: String
-    var promptPrefix: String
-
-    static let builtIn: [LiveAIMode] = [
-        LiveAIMode(id: "standard", name: "Standard", icon: "bubble.left", promptPrefix: ""),
-        LiveAIMode(id: "museum", name: "Museum Guide", icon: "building.columns", promptPrefix: "You are acting as a museum docent and art expert. When the user shows you artwork, sculptures, or exhibits, identify them and provide engaging context: the artist, period, technique, and cultural significance. Be enthusiastic and educational.\n\n"),
-        LiveAIMode(id: "accessibility", name: "Blind Assistant", icon: "figure.walk", promptPrefix: "You are a visual accessibility assistant for a visually impaired user. Describe the environment in detail: obstacles, people, signage, doors, stairs, vehicles, and spatial layout. Be specific about distances and directions (left, right, ahead). Prioritize safety-critical information.\n\n"),
-        LiveAIMode(id: "reading", name: "Reading Assistant", icon: "text.viewfinder", promptPrefix: "You are a reading assistant. Focus on any visible text — signs, menus, documents, labels, screens. Read text aloud clearly and completely. For foreign languages, first read the original, then translate. Offer to summarize long text.\n\n"),
-        LiveAIMode(id: "translator", name: "Live Translator", icon: "globe", promptPrefix: "You are a real-time translator. When you see text or hear speech in a foreign language, translate it naturally. Provide the original text first, then the translation. For signs and menus, translate everything visible.\n\n"),
-        LiveAIMode(id: "tutor", name: "Language Tutor", icon: "graduationcap", promptPrefix: "You are a language tutor. Help the user practice the language of the text/signs they show you. Pronounce words clearly, explain grammar, suggest phrases for the situation. Be encouraging and patient.\n\n"),
-        LiveAIMode(id: "golf", name: "Golf Caddy", icon: "figure.golf", promptPrefix: "You are a golf caddy on smart glasses. Help with club selection, read greens, track shots, and provide course strategy. Be confident and decisive. Keep advice brief during play — 1-2 sentences per decision. Celebrate good shots, stay positive on bad ones.\n\n"),
-    ]
-}
-
-/// A user-configurable quick action button shown on the main screen.
-struct QuickAction: Codable, Identifiable {
-    var id: String
-    var label: String
-    var icon: String
-    var type: ActionType
-
-    enum ActionType: String, Codable, CaseIterable, Identifiable {
-        case prompt = "prompt"
-        case photo = "photo"
-        case photoThenPrompt = "photoThenPrompt"
-        case homeAssistant = "homeAssistant"
-        case siriShortcut = "siriShortcut"
-        case openApp = "openApp"
-
-        var id: String { rawValue }
-
-        var displayName: String {
-            switch self {
-            case .prompt: return "Text Prompt"
-            case .photo: return "Take Photo"
-            case .photoThenPrompt: return "Photo + Prompt"
-            case .homeAssistant: return "Home Assistant"
-            case .siriShortcut: return "Siri Shortcut"
-            case .openApp: return "Open App"
-            }
-        }
-
-        var description: String {
-            switch self {
-            case .prompt: return "Send a text prompt to the AI"
-            case .photo: return "Capture and describe a photo"
-            case .photoThenPrompt: return "Capture a photo with a custom prompt"
-            case .homeAssistant: return "Call a Home Assistant service"
-            case .siriShortcut: return "Run a Siri Shortcut by name"
-            case .openApp: return "Open an app via URL scheme"
-            }
-        }
-    }
-
-    /// The prompt text (for .prompt and .photoThenPrompt types)
-    var promptText: String?
-    /// Home Assistant service call (e.g., "light.turn_off") for .homeAssistant type
-    var haService: String?
-    /// Home Assistant entity ID (e.g., "light.living_room") for .homeAssistant type
-    var haEntityId: String?
-    /// Extra data as JSON string for .homeAssistant type (e.g., {"brightness": 50})
-    var haData: String?
-    /// Siri Shortcut name for .siriShortcut type
-    var shortcutName: String?
-    /// URL scheme for .openApp type (e.g., "weixin://")
-    var urlScheme: String?
-
-    static let travelTemplates: [QuickAction] = [
-        QuickAction(
-            id: "travel-translate-sign-menu",
-            label: "Translate Sign",
-            icon: "text.viewfinder",
-            type: .photoThenPrompt,
-            promptText: "Read all visible text in this image. First provide exact original text, then translate to English. If helpful, use the translate tool to improve accuracy. Keep response concise for glasses."
-        ),
-        QuickAction(
-            id: "travel-ask-local-phrase",
-            label: "Local Phrase",
-            icon: "globe",
-            type: .prompt,
-            promptText: "Help me say this naturally in the local language where I am. If my intent is unclear, ask one short clarification first. Then provide local phrase, pronunciation, and a polite variant. Use the translate tool."
-        ),
-    ]
-
-    /// Built-in Field Assist quick action. Injected at the front of `Config.quickActions`
-    /// whenever Field Assist is active (see `withFieldAssistAction`) — it is never persisted,
-    /// so it appears/disappears with the entitlement. A `.prompt` action so it routes through
-    /// the existing pipeline and the AI starts the session via the `field_session` tool.
-    static let fieldAssist = QuickAction(
-        id: "field-assist",
-        label: "Field Assist",
-        icon: "wrench.and.screwdriver.fill",
-        type: .prompt,
-        promptText: "Start a Field Assist session on my default vault. Briefly confirm you're ready and what you can help me troubleshoot."
-    )
-
-    static let defaults: [QuickAction] = [
-        QuickAction(id: "describe", label: "Describe", icon: "eye", type: .photoThenPrompt,
-                    promptText: "Describe what you see in this image in detail."),
-        QuickAction(id: "calendar", label: "Event", icon: "calendar", type: .photoThenPrompt,
-                    promptText: "Extract any event details from this image (dates, times, locations, names) and create a calendar entry summary."),
-        QuickAction(id: "task", label: "Task", icon: "checklist", type: .photoThenPrompt,
-                    promptText: "Extract any action items or tasks from this image and list them."),
-        QuickAction(id: "lights-off", label: "Lights Off", icon: "lightbulb.slash", type: .homeAssistant,
-                    haService: "light.turn_off", haEntityId: "all"),
-    ] + travelTemplates
-}
-
-/// A saved LLM model configuration
-// MARK: - Gateway Configuration
-
-/// Known gateway providers — users can also add custom ones.
-enum GatewayProvider: String, Codable, CaseIterable, Identifiable {
-    case openclaw = "openclaw"
-    case nanoclaw = "nanoclaw"
-    case nemoclaw = "nemoclaw"
-    case custom = "custom"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .openclaw: return "OpenClaw"
-        case .nanoclaw: return "NanoClaw"
-        case .nemoclaw: return "NemoClaw"
-        case .custom: return "Custom"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .openclaw: return "server.rack"
-        case .nanoclaw: return "desktopcomputer"
-        case .nemoclaw: return "cpu"
-        case .custom: return "gear"
-        }
-    }
-
-    var defaultPort: Int {
-        switch self {
-        case .openclaw: return 18789
-        case .nanoclaw: return 18789
-        case .nemoclaw: return 18789
-        case .custom: return 18789
-        }
-    }
-
-    /// Whether this provider uses the standard OpenClaw WebSocket protocol.
-    var usesOpenClawProtocol: Bool { true }
-}
-
-/// A configured gateway endpoint — could be OpenClaw, NanoClaw, NemoClaw, or custom.
-struct GatewayConfig: Codable, Identifiable, Equatable {
-    var id: String
-    var name: String                    // User label, e.g. "Mac Mini OpenClaw"
-    var provider: String                // GatewayProvider rawValue
-    var lanHost: String                 // LAN/local IP or hostname
-    var port: Int                       // Default 18789
-    var tunnelHost: String              // Tailscale or tunnel URL
-    var token: String                   // Gateway auth token
-    var connectionMode: String          // "auto", "lan", "tunnel"
-    var enabled: Bool
-    var priority: Int                   // Lower = tried first
-
-    var gatewayProvider: GatewayProvider {
-        GatewayProvider(rawValue: provider) ?? .custom
-    }
-
-    var connectionModeEnum: OpenClawConnectionMode {
-        OpenClawConnectionMode(rawValue: connectionMode) ?? .auto
-    }
-
-    /// Build the LAN URL from host + port.
-    var lanURL: String {
-        let host = lanHost.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !host.isEmpty else { return "" }
-        return "\(host):\(port)"
-    }
-
-    /// The tunnel URL (already includes port usually).
-    var tunnelURL: String {
-        tunnelHost.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-    }
-
-    var isConfigured: Bool {
-        !token.isEmpty && (!lanHost.isEmpty || !tunnelHost.isEmpty)
-    }
-
-    /// Create a new gateway with defaults for a given provider.
-    static func newGateway(provider: GatewayProvider, priority: Int = 0) -> GatewayConfig {
-        GatewayConfig(
-            id: UUID().uuidString,
-            name: "\(provider.displayName) Gateway",
-            provider: provider.rawValue,
-            lanHost: "",
-            port: provider.defaultPort,
-            tunnelHost: "",
-            token: "",
-            connectionMode: "auto",
-            enabled: true,
-            priority: priority
-        )
-    }
-}
-
-struct ModelConfig: Codable, Identifiable, Equatable {
-    var id: String  // UUID string
-    var name: String  // User-facing label, e.g. "Claude Sonnet" or "GPT-4o"
-    var provider: String  // LLMProvider rawValue
-    var apiKey: String
-    var model: String
-    var baseURL: String
-    /// Optional user override for whether this model accepts image input.
-    /// When nil, the app falls back to provider/model-name heuristics.
-    var supportsVision: Bool? = nil
-
-    /// Convenience to get the LLMProvider enum
-    var llmProvider: LLMProvider {
-        LLMProvider(rawValue: provider) ?? .custom
-    }
-
-    /// Whether this model should receive image input when the app has an image available.
-    var visionEnabled: Bool {
-        supportsVision ?? Self.inferredSupportsVision(provider: llmProvider, model: model, baseURL: baseURL)
-    }
-
-    static func inferredSupportsVision(provider: LLMProvider, model: String, baseURL: String) -> Bool {
-        switch provider {
-        case .anthropic, .gemini, .openai:
-            return true
-        case .groq, .local, .appleOnDevice:
-            return false
-        case .qwen:
-            // Qwen3.5-plus and qwen-vl models support vision
-            let lowerModel = model.lowercased()
-            return lowerModel.contains("vl") || lowerModel.contains("plus") || lowerModel.contains("max") || lowerModel.contains("omni")
-        case .openrouter:
-            // OpenRouter supports vision for many models
-            let lowerModel = model.lowercased()
-            return lowerModel.contains("claude") || lowerModel.contains("gpt-4") || lowerModel.contains("gemini") || lowerModel.contains("vision") || lowerModel.contains("llava")
-        case .zai, .minimax, .custom:
-            let lowerModel = model.lowercased()
-            let lowerBaseURL = baseURL.lowercased()
-
-            let knownVisionHints = [
-                "vision", "gpt-4", "gpt-4.1", "gpt-4o", "o1", "o3",
-                "claude-3", "claude-4", "sonnet", "opus",
-                "gemini", "vl", "qwen-vl", "qwen2.5-vl", "qvq",
-                "pixtral", "llava", "minicpm-v", "glm-4.1v"
-            ]
-
-            if knownVisionHints.contains(where: { lowerModel.contains($0) }) {
-                return true
-            }
-
-            if lowerBaseURL.contains("openrouter.ai") {
-                return knownVisionHints.contains(where: { lowerModel.contains($0) })
-            }
-
-            return false
-        }
-    }
-
-    /// Create a new config with defaults for a provider
-    static func defaultConfig(for provider: LLMProvider) -> ModelConfig {
-        ModelConfig(
-            id: UUID().uuidString,
-            name: provider.displayName,
-            provider: provider.rawValue,
-            apiKey: "",
-            model: provider.defaultModel,
-            baseURL: provider.defaultBaseURL
-        )
-    }
-}
-
-/// A saved system prompt preset
-struct PromptPreset: Codable, Identifiable, Equatable {
-    var id: String
-    var name: String
-    var prompt: String
-    var isBuiltIn: Bool
-    var icon: String?
-    /// Suggested camera behavior for this preset mode.
-    /// "smart" = auto-activate on vision queries, "always" = keep camera on, nil = default behavior.
-    var cameraBehavior: String?
-}
-
-/// A persona bundles a wake word, AI model, and system prompt.
-/// Multiple personas can be active simultaneously — each wake word routes to its own model+prompt.
-struct Persona: Codable, Identifiable, Equatable {
-    var id: String
-    var name: String                      // "Claude", "Jarvis", "Computer"
-    var wakePhrase: String                // "hey claude"
-    var alternativeWakePhrases: [String]   // ["hey cloud", "hey claud"]
-    var modelId: String                   // References ModelConfig.id
-    var presetId: String                  // References PromptPreset.id
-    var enabled: Bool
-    /// SF Symbol icon name for display in persona picker / mode cards.
-    var icon: String?
-    /// Whether this is a built-in preset persona (shipped with the app).
-    var isBuiltIn: Bool?
-
-    // MARK: - Agentic Capabilities (optional)
-
-    /// Custom soul.md content for this persona. When set, overrides the global soul.
-    var soulOverride: String?
-
-    /// Chattiness level for this persona (nil = use global setting).
-    /// Raw string matching Config.AgentChattiness: "quiet", "normal", "chatty".
-    var chattinessRaw: String?
-
-    /// Specific tools this persona can use (nil = all tools). Restrict to subset for focused agents.
-    var allowedTools: [String]?
-
-    /// Scheduled task IDs this persona owns. Tasks only run when this persona is active.
-    var ownedTaskIds: [String]?
-
-    /// All phrases this persona responds to (primary + alternatives).
-    var allPhrases: [String] {
-        [wakePhrase] + alternativeWakePhrases
-    }
-}
-
-/// A user-defined tool that maps to a Siri Shortcut or URL scheme
-struct CustomToolDefinition: Codable, Identifiable, Equatable {
-    var id: String
-    var name: String
-    var description: String
-    var parameters: [CustomToolParam]
-    var actionType: ActionType
-    var shortcutName: String?
-    var urlTemplate: String?
-
-    enum ActionType: String, Codable, CaseIterable {
-        case shortcut
-        case urlScheme
-
-        var displayName: String {
-            switch self {
-            case .shortcut: return "Siri Shortcut"
-            case .urlScheme: return "URL Scheme"
-            }
-        }
-    }
-
-    struct CustomToolParam: Codable, Identifiable, Equatable {
-        var id: String
-        var name: String
-        var type: String  // "string" or "number"
-        var description: String
-        var required: Bool
-    }
-}
-
 /// App configuration and API keys
 struct Config {
     /// Anthropic API key for Claude. Stored in the Keychain (see `KeychainService`).
@@ -451,13 +92,9 @@ struct Config {
 
     // MARK: - Onboarding
 
-    static var hasCompletedOnboarding: Bool {
-        UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
-    }
+    @UserDefaultsBacked("hasCompletedOnboarding", default: false) static var hasCompletedOnboarding: Bool
 
-    static func setHasCompletedOnboarding(_ completed: Bool) {
-        UserDefaults.standard.set(completed, forKey: "hasCompletedOnboarding")
-    }
+    static func setHasCompletedOnboarding(_ completed: Bool) { hasCompletedOnboarding = completed }
 
     /// True when the user hasn't completed onboarding and has no configured API keys.
     static var needsOnboarding: Bool {
@@ -545,7 +182,7 @@ struct Config {
     }
 
     /// Claude model to use
-    static let claudeModel = "claude-sonnet-4-20250514"
+    static let claudeModel = "claude-sonnet-5"
 
     /// Max tokens for LLM response
     static let maxTokens = 500
@@ -642,13 +279,9 @@ struct Config {
     }
 
     /// Whether automatic model routing is enabled. When off, all requests use the active model.
-    static var autoModelRoutingEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "autoModelRoutingEnabled")
-    }
+    @UserDefaultsBacked("autoModelRoutingEnabled", default: false) static var autoModelRoutingEnabled: Bool
 
-    static func setAutoModelRoutingEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "autoModelRoutingEnabled")
-    }
+    static func setAutoModelRoutingEnabled(_ enabled: Bool) { autoModelRoutingEnabled = enabled }
 
     /// Get the model explicitly assigned to a tier by the user.
     /// Falls back to keyword-based auto-detection if no model is assigned.
@@ -1517,6 +1150,17 @@ struct Config {
         setSavedPersonas(personas)
     }
 
+    /// Append a persona (e.g. an imported Project, Plan AN). Replaces any with the same id.
+    static func addPersona(_ persona: Persona) {
+        var personas = savedPersonas
+        if let idx = personas.firstIndex(where: { $0.id == persona.id }) {
+            personas[idx] = persona
+        } else {
+            personas.append(persona)
+        }
+        setSavedPersonas(personas)
+    }
+
     /// Uninstall a built-in persona mode.
     static func uninstallPersonaMode(_ id: String) {
         var personas = savedPersonas
@@ -1712,13 +1356,9 @@ struct Config {
 
     /// When true, live translation uses the iPhone's built-in mic instead of glasses Bluetooth mic.
     /// Useful for translating what someone nearby is saying (their voice comes through the phone mic).
-    static var usePhoneMicForTranslation: Bool {
-        UserDefaults.standard.bool(forKey: "usePhoneMicForTranslation")
-    }
+    @UserDefaultsBacked("usePhoneMicForTranslation", default: false) static var usePhoneMicForTranslation: Bool
 
-    static func setUsePhoneMicForTranslation(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "usePhoneMicForTranslation")
-    }
+    static func setUsePhoneMicForTranslation(_ enabled: Bool) { usePhoneMicForTranslation = enabled }
 
     // MARK: - Quick Actions
 
@@ -1762,23 +1402,56 @@ struct Config {
     }
 
     /// Whether to show all quick actions on the Voice tab, or only the top 4.
-    static var showAllQuickActions: Bool {
-        UserDefaults.standard.bool(forKey: "showAllQuickActions")
-    }
+    @UserDefaultsBacked("showAllQuickActions", default: false) static var showAllQuickActions: Bool
 
-    static func setShowAllQuickActions(_ show: Bool) {
-        UserDefaults.standard.set(show, forKey: "showAllQuickActions")
+    static func setShowAllQuickActions(_ show: Bool) { showAllQuickActions = show }
+
+    // MARK: - Speech Recognition Locale
+
+    /// Which locale the speech features (wake word, transcription, captions, rewind, teleprompter)
+    /// recognize in. `"auto"` follows the device's preferred language; an explicit identifier
+    /// (e.g. `"de-DE"`) pins it. Resolved against what `SFSpeechRecognizer` actually supports —
+    /// see `SpeechLocaleResolver`. Default `"auto"` (was hardcoded en-US everywhere).
+    @UserDefaultsBacked("speechRecognitionLocale", default: "auto") static var speechRecognitionLocale: String
+
+    static func setSpeechRecognitionLocale(_ id: String) { speechRecognitionLocale = id }
+
+    // MARK: - Simple Mode
+
+    /// Hide the owner-only configuration surface in Settings (models, personas, behavior, tools,
+    /// integrations, advanced) — for handing the device to someone who just needs it to work.
+    /// Pure UI gating: nothing about routing or behavior changes. Default off.
+    @UserDefaultsBacked("simpleModeEnabled", default: false) static var simpleModeEnabled: Bool
+
+    // MARK: - Uncertainty Web Search (Plan BI)
+
+    /// Local backends (MLX, Apple Foundation) can't tool-call `web_search`; when on, a hedged or
+    /// freshness-sensitive local answer gets one transparent web-grounded re-ask. Default on —
+    /// `WebSearchTool` always has the keyless DuckDuckGo fallback, so no configuration is needed.
+    @UserDefaultsBacked("localWebSearchFallbackEnabled", default: true) static var localWebSearchFallbackEnabled: Bool
+
+    // MARK: - Remote Invoke (Plan BH)
+
+    // Per-class consent for gateway-initiated device commands. The whole surface additionally
+    // gates on `agentModeEnabled`; capture (photo/video/audio/transcription/translation) is the
+    // surveillance class and defaults OFF.
+    @UserDefaultsBacked("remoteInvokeObserveEnabled", default: true) static var remoteInvokeObserveEnabled: Bool
+    @UserDefaultsBacked("remoteInvokeOutputEnabled", default: true) static var remoteInvokeOutputEnabled: Bool
+    @UserDefaultsBacked("remoteInvokeCaptureEnabled", default: false) static var remoteInvokeCaptureEnabled: Bool
+
+    static var remoteInvokeToggles: RemoteCommandPolicy.Toggles {
+        RemoteCommandPolicy.Toggles(
+            observe: remoteInvokeObserveEnabled,
+            output: remoteInvokeOutputEnabled,
+            capture: remoteInvokeCaptureEnabled
+        )
     }
 
     // MARK: - OpenClaw Configuration
 
-    static var openClawEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "openClawEnabled")
-    }
+    @UserDefaultsBacked("openClawEnabled", default: false) static var openClawEnabled: Bool
 
-    static func setOpenClawEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "openClawEnabled")
-    }
+    static func setOpenClawEnabled(_ enabled: Bool) { openClawEnabled = enabled }
 
     static var openClawConnectionMode: OpenClawConnectionMode {
         if let raw = UserDefaults.standard.string(forKey: "openClawConnectionMode"),
@@ -1871,6 +1544,40 @@ struct Config {
     static func setSavedGateways(_ gateways: [GatewayConfig]) {
         guard let data = try? JSONEncoder().encode(gateways) else { return }
         KeychainService.setData(data, for: "savedGateways")
+    }
+
+    // MARK: - Device pairing persistence
+
+    /// Persist the pairing result for a gateway: store the per-device token (clearing the
+    /// transient setup code once it lands) and/or the device id.
+    static func setDeviceCredentials(gatewayId: String, deviceToken: String? = nil, deviceId: String? = nil) {
+        var gateways = savedGateways
+        guard let idx = gateways.firstIndex(where: { $0.id == gatewayId }) else { return }
+        if let deviceToken {
+            gateways[idx].deviceToken = deviceToken
+            gateways[idx].setupCode = nil
+        }
+        if let deviceId { gateways[idx].deviceId = deviceId }
+        setSavedGateways(gateways)
+    }
+
+    /// Store a setup code on a gateway so the next connect attempts bootstrap pairing.
+    static func setGatewaySetupCode(gatewayId: String, setupCode: String) {
+        var gateways = savedGateways
+        guard let idx = gateways.firstIndex(where: { $0.id == gatewayId }) else { return }
+        gateways[idx].setupCode = setupCode
+        setSavedGateways(gateways)
+    }
+
+    /// The stable device id for a gateway, generating + persisting one if absent.
+    static func deviceId(forGateway gatewayId: String) -> String {
+        var gateways = savedGateways
+        guard let idx = gateways.firstIndex(where: { $0.id == gatewayId }) else { return "" }
+        if let existing = gateways[idx].deviceId, !existing.isEmpty { return existing }
+        let newId = UUID().uuidString
+        gateways[idx].deviceId = newId
+        setSavedGateways(gateways)
+        return newId
     }
 
     /// Enabled gateways only, in priority order.
@@ -2150,15 +1857,29 @@ struct Config {
         !perplexityAPIKey.isEmpty
     }
 
+    // MARK: - Tavily Search
+
+    /// Tavily API key. Stored in the Keychain (see `KeychainService`).
+    static var tavilyAPIKey: String {
+        if let key = KeychainService.string(for: "tavilyAPIKey"), !key.isEmpty {
+            return key
+        }
+        return ""
+    }
+
+    static func setTavilyAPIKey(_ key: String) {
+        KeychainService.setString(key, for: "tavilyAPIKey")
+    }
+
+    static var isTavilyConfigured: Bool {
+        !tavilyAPIKey.isEmpty
+    }
+
     // MARK: - Privacy Filter
 
-    static var privacyFilterEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "privacyFilterEnabled")
-    }
+    @UserDefaultsBacked("privacyFilterEnabled", default: false) static var privacyFilterEnabled: Bool
 
-    static func setPrivacyFilterEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "privacyFilterEnabled")
-    }
+    static func setPrivacyFilterEnabled(_ enabled: Bool) { privacyFilterEnabled = enabled }
 
     // MARK: - Health Data Sharing with AI
 
@@ -2170,13 +1891,9 @@ struct Config {
     /// party. This MUST default to false (opt-in). On-device tracking, form
     /// analysis, and saving workouts to Apple Health do not require it; only
     /// transmitting Health-read data off-device does.
-    static var shareHealthDataWithAI: Bool {
-        UserDefaults.standard.bool(forKey: "shareHealthDataWithAI")
-    }
+    @UserDefaultsBacked("shareHealthDataWithAI", default: false) static var shareHealthDataWithAI: Bool
 
-    static func setShareHealthDataWithAI(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "shareHealthDataWithAI")
-    }
+    static func setShareHealthDataWithAI(_ enabled: Bool) { shareHealthDataWithAI = enabled }
 
     // MARK: - Listening Toggle
 
@@ -2260,41 +1977,42 @@ struct Config {
         UserDefaults.standard.set(enabled, forKey: "useGlassesMicForWakeWord")
     }
 
+    /// Use on-device speech recognition for the always-on wake-word listener (Plan BE). Default on:
+    /// short-phrase spotting doesn't need the server, and streaming mic audio to Apple 24/7 is the
+    /// biggest steady battery/data drain. Real queries still use server recognition.
+    static var onDeviceWakeWordEnabled: Bool {
+        let key = "onDeviceWakeWordEnabled"
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }
+
+    static func setOnDeviceWakeWordEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: "onDeviceWakeWordEnabled")
+    }
+
     // MARK: - Audio-Only Mode
 
     /// When enabled, disables video frame streaming to save battery. Voice still works.
-    static var audioOnlyMode: Bool {
-        UserDefaults.standard.bool(forKey: "audioOnlyMode")
-    }
+    @UserDefaultsBacked("audioOnlyMode", default: false) static var audioOnlyMode: Bool
 
-    static func setAudioOnlyMode(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "audioOnlyMode")
-    }
+    static func setAudioOnlyMode(_ enabled: Bool) { audioOnlyMode = enabled }
 
     // MARK: - Glasses Display (in-lens HUD)
 
     /// When enabled, AI responses and ambient captions are mirrored to the
     /// Ray-Ban Display in-lens HUD. No-ops on glasses without a display.
-    static var glassesDisplayEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "glassesDisplayEnabled")
-    }
+    @UserDefaultsBacked("glassesDisplayEnabled", default: false) static var glassesDisplayEnabled: Bool
 
-    static func setGlassesDisplayEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "glassesDisplayEnabled")
-    }
+    static func setGlassesDisplayEnabled(_ enabled: Bool) { glassesDisplayEnabled = enabled }
 
     // MARK: - Memory loop (self-improving)
 
     /// When on, the assistant offers a spoken nudge after you state a durable fact or repeat a
     /// multi-step request ("say 'remember it'" / "save that as a skill"). Off by default. When
     /// Agent Mode is also on, those are auto-saved silently instead of nudged.
-    static var memoryNudgesEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "memoryNudgesEnabled")
-    }
+    @UserDefaultsBacked("memoryNudgesEnabled", default: false) static var memoryNudgesEnabled: Bool
 
-    static func setMemoryNudgesEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "memoryNudgesEnabled")
-    }
+    static func setMemoryNudgesEnabled(_ enabled: Bool) { memoryNudgesEnabled = enabled }
 
     // MARK: - Teleprompter
 
@@ -2358,13 +2076,9 @@ struct Config {
 
     // MARK: - Intent Classifier
 
-    static var intentClassifierEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "intentClassifierEnabled")
-    }
+    @UserDefaultsBacked("intentClassifierEnabled", default: false) static var intentClassifierEnabled: Bool
 
-    static func setIntentClassifierEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "intentClassifierEnabled")
-    }
+    static func setIntentClassifierEnabled(_ enabled: Bool) { intentClassifierEnabled = enabled }
 
     // MARK: - Smart Camera
 
@@ -2411,6 +2125,175 @@ struct Config {
         UserDefaults.standard.set(enabled, forKey: "userMemoryEnabled")
     }
 
+    // MARK: - Skill Retrieval
+
+    /// When `true`, the skill stores inject only the skills relevant to the current turn (exact
+    /// trigger matches + top-K by embedding similarity) instead of dumping the whole library.
+    /// **Default on** (beta) — a no-op below `skillRetrievalMinCount` skills (so most users are
+    /// unaffected), and exact trigger matches are always kept; it only trims once the bank grows.
+    /// Set off to restore the unconditional dump. See [[SkillRetriever]].
+    static var skillRetrievalEnabled: Bool {
+        let key = "skillRetrievalEnabled"
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }
+
+    static func setSkillRetrievalEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: "skillRetrievalEnabled")
+    }
+
+    /// Soft budget: how many skills to inject when retrieval is on (exact trigger matches are always
+    /// kept and may exceed this). Falls back to a sensible default when unset.
+    static var skillRetrievalTopK: Int {
+        let v = UserDefaults.standard.integer(forKey: "skillRetrievalTopK")
+        return v > 0 ? v : 6
+    }
+
+    /// Floor below which retrieval is a no-op (dumping a handful is cheaper than ranking them).
+    static var skillRetrievalMinCount: Int {
+        let key = "skillRetrievalMinCount"
+        if UserDefaults.standard.object(forKey: key) == nil { return 8 }
+        return UserDefaults.standard.integer(forKey: key)
+    }
+
+    // MARK: - Project Memory
+
+    /// When `true`, notes scoped to the active Field Assist job (see [[ProjectMemory]]) are injected
+    /// into the prompt while that job is active. **Default on** (beta) — purely additive context that
+    /// only appears with an active job and saved notes; without it, `project_note` would save notes
+    /// that never surface. Flag is the kill-switch.
+    static var projectMemoryEnabled: Bool {
+        let key = "projectMemoryEnabled"
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }
+
+    static func setProjectMemoryEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: "projectMemoryEnabled")
+    }
+
+    // MARK: - User Memory Retrieval
+
+    /// When `true`, the shared-memory injection passes the current turn as a query to
+    /// `SemanticMemoryStore.systemPromptContext(query:)`, so only the facts relevant to the turn are
+    /// injected (its existing top-8 semantic search) instead of dumping every fact. **Default on**
+    /// (beta) — leaner token use; falls back to a full dump when the search returns nothing. Set off
+    /// to restore the unconditional dump.
+    static var userMemoryRetrievalEnabled: Bool {
+        let key = "userMemoryRetrievalEnabled"
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }
+
+    static func setUserMemoryRetrievalEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: "userMemoryRetrievalEnabled")
+    }
+
+    // MARK: - Contextual Embeddings
+
+    /// When `true`, [[Embedder]] prefers the transformer `NLContextualEmbedding` over the lookup-based
+    /// `NLEmbedding` for semantic search (sharper RAG + memory retrieval). **Default off** — it downloads
+    /// an OTA asset on first use and, being a different model, re-embeds stored vectors via the version
+    /// stamp (a one-time cost). Until the asset is present, `Embedder` transparently falls back to
+    /// `NLEmbedding`, so flipping this on is safe. Enable on-device to validate the quality lift.
+    @UserDefaultsBacked("contextualEmbeddingEnabled", default: false) static var contextualEmbeddingEnabled: Bool
+
+    static func setContextualEmbeddingEnabled(_ enabled: Bool) { contextualEmbeddingEnabled = enabled }
+
+    // MARK: - Model pricing overrides (Plan AU — Settings editor)
+
+    /// User edits to the bundled `ModelPricing` table (USD per 1M tokens), keyed by
+    /// the same model-id prefixes. Persisted locally; applied over the defaults.
+    static var modelPricingOverrides: [String: ModelPricing.Rate] {
+        guard let data = UserDefaults.standard.data(forKey: "modelPricingOverrides"),
+              let dict = try? JSONDecoder().decode([String: ModelPricing.Rate].self, from: data) else { return [:] }
+        return dict
+    }
+
+    /// Persist the overrides and apply them to the live `ModelPricing` table.
+    static func setModelPricingOverrides(_ overrides: [String: ModelPricing.Rate]) {
+        if let data = try? JSONEncoder().encode(overrides) {
+            UserDefaults.standard.set(data, forKey: "modelPricingOverrides")
+        }
+        ModelPricing.overrides = overrides
+    }
+
+    /// Load persisted pricing overrides into `ModelPricing` (call once at launch).
+    static func applyModelPricingOverrides() {
+        ModelPricing.overrides = modelPricingOverrides
+    }
+
+    // MARK: - Content-Aware Frame Gate (Plan AT)
+
+    /// When `true`, `FrameThrottler` consults a perceptual-hash `FrameGate` after
+    /// its time check and drops frames that are visually indistinguishable from
+    /// the last one sent. Defaults to `false`: the time-only throttle behaves
+    /// exactly as before until this is turned on.
+    @UserDefaultsBacked("frameDedupEnabled", default: false) static var frameDedupEnabled: Bool
+
+    static func setFrameDedupEnabled(_ enabled: Bool) { frameDedupEnabled = enabled }
+
+    /// Base dHash Hamming distance (of 64) at/below which two frames are treated
+    /// as the same scene and the candidate is dropped. ~3–5 is "same scene".
+    static var frameDedupHammingThreshold: Int {
+        let v = UserDefaults.standard.object(forKey: "frameDedupHammingThreshold") as? Int
+        return v ?? 4
+    }
+
+    static func setFrameDedupHammingThreshold(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "frameDedupHammingThreshold")
+    }
+
+    /// Seconds after the last sent frame before the gate forces one through even
+    /// if everything since has been deduped, so the model's view can't go stale.
+    static var frameDedupHeartbeatSeconds: TimeInterval {
+        let v = UserDefaults.standard.object(forKey: "frameDedupHeartbeatSeconds") as? Double
+        return v ?? 12
+    }
+
+    static func setFrameDedupHeartbeatSeconds(_ value: TimeInterval) {
+        UserDefaults.standard.set(value, forKey: "frameDedupHeartbeatSeconds")
+    }
+
+    // MARK: - Visual State Memory (Plan AV)
+
+    /// When `true`, the live agent keeps a short rolling memory of distinct scenes
+    /// (keyframes from the frame gate, each one-line described) and injects a
+    /// "Recent Visual Context" block into the session instruction. Defaults to
+    /// `false`: the instruction is built exactly as before. Rides on the content
+    /// gate, so `frameDedupEnabled` must also be on for keyframes to flow.
+    @UserDefaultsBacked("visualStateMemoryEnabled", default: false) static var visualStateMemoryEnabled: Bool
+
+    static func setVisualStateMemoryEnabled(_ enabled: Bool) { visualStateMemoryEnabled = enabled }
+
+    /// Maximum keyframes retained in the rolling visual memory (and the cap on how
+    /// many appear in the injected context). 5–8 covers "the last little while".
+    static var visualStateMaxKeyframes: Int {
+        let v = UserDefaults.standard.object(forKey: "visualStateMaxKeyframes") as? Int
+        return v ?? 6
+    }
+
+    static func setVisualStateMaxKeyframes(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "visualStateMaxKeyframes")
+    }
+
+    /// Minimum seconds between keyframe describe calls — a hard rate-limit so the
+    /// per-keyframe LLM description stays a small, bounded cost.
+    static var visualStateDescribeMinInterval: TimeInterval {
+        let v = UserDefaults.standard.object(forKey: "visualStateDescribeMinInterval") as? Double
+        return v ?? 6
+    }
+
+    static func setVisualStateDescribeMinInterval(_ value: TimeInterval) {
+        UserDefaults.standard.set(value, forKey: "visualStateDescribeMinInterval")
+    }
+
+    /// When `true`, keyframe thumbnails are persisted and may be attached to the
+    /// agent turn (heavier). Default `false`: text-only "Recent Visual Context".
+    @UserDefaultsBacked("visualStateInjectThumbnails", default: false) static var visualStateInjectThumbnails: Bool
+
+    static func setVisualStateInjectThumbnails(_ enabled: Bool) { visualStateInjectThumbnails = enabled }
+
     // MARK: - Siri "Ask a Question" Behavior
 
     /// When `true`, the Siri "Ask OpenGlasses a question" intent brings the app to
@@ -2418,38 +2301,26 @@ struct Config {
     /// and Siri speaks the answer hands-free (OpenGlasses normally stays running to
     /// listen for wake words). Users whose app gets killed and see "OpenGlasses is
     /// not running" can enable this for reliability at the cost of launching the app.
-    static var siriAskOpensApp: Bool {
-        UserDefaults.standard.bool(forKey: "siriAskOpensApp")
-    }
+    @UserDefaultsBacked("siriAskOpensApp", default: false) static var siriAskOpensApp: Bool
 
-    static func setSiriAskOpensApp(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "siriAskOpensApp")
-    }
+    static func setSiriAskOpensApp(_ enabled: Bool) { siriAskOpensApp = enabled }
 
     // MARK: - Silent Mode
 
     /// When enabled, the wake word listener is off but the agent is still actionable
     /// via the watch, widget quick actions, Action Button, and manual mic tap.
     /// Scheduled agent tasks still run in the background.
-    static var silentMode: Bool {
-        UserDefaults.standard.bool(forKey: "silentMode")
-    }
+    @UserDefaultsBacked("silentMode", default: false) static var silentMode: Bool
 
-    static func setSilentMode(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "silentMode")
-    }
+    static func setSilentMode(_ enabled: Bool) { silentMode = enabled }
 
     // MARK: - Glasses-Only Audio
 
     /// When true, agent TTS and notification sounds are silenced if glasses are not connected.
     /// When false (default), audio plays through the phone speaker even without glasses.
-    static var glassesOnlyAudio: Bool {
-        UserDefaults.standard.bool(forKey: "glassesOnlyAudio")
-    }
+    @UserDefaultsBacked("glassesOnlyAudio", default: false) static var glassesOnlyAudio: Bool
 
-    static func setGlassesOnlyAudio(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "glassesOnlyAudio")
-    }
+    static func setGlassesOnlyAudio(_ enabled: Bool) { glassesOnlyAudio = enabled }
 
 // MARK: - Auto-Sleep
 
@@ -2474,6 +2345,13 @@ struct Config {
     static func setAgentModeEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: "agentModeEnabled")
     }
+
+    /// When on, an ambiguous request (action cues but no clear sequencer) is classified
+    /// by a tiny LLM call to decide single- vs multi-step (Plan S Phase 2). Default off:
+    /// the pure keyword heuristic alone decides, with no extra round-trip.
+    @UserDefaultsBacked("llmComplexityClassifierEnabled", default: false) static var llmComplexityClassifierEnabled: Bool
+
+    static func setLLMComplexityClassifierEnabled(_ enabled: Bool) { llmComplexityClassifierEnabled = enabled }
 
     // MARK: - Remote Agent Harness (Plan N)
 
@@ -2507,27 +2385,53 @@ struct Config {
         }
     }
 
+    // MARK: - Codex / Claude Code remote harnesses (Plan N, Phase 3)
+
+    /// OpenAI Codex cloud API token (Keychain — secret). Empty ⇒ harness not configured.
+    static var codexAgentToken: String {
+        KeychainService.string(for: "codexAgentToken") ?? ""
+    }
+    static func setCodexAgentToken(_ token: String) {
+        if token.isEmpty { _ = KeychainService.delete("codexAgentToken") }
+        else { _ = KeychainService.setString(token, for: "codexAgentToken") }
+    }
+    /// Optional base-URL override for the Codex endpoint (non-secret). Blank ⇒ preset default.
+    static var codexAgentBaseURL: String {
+        UserDefaults.standard.string(forKey: "codexAgentBaseURL") ?? ""
+    }
+    static func setCodexAgentBaseURL(_ url: String) {
+        UserDefaults.standard.set(url, forKey: "codexAgentBaseURL")
+    }
+
+    /// Claude Code remote API token (Keychain — secret). Empty ⇒ harness not configured.
+    static var claudeRemoteToken: String {
+        KeychainService.string(for: "claudeRemoteToken") ?? ""
+    }
+    static func setClaudeRemoteToken(_ token: String) {
+        if token.isEmpty { _ = KeychainService.delete("claudeRemoteToken") }
+        else { _ = KeychainService.setString(token, for: "claudeRemoteToken") }
+    }
+    /// Optional base-URL override for the Claude Code endpoint (non-secret). Blank ⇒ preset default.
+    static var claudeRemoteBaseURL: String {
+        UserDefaults.standard.string(forKey: "claudeRemoteBaseURL") ?? ""
+    }
+    static func setClaudeRemoteBaseURL(_ url: String) {
+        UserDefaults.standard.set(url, forKey: "claudeRemoteBaseURL")
+    }
+
     // MARK: - Field Assist (B2B)
 
     /// Developer-only: run the local MCP glasses HTTP server (Plan E). Only effective when
     /// `agentModeEnabled` is also on.
-    static var mcpServerEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "mcpServerEnabled")
-    }
+    @UserDefaultsBacked("mcpServerEnabled", default: false) static var mcpServerEnabled: Bool
 
-    static func setMCPServerEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "mcpServerEnabled")
-    }
+    static func setMCPServerEnabled(_ enabled: Bool) { mcpServerEnabled = enabled }
 
     /// Master toggle for the Accessibility Tier (A1 Reading Accessibility). When off, the
     /// ReadingAccessibilityTool is not registered.
-    static var accessibilityModeEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "accessibilityModeEnabled")
-    }
+    @UserDefaultsBacked("accessibilityModeEnabled", default: false) static var accessibilityModeEnabled: Bool
 
-    static func setAccessibilityModeEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "accessibilityModeEnabled")
-    }
+    static func setAccessibilityModeEnabled(_ enabled: Bool) { accessibilityModeEnabled = enabled }
 
     /// Master toggle for the Field Assist feature. When off, no vaults are loaded
     /// and the FieldSessionTool is not registered.
@@ -2744,13 +2648,9 @@ struct Config {
     }
 
     /// Whether the agent has completed its initial onboarding questions.
-    static var agentOnboardingComplete: Bool {
-        UserDefaults.standard.bool(forKey: "agentOnboardingComplete")
-    }
+    @UserDefaultsBacked("agentOnboardingComplete", default: false) static var agentOnboardingComplete: Bool
 
-    static func setAgentOnboardingComplete(_ complete: Bool) {
-        UserDefaults.standard.set(complete, forKey: "agentOnboardingComplete")
-    }
+    static func setAgentOnboardingComplete(_ complete: Bool) { agentOnboardingComplete = complete }
 
     // MARK: - Conversation Persistence
 
@@ -2858,52 +2758,19 @@ struct Config {
     }
 
     /// Whether the on-device agent model has been downloaded.
-    static var agentModelDownloaded: Bool {
-        UserDefaults.standard.bool(forKey: "agentModelDownloaded")
-    }
+    @UserDefaultsBacked("agentModelDownloaded", default: false) static var agentModelDownloaded: Bool
 
-    static func setAgentModelDownloaded(_ value: Bool) {
-        UserDefaults.standard.set(value, forKey: "agentModelDownloaded")
-    }
+    static func setAgentModelDownloaded(_ value: Bool) { agentModelDownloaded = value }
 
     /// Whether fast-tier queries may run on the *on-device* MLX agent model.
-    /// Default off: the bundled gemma-4 MLX path can fatally crash during inference
-    /// ("SmallVector out of range"), and that crash is uncatchable, so we don't route
-    /// to it unless the user explicitly opts in. Cloud agent models are unaffected.
-    static var localAgentEnabled: Bool {
-        UserDefaults.standard.bool(forKey: "localAgentEnabled")
-    }
+    ///
+    /// Historically default-off because the gemma-4 agent model fatally crashed during
+    /// inference: it was mis-routed through `VLMModelFactory` (see
+    /// `LocalLLMService.visionModelIds`) into the uncatchable `MLXVLM.Gemma4` trap. That
+    /// routing is fixed — the model now loads as text — but the default stays off pending
+    /// on-device confirmation that the text path generates cleanly. Cloud agents are unaffected.
+    @UserDefaultsBacked("localAgentEnabled", default: false) static var localAgentEnabled: Bool
 
-    static func setLocalAgentEnabled(_ value: Bool) {
-        UserDefaults.standard.set(value, forKey: "localAgentEnabled")
-    }
+    static func setLocalAgentEnabled(_ value: Bool) { localAgentEnabled = value }
 }
 
-// MARK: - App Mode Enum
-
-enum AppMode: String, CaseIterable {
-    case direct = "direct"
-    case geminiLive = "geminiLive"
-    case openaiRealtime = "openaiRealtime"
-
-    var displayName: String {
-        switch self {
-        case .direct: return "Direct Mode"
-        case .geminiLive: return "Gemini Live"
-        case .openaiRealtime: return "OpenAI Realtime"
-        }
-    }
-
-    var description: String {
-        switch self {
-        case .direct: return "Wake word, any LLM provider, text-to-speech"
-        case .geminiLive: return "Real-time audio/video streaming via Gemini"
-        case .openaiRealtime: return "Real-time audio/video streaming via OpenAI"
-        }
-    }
-
-    /// Whether this mode is a real-time streaming mode (as opposed to wake-word direct mode).
-    var isRealtime: Bool {
-        self == .geminiLive || self == .openaiRealtime
-    }
-}

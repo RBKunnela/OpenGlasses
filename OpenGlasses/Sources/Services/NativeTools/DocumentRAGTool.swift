@@ -51,6 +51,12 @@ struct DocumentRAGTool: NativeTool {
     weak var documentStore: DocumentStore?
     var cameraService: CameraService?
     var ocrService = OCRService()
+    /// Resolves the active project's namespace (Plan AN). Defaults to "global" when
+    /// unset or no project is active, preserving pre-AN behaviour.
+    var activeNamespace: (() -> String)?
+
+    /// The namespace to scope ingest/query/list to for this call.
+    private func currentNamespace() -> String { activeNamespace?() ?? "global" }
 
     func execute(args: [String: Any]) async throws -> String {
         guard let store = documentStore else { return "Document knowledge base is unavailable." }
@@ -71,13 +77,14 @@ struct DocumentRAGTool: NativeTool {
     private func runQuery(_ args: [String: Any], store: DocumentStore) async -> String {
         let query = (args["query"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return "Provide a query to search the document knowledge base." }
-        guard !store.list().isEmpty else {
-            return "No documents have been saved yet. Use ingest_scan or ingest_text to add one first."
+        let ns = currentNamespace()
+        guard !store.list(namespace: ns).isEmpty else {
+            return "No documents have been saved in this project yet. Use ingest_scan or ingest_text to add one first."
         }
 
         let limit = min(max(args["limit"] as? Int ?? 4, 1), 10)
         let docId = (args["document_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        let passages = store.query(query, limit: limit, documentIds: docId.map { [$0] })
+        let passages = store.query(query, limit: limit, namespace: ns, documentIds: docId.map { [$0] })
 
         guard !passages.isEmpty else {
             return "No relevant passages found for: \(query)"
@@ -104,7 +111,7 @@ struct DocumentRAGTool: NativeTool {
         guard !text.isEmpty else { return "Provide text to save as a document." }
         let name = (args["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? defaultName(prefix: "Note")
 
-        guard let ref = await store.ingest(name: name, text: text, sourceType: "text") else {
+        guard let ref = await store.ingest(name: name, text: text, sourceType: "text", namespace: currentNamespace()) else {
             return "Could not save the document — the text may be too short."
         }
         return "Saved \"\(ref.name)\" to your knowledge base (\(ref.chunkCount) sections, \(ref.charCount) characters)."
@@ -128,15 +135,15 @@ struct DocumentRAGTool: NativeTool {
         }
 
         let name = (args["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? defaultName(prefix: "Scan")
-        guard let ref = await store.ingest(name: name, text: result.text, sourceType: "scan") else {
+        guard let ref = await store.ingest(name: name, text: result.text, sourceType: "scan", namespace: currentNamespace()) else {
             return "Captured text but could not save it."
         }
         return "Scanned and saved \"\(ref.name)\" (\(ref.chunkCount) sections, \(ref.charCount) characters). You can now ask questions about it."
     }
 
     private func listDocuments(store: DocumentStore) -> String {
-        let docs = store.list()
-        guard !docs.isEmpty else { return "No documents saved yet." }
+        let docs = store.list(namespace: currentNamespace())
+        guard !docs.isEmpty else { return "No documents saved in this project yet." }
         let df = DateFormatter()
         df.dateStyle = .medium
         df.timeStyle = .short
@@ -145,8 +152,8 @@ struct DocumentRAGTool: NativeTool {
     }
 
     private func forget(_ args: [String: Any], store: DocumentStore) -> String {
-        let docs = store.list()
-        guard !docs.isEmpty else { return "No documents to delete." }
+        let docs = store.list(namespace: currentNamespace())
+        guard !docs.isEmpty else { return "No documents to delete in this project." }
 
         if let id = (args["document_id"] as? String).flatMap({ $0.isEmpty ? nil : $0 }),
            let match = docs.first(where: { $0.id == id }) {

@@ -2,7 +2,7 @@
 
 [中文文档 (Chinese)](README.zh-CN.md)
 
-An open-source voice-powered AI assistant for Ray-Ban and Oakley Meta smart glasses. 85+ built-in tools, multi-LLM support (cloud + on-device) with automatic model routing, a **fully offline voice mode** (on-device speech-to-text, AI, and voice), personas with simultaneous wake words, an in-lens HUD with hands-free task control on Ray-Ban Display glasses, an on-device knowledge graph, live translation, hands-free field-service guidance, real-time vision coaching, MCP tool servers, and CarPlay + Apple Watch companions — all controlled hands-free by voice.
+A source-available voice-powered AI assistant for Ray-Ban and Oakley Meta smart glasses. 85+ built-in tools, multi-LLM support (cloud + on-device) with automatic model routing, a **fully offline voice mode** (on-device speech-to-text, AI, and voice), personas with simultaneous wake words, an in-lens HUD with hands-free task control on Ray-Ban Display glasses, an on-device knowledge graph, live translation, hands-free field-service guidance, real-time vision coaching, MCP tool servers, and CarPlay + Apple Watch companions — all controlled hands-free by voice.
 
 > **Note**: The Meta Wearables SDK is currently in **developer preview**. App Store distribution is pending approval — each user must build the app from source with their own Meta developer credentials.
 
@@ -53,6 +53,8 @@ OpenGlasses ships App Intents + Siri Shortcuts, so you can drive it straight fro
 | "Hey Siri, ask OpenGlasses a question" | Siri asks **"What would you like to ask?"**, you speak the question, it's answered under your active persona |
 | "Hey Siri, OpenGlasses take a photo" | Captures via the glasses and describes the scene |
 | "Hey Siri, OpenGlasses describe surroundings" | Accessibility scene description |
+
+Beyond the pre-made phrases above, **Capture Glasses Photo** (a silent capture saved to your library) and **Record Glasses Video** are available as **Shortcuts actions** you can add to Siri, the Action button, or your own automations.
 
 The first time, iOS surfaces these in the **Shortcuts** app and the Siri phrase picker (you can rename the phrase to anything you like). A **persona name** can ride in the phrase ("ask Claude…") because it's a fixed, resolvable choice; the **question** can't (iOS only lets App Shortcut phrases embed fixed choices, not free-form text), so it's asked **two-step** — Siri prompts and awaits your spoken reply. Consecutive asks within a few minutes continue the **same conversation thread**, and Siri shows the answer in a result card. The intent runs in the background and speaks the result — no need to bring the app forward. If Siri ever says OpenGlasses isn't running, enable **Settings → Voice → Open App for Siri Questions** to have it launch the app first.
 
@@ -300,13 +302,13 @@ Assign models to **Fast**, **Balanced**, and **Best** tiers, then let OpenGlasse
 ### CarPlay & Apple Watch
 
 - **CarPlay** — hands-free voice assistant on your car's display.
-- **Apple Watch** — companion app and widget for quick control and glanceable status.
+- **Apple Watch** — companion app and widget for quick control and glanceable status, including **taking a photo or starting/stopping a video recording on the glasses** straight from your wrist.
 
 ---
 
 ## Enterprise
 
-Commercial features for teams and regulated industries. These are licensed separately from the open-source core — see [License](#license) or contact Skunkworks NZ.
+Commercial features for teams and regulated industries. These are licensed separately from the source-available core — see [License](#license) or contact Skunkworks NZ at [g@skunkworks.kiwi](mailto:g@skunkworks.kiwi).
 
 ### Field Assist — Guided Field Service
 
@@ -499,7 +501,7 @@ All settings are in-app — no source code editing needed.
 
 ## Contributing
 
-Contributions welcome! This is fully open-source. Fork, improve, submit PRs.
+Contributions welcome! This is source-available under the Business Source License 1.1 (free for non-commercial use; converts to Apache 2.0 in 2030). Fork, improve, submit PRs.
 
 Key areas for contribution:
 - New native tools
@@ -510,7 +512,7 @@ Key areas for contribution:
 
 ## License
 
-Business Source License 1.1 — free for non-commercial use. Commercial use requires a separate license from Skunk0 / Skunkworks NZ. Converts to Apache 2.0 on March 24, 2030. See LICENSE file for details.
+Business Source License 1.1 — free for non-commercial use. Commercial use requires a separate license from Skunk0 / Skunkworks NZ — contact [g@skunkworks.kiwi](mailto:g@skunkworks.kiwi). Converts to Apache 2.0 on March 24, 2030. See LICENSE file for details.
 
 ## Credits
 
@@ -520,4 +522,4 @@ Powered by [Anthropic Claude](https://www.anthropic.com/), [Meta Wearables SDK](
 
 ---
 
-**Note**: Independent open-source project, not affiliated with Meta or Anthropic.
+**Note**: Independent source-available project, not affiliated with Meta or Anthropic.

@@ -11,13 +11,39 @@ cd "${CI_PRIMARY_REPOSITORY_PATH:-$(dirname "$0")/..}"
 defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
 defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
-if ! command -v xcodegen >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
-  brew install xcodegen
-fi
+# --- XcodeGen (no Homebrew) -------------------------------------------------
+# Xcode Cloud's network can't resolve ghcr.io — Homebrew's bottle + portable-ruby host. So
+# `brew install xcodegen` dies inside Homebrew auto-update with
+#   curl: (6) Could not resolve host: ghcr.io
+# which (under `set -e`) aborts this whole script. Install XcodeGen from its GitHub *release*
+# instead: github.com is reachable (the repo was just cloned from it), and the release archive is
+# self-contained (`xcodegen/bin/xcodegen` + `share/`).
+#
+# When bumping, keep this in step with the version developers use locally.
+XCODEGEN_VERSION="2.45.4"
+
 if ! command -v xcodegen >/dev/null 2>&1; then
-  echo "xcodegen required to generate OpenGlasses.xcodeproj" >&2
+  echo "ci_post_clone: installing XcodeGen ${XCODEGEN_VERSION} from the GitHub release…"
+  tools_dir="$PWD/.ci-tools/xcodegen-${XCODEGEN_VERSION}"
+  rm -rf "$tools_dir"
+  mkdir -p "$tools_dir"
+  curl -fsSL "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip" \
+    -o "$tools_dir/xcodegen.zip"
+  unzip -oq "$tools_dir/xcodegen.zip" -d "$tools_dir"
+  xcodegen_bin="$(find "$tools_dir" -type f -name xcodegen -path '*/bin/*' | head -n 1)"
+  if [ -n "$xcodegen_bin" ]; then
+    chmod +x "$xcodegen_bin"
+    PATH="$(dirname "$xcodegen_bin"):$PATH"
+    export PATH
+  fi
+fi
+
+if ! command -v xcodegen >/dev/null 2>&1; then
+  echo "ci_post_clone: xcodegen unavailable after GitHub-release install" >&2
   exit 1
 fi
+echo "ci_post_clone: $(xcodegen --version 2>&1 | head -n 1)"
+
 ./Scripts/generate-xcodeproj.sh
 
 # Xcode Cloud requires a committed Package.resolved and will NOT resolve packages
@@ -31,3 +57,4 @@ fi
 RESOLVED_DST="OpenGlasses.xcodeproj/project.xcworkspace/xcshareddata/swiftpm"
 mkdir -p "$RESOLVED_DST"
 cp ci_scripts/Package.resolved "$RESOLVED_DST/Package.resolved"
+echo "ci_post_clone: complete"

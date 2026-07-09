@@ -1,10 +1,12 @@
-# Plan — Speaker Diarization (Deepgram "who said what")
+# Plan AQ — Speaker Diarization (Deepgram "who said what")
 
-**Status:** 📋 Planned (not built). The deterministic core (response parsing, speaker
-registry, segment merging) is fully headless-testable; only the live WebSocket stream +
-mic audio are device-pending — same posture as the rest of the speech work. Closes the
-long-standing gap noted in `CLAUDE.md` ("Speaker Diarization — NOT YET DONE (needs Deepgram
-integration)").
+**Status:** 🚧 Core shipped ([#115](https://github.com/straff2002/OpenGlasses/pull/115)). The
+deterministic core (response parsing, speaker registry, segment merging, PCM conversion, the
+provider seam) is built and tested (24 tests); the `DeepgramSTTService`/`DeepgramBatchService`
+transport + flag-gated `AmbientCaptionService` path + `DiarizationSettingsView` are in. Off by
+default; HIPAA mode hard-disables. **Deferred (device-pending):** the live WebSocket stream +
+mic audio, and on-device speaker-naming-from-chip. Closes the long-standing gap noted in
+`CLAUDE.md` ("Speaker Diarization — NOT YET DONE (needs Deepgram integration)").
 
 Today every transcript — live ambient captions, recorded-meeting `.m4a` transcripts,
 meeting summaries — is an undifferentiated wall of text. Diarization labels **who** said
@@ -60,8 +62,8 @@ protocol DiarizationProvider: AnyObject {
   `confidence`. Pure value type.
 - `DeepgramResponseParser` — **the tested core.** Deepgram JSON → `DiarizedSegment`. Computes
   the **majority speaker across the segment's words** (handles a speaker switching
-  mid-segment — the same idea as VisionClaw's Android `DeepgramSTTService`), distinguishes
-  interim vs `is_final`, tolerates missing `speaker` fields. Pure function → heavily tested.
+  mid-segment), distinguishes interim vs `is_final`, tolerates missing `speaker` fields. Pure
+  function → heavily tested.
 - `SpeakerRegistry` — stable `Int` id → optional name + a deterministic display colour;
   persists names; merges ids when two are named the same. Pure + persisted.
 - `SpeakerSegmentMerger` — coalesces consecutive same-speaker finals into readable turns for
@@ -159,7 +161,5 @@ captions, recorded meetings, and the brain's social memory. "Who said what" turn
 transcript into a usable record (assign action items, recall who proposed what, brief on a
 person from real quotes). It's cheap and low-risk: the hard part (response → labeled segments)
 is a pure, fully-testable function, it reuses the entire audio + caption + recording stack
-already built, and it degrades cleanly to today's behaviour when off. Reference: the VisionClaw
-fork's Android `DeepgramSTTService` proves the streaming-diarization shape end to end (it is a
-*reference* only — Meta-licensed sample code; the iOS client is written fresh against
-Deepgram's documented API).
+already built, and it degrades cleanly to today's behaviour when off. The iOS client is written
+fresh against Deepgram's documented streaming + batch API.

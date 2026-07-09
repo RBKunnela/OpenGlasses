@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-一款开源的语音 AI 助手应用，专为 Ray-Ban 与 Oakley Meta 智能眼镜打造。内置 85+ 原生工具，支持多 LLM（云端 + 本地设备）并自动路由模型，**完全离线语音模式**（端侧语音转文字、AI 与语音），多角色同时唤醒，在 Ray-Ban Display 眼镜上提供镜内 HUD 与免提任务操作，本地设备知识图谱，实时翻译，免提现场作业指导，实时视觉教练，MCP 工具服务器，以及 CarPlay + Apple Watch 配套应用——全部通过语音免提控制。
+一款源代码可用（source-available）的语音 AI 助手应用，专为 Ray-Ban 与 Oakley Meta 智能眼镜打造。内置 85+ 原生工具，支持多 LLM（云端 + 本地设备）并自动路由模型，**完全离线语音模式**（端侧语音转文字、AI 与语音），多角色同时唤醒，在 Ray-Ban Display 眼镜上提供镜内 HUD 与免提任务操作，本地设备知识图谱，实时翻译，免提现场作业指导，实时视觉教练，MCP 工具服务器，以及 CarPlay + Apple Watch 配套应用——全部通过语音免提控制。
 
 > **注意**：Meta Wearables SDK 目前处于**开发者预览**阶段。尚不支持 App Store 分发——每位用户需使用自己的 Meta 开发者凭据从源码构建应用。
 
@@ -269,7 +269,7 @@
 
 ## 企业版功能
 
-面向团队和受监管行业的商业功能。这些功能在开源核心之外单独授权——参见[许可证](#许可证)或联系 Skunkworks NZ。
+面向团队和受监管行业的商业功能。这些功能在源代码可用核心之外单独授权——参见[许可证](#许可证)或联系 Skunkworks NZ。
 
 ### 现场作业助手 — 引导式现场服务
 
@@ -424,7 +424,7 @@ open OpenGlasses.xcodeproj
 
 ## 参与贡献
 
-欢迎贡献！这是一个完全开源的项目。Fork、改进、提交 PR。
+欢迎贡献！本项目采用 Business Source License 1.1，源代码可用（非商业用途免费，2030 年转为 Apache 2.0）。Fork、改进、提交 PR。
 
 主要贡献方向：
 - 新的原生工具
@@ -435,7 +435,7 @@ open OpenGlasses.xcodeproj
 
 ## 许可证
 
-BSL 1.1（Business Source License 1.1）——非商业用途免费。商业用途需从 Skunk0 / Skunkworks NZ 获取单独许可。2030 年 3 月 24 日转换为 Apache 2.0。详见 LICENSE 文件。
+BSL 1.1（Business Source License 1.1）——非商业用途免费。商业用途需从 Skunk0 / Skunkworks NZ 获取单独许可（联系 [g@skunkworks.kiwi](mailto:g@skunkworks.kiwi)）。2030 年 3 月 24 日转换为 Apache 2.0。详见 LICENSE 文件。
 
 ## 致谢
 
@@ -445,4 +445,4 @@ BSL 1.1（Business Source License 1.1）——非商业用途免费。商业用�
 
 ---
 
-**注意**：这是一个独立的开源项目，与 Meta 或 Anthropic 无关联。
+**注意**：这是一个独立的源代码可用项目，与 Meta 或 Anthropic 无关联。

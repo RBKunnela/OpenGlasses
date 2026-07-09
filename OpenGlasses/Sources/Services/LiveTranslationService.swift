@@ -18,6 +18,11 @@ final class LiveTranslationService: ObservableObject {
     private var audioEngine: AVAudioEngine?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    /// Coexisting hold with the audio-session coordinator. Translation runs *under* the current
+    /// owner (the wake-word listener that triggered it) using `.measurement`/`.mixWithOthers`, so it
+    /// registers as a non-exclusive rider rather than acquiring the session — it must not preempt
+    /// or deactivate it.
+    private var coexistToken: UUID?
 
     /// Callback when a translation is ready to be spoken
     var onTranslation: ((String) -> Void)?
@@ -52,6 +57,7 @@ final class LiveTranslationService: ObservableObject {
         lastTranslatedText = ""
 
         startListening()
+        coexistToken = AudioSessionCoordinator.shared.beginCoexisting(.liveTranslation)
         print("🌍 Live translation started: \(source) → \(target)")
     }
 
@@ -65,6 +71,10 @@ final class LiveTranslationService: ObservableObject {
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine = nil
+        if let token = coexistToken {
+            coexistToken = nil
+            AudioSessionCoordinator.shared.endCoexisting(token)
+        }
         print("🌍 Live translation stopped. \(translationCount) translations.")
     }
 
@@ -78,7 +88,11 @@ final class LiveTranslationService: ObservableObject {
             let options: AVAudioSession.CategoryOptions = usePhoneMic
                 ? [.mixWithOthers, .defaultToSpeaker]
                 : [.mixWithOthers, .allowBluetoothHFP, .allowBluetoothA2DP, .defaultToSpeaker]
-            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: options)
+            // .default, not .measurement (Plan BE): as a coexisting rider we must not leave the
+            // shared session in a state the owner didn't choose. .measurement disables output
+            // processing and makes iPhone-speaker TTS extremely quiet, and it was never restored on
+            // stop. .default matches the wake-word baseline so audio coexists cleanly.
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: options)
             try audioSession.setActive(true)
             print("🌍 Translation mic source: \(usePhoneMic ? "iPhone" : "glasses (Bluetooth)")")
         } catch {

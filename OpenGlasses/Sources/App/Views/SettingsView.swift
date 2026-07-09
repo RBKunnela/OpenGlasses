@@ -7,6 +7,7 @@ struct SettingsView: View {
     @AppStorage("accentColorName") private var accentColorName: String = "violet"
 
     // Model configs editing
+    @State private var simpleModeEnabled = Config.simpleModeEnabled
     @State private var modelConfigs: [ModelConfig] = Config.savedModels
     @State private var editingModel: ModelConfig? = nil
     @State private var showAddModel = false
@@ -27,13 +28,8 @@ struct SettingsView: View {
     @State private var isTogglingEncryption = false
 
     // Service settings (owned here, bound to ServicesSettingsView)
-    @State private var elevenLabsKeyInput = Config.elevenLabsAPIKey
-    @State private var selectedVoice = Config.elevenLabsVoiceId
-    @State private var emotionAwareTTSEnabled = Config.emotionAwareTTSEnabled
-    @State private var perplexityKeyInput = Config.perplexityAPIKey
-    @State private var broadcastPlatform = Config.broadcastPlatform
-    @State private var broadcastRTMPURL = Config.broadcastRTMPURL
-    @State private var broadcastStreamKey = Config.broadcastStreamKey
+    // ElevenLabs / TTS voice, web-search keys, and live-streaming config are owned
+    // by ServicesSettingsView (self-contained, persists to Config on change).
 
     var body: some View {
         Form {
@@ -110,6 +106,10 @@ struct SettingsView: View {
                 Text("Alternative ways to start the assistant without the wake word — for noisy, silent, or no-speech situations. All are off by default. The Volume Button trigger can interfere with normal volume control.")
             }
 
+            // Simple Mode hides the owner-only configuration surface (models, personas,
+            // behavior, tools, integrations, advanced) — the device keeps working exactly
+            // as configured; the sections below just stop being visible/editable.
+            if !simpleModeEnabled {
             // MARK: AI Models
             Section {
                 ForEach(modelConfigs) { model in
@@ -385,6 +385,25 @@ struct SettingsView: View {
                 } label: {
                     Label("Voice Skills", systemImage: "waveform")
                 }
+
+                if Config.agentModeEnabled {
+                    NavigationLink {
+                        SuggestedSkillsView()
+                    } label: {
+                        HStack {
+                            Label("Suggested Skills", systemImage: "lightbulb.max")
+                            Spacer()
+                            let count = EvolvedSkillStore.shared.pending().count
+                            if count > 0 {
+                                Text("\(count)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 7).padding(.vertical, 2)
+                                    .background(Capsule().fill(.red))
+                            }
+                        }
+                    }
+                }
             } header: {
                 Text("Tools the AI Can Use")
             } footer: {
@@ -397,16 +416,7 @@ struct SettingsView: View {
 
             Section {
                 NavigationLink {
-                    ServicesSettingsView(
-                        appState: appState,
-                        elevenLabsKeyInput: $elevenLabsKeyInput,
-                        selectedVoice: $selectedVoice,
-                        emotionAwareTTSEnabled: $emotionAwareTTSEnabled,
-                        perplexityKeyInput: $perplexityKeyInput,
-                        broadcastPlatform: $broadcastPlatform,
-                        broadcastRTMPURL: $broadcastRTMPURL,
-                        broadcastStreamKey: $broadcastStreamKey
-                    )
+                    ServicesSettingsView(appState: appState)
                 } label: {
                     Label("Services & Integrations", systemImage: "square.grid.2x2")
                 }
@@ -435,6 +445,8 @@ struct SettingsView: View {
                 Text("Connected Apps & Services")
             } footer: {
                 Text("ElevenLabs voices, Perplexity search, broadcast targets, and live-streaming live under Services. Gateways are OpenClaw bridges to your devices (smart home, automations). MCP Servers expose external tool servers the AI can call.")
+            }
+
             }
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -543,6 +555,7 @@ struct SettingsView: View {
                 Text("Theme, accent colour, and which languages the assistant speaks and understands.")
             }
 
+            if !simpleModeEnabled {
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             // MARK: — Advanced
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -559,10 +572,40 @@ struct SettingsView: View {
                 } label: {
                     Label("Network Activity", systemImage: "antenna.radiowaves.left.and.right")
                 }
+
+                NavigationLink {
+                    LiveVisionSettingsView()
+                } label: {
+                    Label("Live Vision", systemImage: "camera.metering.matrix")
+                }
+
+                NavigationLink {
+                    DocumentsView()
+                } label: {
+                    Label("Documents", systemImage: "doc.text.magnifyingglass")
+                }
+
+                NavigationLink {
+                    CaptureFlowAuthorView()
+                } label: {
+                    Label("Author Capture-Flow", systemImage: "list.bullet.rectangle")
+                }
             } header: {
                 Text("Advanced")
             } footer: {
                 Text("Diagnostic tools for power users — inspect the prompts being sent to the AI and watch live network requests. Useful for debugging or building your own integrations.")
+            }
+
+            }
+
+            // MARK: Simple Mode (always visible so the owner can leave it)
+            Section {
+                Toggle(isOn: $simpleModeEnabled) {
+                    Label("Simple Mode", systemImage: "dial.low")
+                }
+                .onChange(of: simpleModeEnabled) { _, v in Config.simpleModeEnabled = v }
+            } footer: {
+                Text("Hides model, persona, behavior, tool, integration, and advanced settings — for handing the device to someone who just needs it to work. Everything keeps running exactly as configured.")
             }
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -658,26 +701,14 @@ struct SettingsView: View {
         }
         appState.llmService.refreshActiveModel()
 
-        Config.setElevenLabsAPIKey(elevenLabsKeyInput)
-        Config.setElevenLabsVoiceId(selectedVoice)
-        // Reset quota cache in case user added credits or changed key
-        appState.speechService.resetElevenLabsQuota()
-
-        Config.setPerplexityAPIKey(perplexityKeyInput)
         Config.setPrivacyFilterEnabled(privacyFilterEnabled)
         appState.privacyFilter.isEnabled = privacyFilterEnabled
         Config.setUseGlassesMicForWakeWord(useGlassesMicForWakeWord)
-
-        Config.setEmotionAwareTTSEnabled(emotionAwareTTSEnabled)
 
         Config.setIntentClassifierEnabled(intentClassifierEnabled)
         Config.setUserMemoryEnabled(userMemoryEnabled)
         Config.setMemoryNudgesEnabled(memoryNudgesEnabled)
         Config.setConversationPersistenceEnabled(conversationPersistenceEnabled)
-
-        Config.setBroadcastPlatform(broadcastPlatform)
-        Config.setBroadcastRTMPURL(broadcastRTMPURL)
-        Config.setBroadcastStreamKey(broadcastStreamKey)
 
         if appState.currentMode == .direct {
             Task {

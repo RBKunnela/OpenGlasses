@@ -384,6 +384,15 @@ class AppState: ObservableObject, AppStateProtocol {
     @Published var isConnected: Bool = false {
         didSet {
             speechService.glassesConnected = isConnected
+            // Tell the gateway-side agent the glasses attached/detached (device.event push,
+            // Plan BH follow-up). Consent-gated like the remote observe class; the client
+            // itself no-ops unless the socket is authenticated.
+            if oldValue != isConnected, Config.agentModeEnabled, Config.remoteInvokeObserveEnabled {
+                openClawEventClient.sendDeviceEvent(type: "glasses", payload: [
+                    "connected": isConnected,
+                    "battery": glassesService.batteryLevel ?? -1,
+                ])
+            }
             // Clean up hardware-facing interfaces when glasses disconnect.
             // The agent and in-flight LLM requests keep running — results
             // can appear in notifications or be read when the app is opened.
@@ -448,6 +457,10 @@ class AppState: ObservableObject, AppStateProtocol {
     }
     @Published var currentTranscription: String = ""
     @Published var lastResponse: String = ""
+    /// In-flight assistant reply for the Chat tab, streamed token-by-token where the provider
+    /// supports it (on-device models today). The Chat thread renders this as a live bubble, then
+    /// swaps it for the persisted message on completion. Nil when no reply is streaming.
+    @Published var streamingTurn: StreamingTurn?
     @Published var errorMessage: String?
     @Published var currentMode: AppMode = Config.appMode
     @Published var activePersona: Persona? {
@@ -528,6 +541,8 @@ class AppState: ObservableObject, AppStateProtocol {
     // OpenClaw + Realtime sessions
     let openClawBridge = OpenClawBridge()
     let openClawEventClient = OpenClawEventClient()
+    /// Remote invoke (Plan BH): gateway-initiated device commands, deny-by-default.
+    lazy var remoteInvoke: RemoteInvokeService = makeRemoteInvokeService()
     let geminiLiveSession = GeminiLiveSessionManager()
     let openAIRealtimeSession = OpenAIRealtimeSessionManager()
     let backgroundVoice = BackgroundVoiceService()
@@ -584,6 +599,10 @@ class AppState: ObservableObject, AppStateProtocol {
 
     init() {
         // Initialize native tool system
+        // Active project namespace for document scoping (Plan AN). Bind a local ref to
+        // `userMemory` (already initialized + kept current by activePersona.didSet) so the
+        // closure resolves the live project id without capturing the half-built AppState.
+        let memoryForNamespace = userMemory
         nativeToolRegistry = NativeToolRegistry(
             locationService: locationService,
             conversationStore: conversationStore,
@@ -596,7 +615,8 @@ class AppState: ObservableObject, AppStateProtocol {
             audioRecorder: audioRecorder,
             medicalExportService: medicalExportService,
             semanticMemory: userMemory,
-            documentStore: documentStore
+            documentStore: documentStore,
+            activeNamespace: { memoryForNamespace.activePersonaId ?? "global" }
         )
         nativeToolRouter = NativeToolRouter(registry: nativeToolRegistry, openClawBridge: openClawBridge)
 
@@ -649,17 +669,10 @@ class AppState: ObservableObject, AppStateProtocol {
 
         addDebugEvent("AppState initialized")
 
-        // Register Gemma 4 model type — not yet in the official mlx-swift-lm registry
-        Task {
-            await LLMTypeRegistry.shared.registerModelType("gemma4") { data in
-                let config = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: data)
-                return Gemma4TextModel(config)
-            }
-            await LLMTypeRegistry.shared.registerModelType("gemma4_text") { data in
-                let config = try JSONDecoder().decode(Gemma4TextConfiguration.self, from: data)
-                return Gemma4TextModel(config)
-            }
-        }
+        // (Gemma-4 is now supplied by mlx-swift-lm's own LLMModelFactory registration; the
+        // former custom port + override here shadowed the library's tested model for every
+        // "gemma4" text load and was only reached — never — because the model mistakenly
+        // loaded through the vision factory. See LocalLLMService.visionModelIds.)
 
         // Share the audio engine so transcription works in background
         transcriptionService.sharedAudioEngineProvider = wakeWordService
@@ -916,9 +929,33 @@ class AppState: ObservableObject, AppStateProtocol {
         // Configure Safety Assessment (HECA) — runs through the structured-vision provider layer.
         SafetyAssessmentService.shared.configure(camera: cameraService, llm: llmService)
 
+        // Visual State Memory (Plan AV) — the keyframe describe needs a vision LLM.
+        VisualStateService.shared.llm = llmService
+
+        // Health-Safety Advisor (Plan AB) — grounded long-tail reasoning for "is this safe for me?".
+        HealthSafetyAdvisor.shared.llm = llmService
+
+        // Apply any saved LLM pricing overrides into the live table (Plan AU editor).
+        Config.applyModelPricingOverrides()
+
+        // Projects (Plan AN) — grounds the prompt in the active project's documents.
+        ProjectContextService.shared.configure(
+            documentStore: documentStore,
+            activeProjectId: { [weak self] in self?.activePersona?.id },
+            activeProjectName: { [weak self] in self?.activePersona?.name }
+        )
+
         // Configure Study Mode — generates decks from documents via the text→JSON LLM call;
         // camera enables the hands-free scan → OCR source.
         StudyService.shared.configure(llm: llmService, documentStore: documentStore, tts: speechService, camera: cameraService)
+
+        // Skill Self-Evolution (Plan AW) — give the loop its LLM analyzer. The capture hook
+        // (NativeToolRouter) feeds tool-error samples; this completes the loop so proposals reach the
+        // review inbox. Agent-Mode-gated throughout; inert until the user turns Agent Mode on.
+        let llm = llmService
+        SkillEvolutionService.shared.analyzer = LLMSkillEvolutionAnalyzer(complete: { system, user in
+            try await llm.completeStateless(user, system: system)
+        })
 
         // Memory & Recall Phase 2 — index conversation turns; recall summarizes via the user's
         // active provider (on-device when that's their choice). Backfill existing history once.
@@ -979,6 +1016,17 @@ class AppState: ObservableObject, AppStateProtocol {
             guard let self else { return }
             Task { @MainActor in
                 await self.triageOpenClawNotification(message)
+            }
+        }
+        // Remote invoke (Plan BH): gateway-initiated device commands. Parser/policy/reply are
+        // pure and tested; the policy denies everything while Agent Mode is off, before the
+        // executor is ever consulted. Every exchange is audited (gateway settings).
+        openClawEventClient.onRemoteRequest = { [weak self] frame, respond in
+            guard let self else { return }
+            Task { @MainActor in
+                if let reply = await self.remoteInvoke.handleFrame(frame) {
+                    respond(reply)
+                }
             }
         }
         // Sync gateway memories when OpenClaw connects
@@ -1727,7 +1775,7 @@ class AppState: ObservableObject, AppStateProtocol {
                 prompt,
                 locationContext: locationService.locationContext,
                 imageData: imageData,
-                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil
+                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? prompt : nil) : nil
             )
             let response = Config.userMemoryEnabled ? userMemory.parseAndExecuteCommands(in: rawResponse) : rawResponse
             lastResponse = response
@@ -1766,7 +1814,7 @@ class AppState: ObservableObject, AppStateProtocol {
                 prompt,
                 locationContext: locationService.locationContext,
                 imageData: photoData,
-                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil
+                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? prompt : nil) : nil
             )
             let response = Config.userMemoryEnabled ? userMemory.parseAndExecuteCommands(in: rawResponse) : rawResponse
             lastResponse = response
@@ -1818,7 +1866,7 @@ class AppState: ObservableObject, AppStateProtocol {
                 let response = try await llmService.sendMessage(
                     text,
                     locationContext: locationService.locationContext,
-                    memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil
+                    memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? text : nil) : nil
                 )
                 lastResponse = response
                 await speechService.speak(response)
@@ -1882,7 +1930,7 @@ class AppState: ObservableObject, AppStateProtocol {
                 prompt,
                 locationContext: locationService.locationContext,
                 imageData: photoData,
-                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil
+                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? prompt : nil) : nil
             )
             let response = Config.userMemoryEnabled ? userMemory.parseAndExecuteCommands(in: rawResponse) : rawResponse
             lastResponse = response
@@ -2155,7 +2203,20 @@ class AppState: ObservableObject, AppStateProtocol {
             return try await self.openClawBridge.agentRequest(method: method, params: params)
         })
         let custom = CustomAgentHarness(config: Config.customAgentHarness ?? CustomHarnessConfig())
-        return AgentHarnessRegistry([openClaw, custom])
+
+        // Codex / Claude Code remote (Plan N Phase 3) — preset-backed HTTP harnesses, ready when a token is set.
+        let codex = CustomAgentHarness(
+            kind: .codexCloud,
+            config: AgentHarnessPreset.codexCloud(token: Config.codexAgentToken, baseURL: Config.codexAgentBaseURL),
+            displayName: AgentHarnessKind.codexCloud.displayName,
+            isConfigured: !Config.codexAgentToken.isEmpty)
+        let claudeCode = CustomAgentHarness(
+            kind: .claudeRemote,
+            config: AgentHarnessPreset.claudeRemote(token: Config.claudeRemoteToken, baseURL: Config.claudeRemoteBaseURL),
+            displayName: AgentHarnessKind.claudeRemote.displayName,
+            isConfigured: !Config.claudeRemoteToken.isEmpty)
+
+        return AgentHarnessRegistry([openClaw, custom, codex, claudeCode])
     }
 
     /// Re-read the Custom endpoint config into the session's registry — call after the user edits the
@@ -2206,49 +2267,194 @@ class AppState: ObservableObject, AppStateProtocol {
     func handleWakeWordDetected(manual: Bool = false) async {
         print("🎤 \(manual ? "Tap-to-talk" : "Wake word") detected! Starting conversation...")
         manuallyTriggered = manual
-        inConversation = true
-
-        // Ensure audio session + engine are alive BEFORE marking ourselves as listening.
-        // Tap-to-talk calls stopListening() first (engine = nil), and startListening()
-        // bails on `guard !isListening`, so setting isListening early would leave the shared
-        // engine dead and force TranscriptionService onto a fragile fallback engine.
-        wakeWordService.configureAudioSession()
-        try? await wakeWordService.ensureAudioEngineRunning()
-        isListening = true
-
-        // Snapshot what's playing before pausing it
-        nowPlayingAtStart = NowPlayingSnapshot.current()
-
-        // Pause podcasts/music so the user can speak clearly (skips if call in progress)
-        wakeWordService.pauseOtherAudio()
-
-        speechService.playAcknowledgmentTone()
-        transcriptionService.startRecording()
-        updateLiveActivity()
+        // The engine-before-listening ordering lives (tested) in ConversationStartSequence.
+        await ConversationStartSequence.run(.init(
+            beginConversation: { [self] in inConversation = true },
+            configureAudioSession: { [self] in wakeWordService.configureAudioSession() },
+            ensureAudioEngineRunning: { [self] in try await wakeWordService.ensureAudioEngineRunning() },
+            markListening: { [self] in isListening = true },
+            snapshotNowPlaying: { [self] in nowPlayingAtStart = NowPlayingSnapshot.current() },
+            pauseOtherAudio: { [self] in wakeWordService.pauseOtherAudio() },
+            playAcknowledgmentTone: { [self] in speechService.playAcknowledgmentTone() },
+            startRecording: { [self] in transcriptionService.startRecording() },
+            updateLiveActivity: { [self] in updateLiveActivity() }
+        ))
     }
 
     // MARK: - Voice Commands
 
-    private static let stopPhrases = ["stop", "nevermind", "never mind", "cancel", "shut up", "be quiet", "quiet"]
-    private static let goodbyePhrases = ["goodbye", "good bye", "bye", "that's all", "thats all",
-                                          "thanks claude", "thank you claude", "i'm done", "im done",
-                                          "end conversation", "go to sleep"]
-    private static let photoPhrases = ["take a picture", "take a photo", "take photo", "take picture",
-                                        "capture photo", "snap a photo", "snap a picture", "take a snap"]
+    /// Pure recognizer for the pre-LLM voice commands (Plan BG P2 groundwork). AppState still owns
+    /// the side effects; the phrase matching + persona-prefix stripping live in a tested unit.
+    private let voiceCommandParser = VoiceCommandParser.default
 
-    private func isStopCommand(_ text: String) -> Bool {
-        let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        return Self.stopPhrases.contains(where: { lower == $0 || lower.hasPrefix($0 + " ") || lower.hasSuffix(" " + $0) })
+    private func isStopCommand(_ text: String) -> Bool { voiceCommandParser.isStop(text) }
+    private func isGoodbyeCommand(_ text: String) -> Bool { voiceCommandParser.isGoodbye(text) }
+    private func isPhotoCommand(_ text: String) -> Bool { voiceCommandParser.isPhoto(text) }
+
+    /// After finishing or short-circuiting a turn, either keep listening for a follow-up (while a
+    /// conversation is active) or drop back to wake-word detection. Replaces the 8+ copy-pasted
+    /// `if inConversation { … } else { await returnToWakeWord() }` blocks (Plan BG P2).
+    /// - Parameter ensureEngine: run the audio-engine keepalive first — needed after TTS playback,
+    ///   which may have interrupted the engine.
+    private func resumeListeningOrReturnToWakeWord(ensureEngine: Bool = false) async {
+        if inConversation {
+            if ensureEngine { try? await wakeWordService.ensureAudioEngineRunning() }
+            isListening = true
+            transcriptionService.startRecording()
+        } else {
+            await returnToWakeWord()
+        }
     }
 
-    private func isGoodbyeCommand(_ text: String) -> Bool {
-        let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        return Self.goodbyePhrases.contains(where: { lower.contains($0) })
+    /// The ordered pre-LLM voice-command chain (Plan BG P2). Each handler checks the transcript and,
+    /// if it applies, drives its mode and resumes listening, reporting that it consumed the turn so
+    /// the flow stops before the LLM. Order is preserved exactly from the original if-ladder:
+    /// teleprompter → HUD task → launcher select → launcher open → intent-ignore filter.
+    private func preLLMHandlers() -> [VoiceCommandHandler] {
+        [
+            // Teleprompter (Phase 2): while a session is running it owns the display, so
+            // "next/back/pause/resume/restart/faster/slower/stop" drive the prompter rather than
+            // the LLM. Checked first since it's a focused, full-screen mode.
+            VoiceCommandHandler(label: "teleprompter") { [weak self] text in
+                guard let self, self.teleprompterService.isActive,
+                      self.teleprompterService.handleVoiceCommand(text) else { return false }
+                print("📜 Teleprompter command handled: \(text)")
+                await self.resumeListeningOrReturnToWakeWord()
+                return true
+            },
+            // HUD task control (Display Phase 3 / Plan X): while a Now/Next card is on the glasses,
+            // "next/done/skip/back" drive the task instead of the LLM. Before intent classification
+            // so these short commands aren't filtered.
+            VoiceCommandHandler(label: "hud-task") { [weak self] text in
+                guard let self, await self.hudRouter.handleVoiceCommand(text) else { return false }
+                print("🎯 HUD task command handled: \(text)")
+                await self.resumeListeningOrReturnToWakeWord()
+                return true
+            },
+            // HUD launcher voice nav (Display Phase 4 / Plan Y): while a menu is open, a spoken item
+            // label (or "back"/"close") selects it. Before the open command so saying a leaf name
+            // inside the menu navigates instead of re-opening the root.
+            VoiceCommandHandler(label: "hud-launcher-select") { [weak self] text in
+                guard let self, self.hudLauncher.handleVoiceSelection(text) else { return false }
+                print("🎛 HUD launcher voice selection: \(text)")
+                await self.resumeListeningOrReturnToWakeWord()
+                return true
+            },
+            // HUD launcher (Display Phase 4 / Plan Y): "menu" opens the band-navigable launcher.
+            VoiceCommandHandler(label: "hud-launcher-open") { [weak self] text in
+                guard let self, HUDLauncher.isOpenCommand(text), self.hudLauncher.hasContent else { return false }
+                print("🎛 HUD launcher opened")
+                self.hudLauncher.open()
+                await self.resumeListeningOrReturnToWakeWord()
+                return true
+            },
+            // Intent classification — filter bystander/filler speech.
+            VoiceCommandHandler(label: "intent-ignore") { [weak self] text in
+                guard let self, self.intentClassifier.isEnabled,
+                      !self.isPhotoCommand(text), !self.isStopCommand(text), !self.isGoodbyeCommand(text)
+                else { return false }
+                guard await self.intentClassifier.classify(transcript: text) == .ignore else { return false }
+                print("🚫 Intent classifier: IGNORE — not responding")
+                await self.resumeListeningOrReturnToWakeWord()
+                return true
+            },
+        ]
     }
 
-    private func isPhotoCommand(_ text: String) -> Bool {
-        let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        return Self.photoPhrases.contains(where: { lower.contains($0) })
+    /// The post-store voice-command chain (Plan BG P2): stop, goodbye, and photo. These run after
+    /// the user's turn is persisted to the conversation store and after persona detection, so the
+    /// photo handler prompts the LLM with the persona-stripped `query` while command matching uses
+    /// the raw transcript. Same first-consumer-wins contract as `preLLMHandlers`.
+    private func postStoreHandlers(query: String) -> [VoiceCommandHandler] {
+        [
+            // "stop" — interrupt TTS, stay in conversation
+            VoiceCommandHandler(label: "stop") { [weak self] text in
+                guard let self, self.isStopCommand(text) else { return false }
+                print("🛑 Voice command: stop")
+                self.speechService.stopSpeaking()
+                if self.inConversation { print("💬 Stopped — listening for next question...") }
+                await self.resumeListeningOrReturnToWakeWord()
+                return true
+            },
+            // "goodbye" — end conversation, back to wake word
+            VoiceCommandHandler(label: "goodbye") { [weak self] text in
+                guard let self, self.isGoodbyeCommand(text) else { return false }
+                print("👋 Voice command: goodbye")
+                self.speechService.stopSpeaking()
+                self.inConversation = false
+                self.lastResponse = "Goodbye!"
+                await self.speechService.speak("Goodbye!")
+                await self.returnToWakeWord()
+                return true
+            },
+            // "take a picture" — capture photo from glasses camera, describe via the vision LLM
+            VoiceCommandHandler(label: "photo") { [weak self] text in
+                guard let self, self.isPhotoCommand(text) else { return false }
+                print("📸 Voice command: take a picture")
+                self.isProcessing = true
+                // Start capture immediately — play the shutter tone, no spoken "taking a picture"
+                self.speechService.playAcknowledgmentTone()
+                self.speechService.startThinkingSound()
+
+                self.currentLLMTask = Task {
+                    await ConversationTurnRunner.run(.init(
+                        send: {
+                            // Capture and send to LLM concurrently — no extra round-trip speech
+                            let photoData = try await self.cameraService.capturePhoto()
+                            try Task.checkCancellation()
+                            // Restore audio for wake word after camera capture (camera reconfigures for Bluetooth)
+                            self.cameraService.restoreAudioForWakeWord()
+                            self.cameraService.saveToPhotoLibrary(photoData)
+                            print("📸 Photo captured, sending to LLM with prompt: \(query)")
+
+                            return try await self.llmService.sendMessage(
+                                query,
+                                locationContext: self.locationService.locationContext,
+                                imageData: photoData,
+                                memoryContext: Config.userMemoryEnabled ? self.userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? query : nil) : nil
+                            )
+                        },
+                        postProcess: { rawResponse in
+                            Config.userMemoryEnabled ? self.userMemory.parseAndExecuteCommands(in: rawResponse) : rawResponse
+                        },
+                        accept: { response in
+                            self.lastResponse = response
+                            if Config.conversationPersistenceEnabled {
+                                self.conversationStore.appendMessage(role: "assistant", content: response)
+                            }
+                            print("🤖 \(self.llmService.activeModelName) (vision): \(response)")
+
+                            // If an audio or video recording is active, inject the description
+                            // into the caption history so the meeting assistant has visual context.
+                            if self.audioRecorder.isRecording || self.videoRecorder.isRecording {
+                                self.ambientCaptions.insertVisualNote(response)
+                            }
+                        },
+                        speak: { response in
+                            // Start wake word listener during TTS so user can say "stop"
+                            self.startStopListener()
+                            await self.speechService.speak(response)
+                            self.stopStopListener()
+                        },
+                        onCancelled: {
+                            print("🛑 Photo/LLM task cancelled")
+                        },
+                        onError: { error in
+                            self.cameraService.restoreAudioForWakeWord()
+                            print("📸 Photo capture failed: \(error)")
+                            self.lastResponse = "Photo failed: \(error.localizedDescription)"
+                            await self.speechService.speak("Sorry, I couldn't take a photo or process the image. \(error.localizedDescription)")
+                        },
+                        finish: {
+                            self.isProcessing = false
+                            self.speechService.stopThinkingSound()
+                            await self.resumeListeningOrReturnToWakeWord(ensureEngine: true)
+                        }
+                    ))
+                }
+                return true
+            },
+        ]
     }
 
     /// Reuse an already-available live frame for vision-capable models without trying to
@@ -2256,7 +2462,9 @@ class AppState: ObservableObject, AppStateProtocol {
     private func currentVisionFrameDataIfAvailable() -> Data? {
         guard Config.activeModel?.visionEnabled == true else { return nil }
         guard cameraService.isStreaming, let frame = cameraService.latestFrame else { return nil }
-        return frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality)
+        guard let data = frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality),
+              !LLMImagePreparer.isDegenerate(data) else { return nil }
+        return data
     }
 
     // MARK: - Smart Camera Activation
@@ -2310,9 +2518,12 @@ class AppState: ObservableObject, AppStateProtocol {
     private func smartCameraCapture(reason: String) async -> Data? {
         print("📷 Smart Camera: activating (\(reason))")
 
-        // If camera is already streaming, just grab the frame
+        // If camera is already streaming, just grab the frame — but never a degenerate
+        // placeholder (don't restart a running stream over a bad frame; just send no image).
         if cameraService.isStreaming, let frame = cameraService.latestFrame {
-            return frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality)
+            guard let data = frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality),
+                  !LLMImagePreparer.isDegenerate(data) else { return nil }
+            return data
         }
 
         // Try to start streaming and capture
@@ -2320,9 +2531,11 @@ class AppState: ObservableObject, AppStateProtocol {
             try await cameraService.startStreaming()
             // Brief wait for first frame
             try await Task.sleep(nanoseconds: 500_000_000)
-            if let frame = cameraService.latestFrame {
+            if let frame = cameraService.latestFrame,
+               let data = frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality),
+               !LLMImagePreparer.isDegenerate(data) {
                 print("📷 Smart Camera: captured frame")
-                return frame.jpegData(compressionQuality: Config.geminiLiveVideoJPEGQuality)
+                return data
             }
             // Try photo capture as fallback
             let photoData = try await cameraService.capturePhoto()
@@ -2347,201 +2560,49 @@ class AppState: ObservableObject, AppStateProtocol {
         speechService.playEndListeningTone()
         print("📝 Transcription: \(text)")
 
-        // Teleprompter (Phase 2): while a session is running it owns the display, so
-        // "next/back/pause/resume/restart/faster/slower/stop" drive the prompter rather than
-        // the LLM. Checked first since it's a focused, full-screen mode.
-        if teleprompterService.isActive, teleprompterService.handleVoiceCommand(text) {
-            print("📜 Teleprompter command handled: \(text)")
-            if inConversation {
-                isListening = true
-                transcriptionService.startRecording()
-            } else {
-                await returnToWakeWord()
-            }
-            return
-        }
-
-        // HUD task control (Display Phase 3 / Plan X): while a Now/Next card is on the
-        // glasses, "next/done/skip/back" drive the task instead of going to the LLM.
-        // Checked before intent classification so these short commands aren't filtered.
-        if await hudRouter.handleVoiceCommand(text) {
-            print("🎯 HUD task command handled: \(text)")
-            if inConversation {
-                isListening = true
-                transcriptionService.startRecording()
-            } else {
-                await returnToWakeWord()
-            }
-            return
-        }
-
-        // HUD launcher voice nav (Display Phase 4 / Plan Y): while a menu is open, a spoken
-        // item label (or "back"/"close") selects it. Checked before the open command so
-        // saying a leaf name inside the menu navigates instead of re-opening the root.
-        if hudLauncher.handleVoiceSelection(text) {
-            print("🎛 HUD launcher voice selection: \(text)")
-            if inConversation {
-                isListening = true
-                transcriptionService.startRecording()
-            } else {
-                await returnToWakeWord()
-            }
-            return
-        }
-
-        // HUD launcher (Display Phase 4 / Plan Y): "menu" opens the band-navigable launcher.
-        if HUDLauncher.isOpenCommand(text), hudLauncher.hasContent {
-            print("🎛 HUD launcher opened")
-            hudLauncher.open()
-            if inConversation {
-                isListening = true
-                transcriptionService.startRecording()
-            } else {
-                await returnToWakeWord()
-            }
+        // Pre-LLM voice-command chain (Plan BG P2): teleprompter, HUD task card, HUD launcher
+        // selection/open, and the intent-ignore filter each get first crack at the transcript. The
+        // first one that consumes it drives its own mode and short-circuits before the LLM. Order
+        // matters and is preserved from the original if-ladder (see `preLLMHandlers`).
+        if await ConversationFlowEngine(handlers: preLLMHandlers()).route(text) != nil {
             return
         }
 
         // Will be updated below if persona detected in text
         var query = text
 
-        // Intent classification — filter bystander/filler speech
-        if intentClassifier.isEnabled && !isPhotoCommand(text) && !isStopCommand(text) && !isGoodbyeCommand(text) {
-            let intent = await intentClassifier.classify(transcript: text)
-            if intent == .ignore {
-                print("🚫 Intent classifier: IGNORE — not responding")
-                if inConversation {
-                    isListening = true
-                    transcriptionService.startRecording()
-                } else {
-                    await returnToWakeWord()
-                }
-                return
-            }
-        }
-
         // Check for persona names in the transcription (for Action Button / push-to-talk mode)
-        // e.g. "Hey Claude, what's the weather" → activate Claude persona, strip prefix
+        // e.g. "Hey Claude, what's the weather" → activate Claude persona, strip prefix.
+        // Recognition + stripping is pure (VoiceCommandParser); AppState applies the match.
         if activePersona == nil {
-            let lower = text.lowercased()
-            for persona in Config.enabledPersonas {
-                for phrase in persona.allPhrases {
-                    if lower.hasPrefix(phrase) || lower.contains(phrase) {
-                        activePersona = persona
-                        Config.setActiveModelId(persona.modelId)
-                        Config.setActivePresetId(persona.presetId)
-                        llmService.refreshActiveModel()
-                        print("🎭 Persona detected in transcription: \(persona.name)")
-                        // Strip the wake phrase from the query
-                        if let range = lower.range(of: phrase) {
-                            query = String(text[range.upperBound...])
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                                .trimmingCharacters(in: CharacterSet(charactersIn: ","))
-                                .trimmingCharacters(in: .whitespaces)
-                        }
-                        if query.isEmpty { query = text }
-                        break
-                    }
-                }
-                if activePersona != nil { break }
+            let personas = Config.enabledPersonas
+            let personaPhrases = personas.map {
+                VoiceCommandParser.PersonaPhrases(id: $0.id, phrases: $0.allPhrases)
+            }
+            if let match = voiceCommandParser.detectPersona(in: text, personas: personaPhrases),
+               let persona = personas.first(where: { $0.id == match.personaId }) {
+                activePersona = persona
+                Config.setActiveModelId(persona.modelId)
+                Config.setActivePresetId(persona.presetId)
+                llmService.refreshActiveModel()
+                print("🎭 Persona detected in transcription: \(persona.name)")
+                query = match.query
             }
         }
 
         // Track in conversation store
         if Config.conversationPersistenceEnabled {
             if conversationStore.activeThreadId == nil {
-                conversationStore.startThread(mode: currentMode.rawValue)
+                conversationStore.startThread(mode: currentMode.rawValue, personaId: activePersona?.id)
             }
             conversationStore.appendMessage(role: "user", content: text)
         }
 
-        // Voice command: "stop" — interrupt TTS, stay in conversation
-        if isStopCommand(text) {
-            print("🛑 Voice command: stop")
-            speechService.stopSpeaking()
-            if inConversation {
-                print("💬 Stopped — listening for next question...")
-                isListening = true
-                transcriptionService.startRecording()
-            } else {
-                await returnToWakeWord()
-            }
-            return
-        }
-
-        // Voice command: "goodbye" — end conversation, back to wake word
-        if isGoodbyeCommand(text) {
-            print("👋 Voice command: goodbye")
-            speechService.stopSpeaking()
-            inConversation = false
-            lastResponse = "Goodbye!"
-            await speechService.speak("Goodbye!")
-            await returnToWakeWord()
-            return
-        }
-
-        // Voice command: "take a picture" — capture photo from glasses camera
-        if isPhotoCommand(text) {
-            print("📸 Voice command: take a picture")
-            isProcessing = true
-            // Start capture immediately — play the shutter tone, no spoken "taking a picture"
-            speechService.playAcknowledgmentTone()
-            speechService.startThinkingSound()
-
-            currentLLMTask = Task {
-                do {
-                    // Capture and send to LLM concurrently — no extra round-trip speech
-                    let photoData = try await cameraService.capturePhoto()
-                    try Task.checkCancellation()
-                    // Restore audio for wake word after camera capture (camera reconfigures for Bluetooth)
-                    cameraService.restoreAudioForWakeWord()
-                    cameraService.saveToPhotoLibrary(photoData)
-                    print("📸 Photo captured, sending to LLM with prompt: \(query)")
-
-                    let rawResponse = try await llmService.sendMessage(
-                        query,
-                        locationContext: locationService.locationContext,
-                        imageData: photoData,
-                        memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil
-                    )
-                    try Task.checkCancellation()
-                    let response = Config.userMemoryEnabled ? userMemory.parseAndExecuteCommands(in: rawResponse) : rawResponse
-                    lastResponse = response
-                    if Config.conversationPersistenceEnabled {
-                        conversationStore.appendMessage(role: "assistant", content: response)
-                    }
-                    print("🤖 \(llmService.activeModelName) (vision): \(response)")
-
-                    // If an audio or video recording is active, inject the description
-                    // into the caption history so the meeting assistant has visual context.
-                    if audioRecorder.isRecording || videoRecorder.isRecording {
-                        ambientCaptions.insertVisualNote(response)
-                    }
-
-                    // Start wake word listener during TTS so user can say "stop"
-                    startStopListener()
-                    await speechService.speak(response)
-                    stopStopListener()
-
-                } catch is CancellationError {
-                    print("🛑 Photo/LLM task cancelled")
-                } catch {
-                    cameraService.restoreAudioForWakeWord()
-                    print("📸 Photo capture failed: \(error)")
-                    lastResponse = "Photo failed: \(error.localizedDescription)"
-                    await speechService.speak("Sorry, I couldn't take a photo or process the image. \(error.localizedDescription)")
-                }
-                isProcessing = false
-                speechService.stopThinkingSound()
-                if inConversation {
-                    // Ensure audio engine is alive after TTS playback
-                    try? await wakeWordService.ensureAudioEngineRunning()
-                    isListening = true
-                    transcriptionService.startRecording()
-                } else {
-                    await returnToWakeWord()
-                }
-            }
+        // Post-store voice-command chain (Plan BG P2): stop, goodbye, photo. Runs after the user
+        // turn is persisted (so "stop"/"goodbye" still appear in the thread) and after persona
+        // detection (the photo prompt uses the persona-stripped `query`). The first consumer
+        // short-circuits before the LLM; order is preserved from the original if-ladder.
+        if await ConversationFlowEngine(handlers: postStoreHandlers(query: query)).route(text) != nil {
             return
         }
 
@@ -2581,128 +2642,125 @@ class AppState: ObservableObject, AppStateProtocol {
 
             if isProcessing {
                 isProcessing = false
-                if inConversation {
-                    try? await wakeWordService.ensureAudioEngineRunning()
-                    isListening = true
-                    transcriptionService.startRecording()
-                } else {
-                    await returnToWakeWord()
-                }
+                await resumeListeningOrReturnToWakeWord(ensureEngine: true)
                 return
             }
         }
 
-        // Tier 2: Model selection — temporarily switch to the recommended tier if available and enabled
+        // Tier 2: Model selection (Plan BG P2). The pure `ModelRoutingPolicy` decides between the
+        // on-device agent model, a temporary switch to the tier-recommended model, and keeping the
+        // active one; this applies the chosen route's side effects.
         var originalModelId: String?
         var useLocalAgent = false
-
-        // Route fast-tier queries to the agent model when agentic mode is on + model ready.
-        // If the agent model is the on-device MLX model, only do so when the user has
-        // opted in (localAgentEnabled, default off) — that path can fatally crash. Cloud
-        // agent models route normally.
         let agentIsCloud = Config.savedModels.contains(where: { $0.id == Config.agentModelId })
-        if classification.modelTier == .fast,
-           Config.agentModeEnabled,
-           Config.agentModelDownloaded,
-           (agentIsCloud || Config.localAgentEnabled),
-           !isPhotoCommand(query) {
+        let tierModel = Config.modelForTier(classification.modelTier)
+        switch ModelRoutingPolicy.decide(
+            isFastTier: classification.modelTier == .fast,
+            agentModeEnabled: Config.agentModeEnabled,
+            agentModelDownloaded: Config.agentModelDownloaded,
+            agentIsCloud: agentIsCloud,
+            localAgentEnabled: Config.localAgentEnabled,
+            isPhoto: isPhotoCommand(query),
+            autoRoutingEnabled: Config.autoModelRoutingEnabled,
+            tierModelId: tierModel?.id,
+            activeModelId: Config.activeModelId
+        ) {
+        case .localAgent:
             useLocalAgent = true
             print("🧠 Routing to agent model (fast tier, agentic mode)\(agentIsCloud ? " [cloud]" : " [on-device]")")
-        } else if classification.modelTier == .fast, Config.agentModeEnabled, Config.agentModelDownloaded, !isPhotoCommand(query) {
-            print("🧠 Skipping on-device agent (localAgentEnabled off) — routing to cloud instead")
-            if Config.autoModelRoutingEnabled,
-               let tierModel = Config.modelForTier(classification.modelTier),
-               tierModel.id != Config.activeModelId {
-                originalModelId = Config.activeModelId
-                Config.setActiveModelId(tierModel.id)
-                llmService.refreshActiveModel()
-            }
-        } else if Config.autoModelRoutingEnabled,
-           let tierModel = Config.modelForTier(classification.modelTier),
-           tierModel.id != Config.activeModelId {
+        case .switchModel(let id):
             originalModelId = Config.activeModelId
-            Config.setActiveModelId(tierModel.id)
+            Config.setActiveModelId(id)
             llmService.refreshActiveModel()
-            print("🧭 Model routed: \(classification.modelTier.rawValue) → \(tierModel.name)")
+            print("🧭 Model routed: \(classification.modelTier.rawValue) → \(tierModel?.name ?? id)")
+        case .keepCurrent:
+            break
         }
 
         // Normal message — send to LLM (with Tier 1 prompt trimming via sections)
         isProcessing = true
         speechService.startThinkingSound()
 
-        do {
-            let rawResponse: String
-            if useLocalAgent {
-                // Fast path: on-device Gemma 4 agent
-                rawResponse = try await llmService.sendViaLocalAgent(
-                    query,
-                    locationContext: classification.relevantSections.contains(.location) ? locationService.locationContext : nil,
-                    memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil
-                )
-            } else {
-                // Standard path: cloud LLM
-                let imageData = await smartCameraImageData(for: query)
-                rawResponse = try await llmService.sendMessage(
-                    query,
-                    locationContext: classification.relevantSections.contains(.location) ? locationService.locationContext : nil,
-                    imageData: imageData,
-                    memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
-                    playbookContext: classification.relevantSections.contains(.playbook) ? playbookStore.playbookContext() : nil,
-                    nowPlayingContext: nowPlayingAtStart?.promptContext,
-                    shortcutsContext: ShortcutsCatalog.shared.promptBlock(),
-                    promptSections: classification.relevantSections
-                )
-            }
-            nowPlayingAtStart = nil  // consumed for this turn
+        // Run the turn inside a tracked, cancellable task (Plan BG P2). Barge-in / stop / cancel
+        // cancel it, so a normal text turn no longer speaks its now-stale response after the user
+        // interrupts — previously only the photo path was cancellable, so a barged-in text turn
+        // would still speak the earlier answer once the LLM call returned.
+        currentLLMTask = Task {
+            await ConversationTurnRunner.run(.init(
+                send: { [self] in
+                    let rawResponse: String
+                    if useLocalAgent {
+                        // Fast path: on-device Gemma 4 agent
+                        rawResponse = try await llmService.sendViaLocalAgent(
+                            query,
+                            locationContext: classification.relevantSections.contains(.location) ? locationService.locationContext : nil,
+                            memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? query : nil) : nil
+                        )
+                    } else {
+                        // Standard path: cloud LLM
+                        let imageData = await smartCameraImageData(for: query)
+                        rawResponse = try await llmService.sendMessage(
+                            query,
+                            locationContext: classification.relevantSections.contains(.location) ? locationService.locationContext : nil,
+                            imageData: imageData,
+                            memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? query : nil) : nil,
+                            playbookContext: classification.relevantSections.contains(.playbook) ? playbookStore.playbookContext() : nil,
+                            nowPlayingContext: nowPlayingAtStart?.promptContext,
+                            shortcutsContext: ShortcutsCatalog.shared.promptBlock(),
+                            promptSections: classification.relevantSections
+                        )
+                    }
+                    nowPlayingAtStart = nil  // consumed for this turn
+                    return rawResponse
+                },
+                postProcess: { [self] rawResponse in
+                    // Parse and execute memory commands from the response
+                    guard Config.userMemoryEnabled else { return rawResponse }
+                    let response = userMemory.parseAndExecuteCommands(in: rawResponse)
 
-            // Parse and execute memory commands from the response
-            let response: String
-            if Config.userMemoryEnabled {
-                response = userMemory.parseAndExecuteCommands(in: rawResponse)
+                    // Periodic nudge: after N turns, inject a hidden review prompt
+                    // into the LLM history so the next response considers what to remember
+                    if userMemory.incrementTurnAndCheckNudge() {
+                        llmService.injectSystemMessage(SemanticMemoryStore.nudgePrompt)
+                    }
+                    return response
+                },
+                accept: { [self] response in
+                    lastResponse = response
+                    print("🤖 \(llmService.activeModelName): \(response)")
 
-                // Periodic nudge: after N turns, inject a hidden review prompt
-                // into the LLM history so the next response considers what to remember
-                if userMemory.incrementTurnAndCheckNudge() {
-                    llmService.injectSystemMessage(SemanticMemoryStore.nudgePrompt)
+                    // Save to conversation store
+                    if Config.conversationPersistenceEnabled {
+                        conversationStore.appendMessage(role: "assistant", content: response)
+                    }
+                },
+                speak: { [self] response in
+                    // Start wake word listener during TTS so user can say "stop"
+                    startStopListener()
+                    await speechService.speak(response)
+                    stopStopListener()
+                },
+                onCancelled: {
+                    print("🛑 LLM turn cancelled")
+                },
+                onError: { [self] error in
+                    errorMessage = "Failed to get response: \(error.localizedDescription)"
+                    await speechService.speak("Sorry, I encountered an error.")
+                },
+                finish: { [self] in
+                    // Restore original model if we switched for this request
+                    if let originalId = originalModelId {
+                        Config.setActiveModelId(originalId)
+                        llmService.refreshActiveModel()
+                    }
+
+                    // After responding, stay in conversation — listen for follow-up
+                    isProcessing = false
+                    speechService.stopThinkingSound()
+                    if inConversation { print("💬 Continuing conversation — listening for follow-up...") }
+                    await resumeListeningOrReturnToWakeWord(ensureEngine: true)
                 }
-            } else {
-                response = rawResponse
-            }
-
-            lastResponse = response
-            print("🤖 \(llmService.activeModelName): \(response)")
-
-            // Save to conversation store
-            if Config.conversationPersistenceEnabled {
-                conversationStore.appendMessage(role: "assistant", content: response)
-            }
-
-            // Start wake word listener during TTS so user can say "stop"
-            startStopListener()
-            await speechService.speak(response)
-            stopStopListener()
-        } catch {
-            errorMessage = "Failed to get response: \(error.localizedDescription)"
-            await speechService.speak("Sorry, I encountered an error.")
-        }
-
-        // Restore original model if we switched for this request
-        if let originalId = originalModelId {
-            Config.setActiveModelId(originalId)
-            llmService.refreshActiveModel()
-        }
-
-        // After responding, stay in conversation — listen for follow-up
-        isProcessing = false
-        speechService.stopThinkingSound()
-        if inConversation {
-            print("💬 Continuing conversation — listening for follow-up...")
-            // Ensure audio engine is alive after TTS playback (may have been interrupted)
-            try? await wakeWordService.ensureAudioEngineRunning()
-            isListening = true
-            transcriptionService.startRecording()
-        } else {
-            await returnToWakeWord()
+            ))
         }
     }
 
@@ -2725,7 +2783,13 @@ class AppState: ObservableObject, AppStateProtocol {
         // Track in conversation store
         if Config.conversationPersistenceEnabled {
             if conversationStore.activeThreadId == nil {
-                conversationStore.startThread(mode: currentMode.rawValue)
+                conversationStore.startThread(mode: currentMode.rawValue, personaId: activePersona?.id)
+            }
+            // User-correction signal (Plan AW): before logging this turn, if it corrects the
+            // previous answer, feed it to the skill-evolution loop (Agent-Mode-gated, no-op otherwise).
+            if let prev = conversationStore.lastExchange() {
+                await SkillEvolutionService.shared.noteUserTurn(
+                    message: query, priorPrompt: prev.prompt, priorResponse: prev.response)
             }
             conversationStore.appendMessage(role: "user", content: query, imageAttached: imageData != nil)
         }
@@ -2733,50 +2797,78 @@ class AppState: ObservableObject, AppStateProtocol {
         isProcessing = true
         speechService.startThinkingSound()
 
-        do {
-            // Use provided image, or fall back to smart camera if no image attached
-            let image: Data?
-            if let imageData {
-                image = imageData
-            } else {
-                image = await smartCameraImageData(for: query)
-            }
-            let rawResponse = try await llmService.sendMessage(
-                query,
-                locationContext: locationService.locationContext,
-                imageData: image,
-                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
-                playbookContext: playbookStore.playbookContext(),
-                shortcutsContext: ShortcutsCatalog.shared.promptBlock()
-            )
+        // Live-stream the reply into the Chat thread (where the provider supports it).
+        let streamThreadId = conversationStore.activeThreadId
+        if let streamThreadId { streamingTurn = StreamingTurn(threadId: streamThreadId, text: "") }
 
-            let response = Config.userMemoryEnabled ? userMemory.parseAndExecuteCommands(in: rawResponse) : rawResponse
-            lastResponse = response
+        // Typed turns run the same skeleton as voice turns, tracked in `currentLLMTask` so
+        // barge-in / cancel stops a typed turn too (Plan BG P2: every turn is cancellable).
+        // Awaited so callers (Siri intent, askUnderPersona) still see the turn complete.
+        let turn = Task {
+            await ConversationTurnRunner.run(.init(
+                send: { [self] in
+                    // Use provided image, or fall back to smart camera if no image attached
+                    let image: Data?
+                    if let imageData {
+                        image = imageData
+                    } else {
+                        image = await smartCameraImageData(for: query)
+                    }
+                    return try await llmService.sendMessage(
+                        query,
+                        locationContext: locationService.locationContext,
+                        imageData: image,
+                        memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? query : nil) : nil,
+                        playbookContext: playbookStore.playbookContext(),
+                        shortcutsContext: ShortcutsCatalog.shared.promptBlock(),
+                        onToken: { [weak self] chunk in
+                            guard let self, let id = streamThreadId else { return }
+                            if self.streamingTurn?.threadId == id { self.streamingTurn?.text += chunk }
+                        }
+                    )
+                },
+                postProcess: { [self] rawResponse in
+                    Config.userMemoryEnabled ? userMemory.parseAndExecuteCommands(in: rawResponse) : rawResponse
+                },
+                accept: { [self] response in
+                    lastResponse = response
+                    streamingTurn = nil  // clear before persisting so the live bubble doesn't duplicate the saved message
 
-            if Config.conversationPersistenceEnabled {
-                conversationStore.appendMessage(role: "assistant", content: response)
-            }
+                    if Config.conversationPersistenceEnabled {
+                        conversationStore.appendMessage(role: "assistant", content: response)
+                    }
 
-            // Memory loop (Phase 3): spot a durable fact or a repeated multi-step request and
-            // offer to remember it (or silently save it in Agent Mode).
-            MemoryLoopService.shared.observeTurn(userText: query, assistantText: response,
-                                                 toolNames: nativeToolRouter.takeTurnToolNames())
-
-            // Speak the response (user can still say "stop")
-            if speakResponse {
-                startStopListener()
-                await speechService.speak(response)
-                stopStopListener()
-            }
-        } catch {
-            errorMessage = "Failed to get response: \(error.localizedDescription)"
-            if speakResponse {
-                await speechService.speak("Sorry, I encountered an error.")
-            }
+                    // Memory loop (Phase 3): spot a durable fact or a repeated multi-step request and
+                    // offer to remember it (or silently save it in Agent Mode).
+                    MemoryLoopService.shared.observeTurn(userText: query, assistantText: response,
+                                                         toolNames: nativeToolRouter.takeTurnToolNames())
+                },
+                speak: { [self] response in
+                    // Speak the response (user can still say "stop")
+                    guard speakResponse else { return }
+                    startStopListener()
+                    await speechService.speak(response)
+                    stopStopListener()
+                },
+                onCancelled: { [self] in
+                    streamingTurn = nil
+                    print("🛑 Text turn cancelled")
+                },
+                onError: { [self] error in
+                    streamingTurn = nil
+                    errorMessage = "Failed to get response: \(error.localizedDescription)"
+                    if speakResponse {
+                        await speechService.speak("Sorry, I encountered an error.")
+                    }
+                },
+                finish: { [self] in
+                    isProcessing = false
+                    speechService.stopThinkingSound()
+                }
+            ))
         }
-
-        isProcessing = false
-        speechService.stopThinkingSound()
+        currentLLMTask = turn
+        await turn.value
     }
 
     /// Run a one-shot query under a specific persona, then restore the prior
@@ -2821,6 +2913,141 @@ class AppState: ObservableObject, AppStateProtocol {
         wakeWordService.pauseRecognitionPublic()
     }
 
+    // MARK: - Remote Invoke (Plan BH)
+
+    /// Build the remote-invoke pipeline: pure parser/policy/reply + an executor whose stage
+    /// bodies map onto the live services. Capture-class commands confirm via the same
+    /// `ToolConfirmationCoordinator` UX as high-impact tools, then announce over TTS before any
+    /// sensor starts — nothing remote is ever silent.
+    private func makeRemoteInvokeService() -> RemoteInvokeService {
+        let executor = RemoteCommandExecutor(deps: .init(
+            confirmCapture: { [weak self] summary in
+                guard let self else { return false }
+                return await self.toolConfirmationCoordinator.requestConfirmation(
+                    toolName: "remote_invoke", summary: summary)
+            },
+            announce: { [weak self] text in
+                await self?.speechService.speak(text)
+            },
+            capturePhoto: { [weak self] in
+                guard let self else { throw RemoteInvokeError.unavailable }
+                let data = try await self.cameraService.capturePhoto()
+                self.cameraService.restoreAudioForWakeWord()
+                self.cameraService.saveToPhotoLibrary(data)
+            },
+            startAudioRecording: { [weak self] in
+                guard let self else { throw RemoteInvokeError.unavailable }
+                try self.audioRecorder.startRecording()
+            },
+            stopAudioRecording: { [weak self] in
+                guard let self else { return nil }
+                return await self.audioRecorder.stopRecording()?.lastPathComponent
+            },
+            startVideo: { [weak self] in
+                guard let self else { throw RemoteInvokeError.unavailable }
+                if !self.cameraService.isStreaming {
+                    try await self.cameraService.startStreaming()
+                }
+                let frameSize = self.cameraService.latestFrame?.size ?? CGSize(width: 720, height: 1280)
+                try self.videoRecorder.startRecording(
+                    from: self.cameraService.framePublisher,
+                    bitrate: max(Config.recordingBitrate, 4_000_000),
+                    outputSize: frameSize
+                )
+            },
+            stopVideo: { [weak self] in
+                guard let self else { return nil }
+                return await self.videoRecorder.stopRecording()?.lastPathComponent
+            },
+            startTranslation: { [weak self] source, target in
+                self?.liveTranslation.start(from: source ?? "auto", to: target ?? "en")
+            },
+            stopTranslation: { [weak self] in
+                self?.liveTranslation.stop()
+            },
+            startTranscription: { [weak self] in
+                self?.ambientCaptions.start()
+            },
+            stopTranscription: { [weak self] in
+                self?.ambientCaptions.stop()
+            },
+            speak: { [weak self] text in
+                await self?.speechService.speak(text)
+            },
+            displayShow: { [weak self] text, icon in
+                guard let self, self.glassesDisplay.deviceSupportsDisplay() else { return false }
+                self.glassesDisplay.showNotification(title: "Agent", body: text, icon: Self.remoteHUDIcon(for: icon))
+                return true
+            },
+            displayClear: { [weak self] in
+                self?.glassesDisplay.clear()
+            },
+            deviceStatus: { [weak self] in
+                guard let self else { return [:] }
+                return [
+                    "glasses_connected": String(self.glassesService.isConnected),
+                    "device_name": self.glassesService.deviceName ?? "none",
+                    "battery": self.glassesService.batteryLevel.map(String.init) ?? "unknown",
+                    "listening": String(self.isListening),
+                    "recording_audio": String(self.audioRecorder.isRecording),
+                    "recording_video": String(self.videoRecorder.isRecording),
+                    "transcribing": String(self.ambientCaptions.isActive),
+                    "translating": String(self.liveTranslation.isActive),
+                ]
+            },
+            deviceCapabilities: { [weak self] in
+                guard let self else { return [:] }
+                // What is *currently* true, not what the app theoretically has.
+                return [
+                    "camera": String(self.glassesService.isConnected),
+                    "display": String(self.glassesDisplay.deviceSupportsDisplay()),
+                    "speak": "true",
+                    "audio_recording": "true",
+                    "video_recording": String(self.glassesService.isConnected),
+                    "transcription": "true",
+                    "translation": "true",
+                    "notes": "true",
+                ]
+            },
+            addNote: { [weak self] text in
+                guard let self else { throw RemoteInvokeError.unavailable }
+                return try await self.nativeToolRouter.registry.executeTool(
+                    name: "save_note", arguments: ["content": text])
+            },
+            getTranscript: { [weak self] in
+                guard let self else { return "" }
+                // History is newest-first; reply chronologically, bounded.
+                return self.ambientCaptions.captionHistory.prefix(20).reversed()
+                    .map { $0.text }.joined(separator: "\n")
+            },
+            stopAll: { [weak self] in
+                guard let self else { return }
+                self.speechService.stopSpeaking()
+                if self.audioRecorder.isRecording { _ = await self.audioRecorder.stopRecording() }
+                if self.videoRecorder.isRecording { _ = await self.videoRecorder.stopRecording() }
+                if self.ambientCaptions.isActive { self.ambientCaptions.stop() }
+                if self.liveTranslation.isActive { self.liveTranslation.stop() }
+            }
+        ))
+        return RemoteInvokeService(
+            environment: .init(
+                agentModeEnabled: { Config.agentModeEnabled },
+                toggles: { Config.remoteInvokeToggles },
+                now: { Date() }
+            ),
+            executor: executor
+        )
+    }
+
+    private static func remoteHUDIcon(for name: String?) -> GlassesDisplayService.HUDIcon {
+        switch name?.lowercased() {
+        case "success": return .success
+        case "warning": return .warning
+        case "error": return .error
+        default: return .info
+        }
+    }
+
     // MARK: - OpenClaw Notification Triage
 
     /// Assess an incoming OpenClaw notification through the agent.
@@ -2859,7 +3086,7 @@ class AppState: ObservableObject, AppStateProtocol {
         do {
             let response = try await llmService.sendMessage(
                 triagePrompt,
-                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
+                memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? triagePrompt : nil) : nil,
                 agentContext: currentAgentContext
             )
 
@@ -2934,7 +3161,7 @@ class AppState: ObservableObject, AppStateProtocol {
             do {
                 let summary = try await llmService.sendMessage(
                     summaryPrompt,
-                    memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext() : nil,
+                    memoryContext: Config.userMemoryEnabled ? userMemory.systemPromptContext(query: Config.userMemoryRetrievalEnabled ? summaryPrompt : nil) : nil,
                     agentContext: currentAgentContext
                 )
                 let cleaned = summary.trimmingCharacters(in: .whitespacesAndNewlines)

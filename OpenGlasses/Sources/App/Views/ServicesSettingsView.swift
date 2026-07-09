@@ -7,18 +7,19 @@ import UniformTypeIdentifiers
 struct ServicesSettingsView: View {
     @ObservedObject var appState: AppState
 
-    // Text-to-Speech
-    @Binding var elevenLabsKeyInput: String
-    @Binding var selectedVoice: String
-    @Binding var emotionAwareTTSEnabled: Bool
+    // Text-to-Speech — self-contained: seeded from Config, persisted on change.
+    @State private var elevenLabsKeyInput: String = Config.elevenLabsAPIKey
+    @State private var selectedVoice: String = Config.elevenLabsVoiceId
+    @State private var emotionAwareTTSEnabled: Bool = Config.emotionAwareTTSEnabled
 
     // Web Search
-    @Binding var perplexityKeyInput: String
+    @State private var perplexityKeyInput: String = Config.perplexityAPIKey
+    @State private var tavilyKeyInput: String = Config.tavilyAPIKey
 
     // Live Streaming
-    @Binding var broadcastPlatform: String
-    @Binding var broadcastRTMPURL: String
-    @Binding var broadcastStreamKey: String
+    @State private var broadcastPlatform: String = Config.broadcastPlatform
+    @State private var broadcastRTMPURL: String = Config.broadcastRTMPURL
+    @State private var broadcastStreamKey: String = Config.broadcastStreamKey
 
     // Camera
     @State private var cameraResolution: String = Config.cameraResolution
@@ -69,9 +70,12 @@ struct ServicesSettingsView: View {
 
             // MARK: Text-to-Speech
             Section {
-                SecureField("API Key", text: $elevenLabsKeyInput)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                SecretInputField(placeholder: "API Key", text: $elevenLabsKeyInput)
+                    .onChange(of: elevenLabsKeyInput) { _, newValue in
+                        Config.setElevenLabsAPIKey(newValue)
+                        // Reset quota cache in case the user added credits or changed key.
+                        appState.speechService.resetElevenLabsQuota()
+                    }
 
                 if elevenLabsKeyInput.isEmpty {
                     Link(destination: URL(string: "https://elevenlabs.io/app/settings/api-keys")!) {
@@ -130,6 +134,9 @@ struct ServicesSettingsView: View {
                     isOn: $emotionAwareTTSEnabled,
                     info: "Detects the emotional tone of responses (happy, calm, concerned, excited) and adjusts the voice to match. ElevenLabs voices change stability and style parameters; iOS voices adjust rate and pitch. Makes the assistant sound more natural and empathetic."
                 )
+                .onChange(of: emotionAwareTTSEnabled) { _, newValue in
+                    Config.setEmotionAwareTTSEnabled(newValue)
+                }
             } header: {
                 Text("Text-to-Speech")
             } footer: {
@@ -252,11 +259,28 @@ struct ServicesSettingsView: View {
             }
             .onAppear { asrDownloader.refreshState() }
 
+            // MARK: Diarization
+            Section {
+                NavigationLink {
+                    DiarizationSettingsView()
+                } label: {
+                    HStack {
+                        Label("Diarization", systemImage: "person.2.wave.2")
+                        Spacer()
+                        Text(Config.isDiarizationConfigured ? "On" : "Off")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } footer: {
+                Text("Label captions and meeting transcripts by speaker (\u{201C}who said what\u{201D}) via Deepgram. Off by default.")
+            }
+
             // MARK: Web Search
             Section {
-                SecureField("API Key", text: $perplexityKeyInput)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                SecretInputField(placeholder: "Perplexity API Key", text: $perplexityKeyInput)
+                    .onChange(of: perplexityKeyInput) { _, newValue in
+                        Config.setPerplexityAPIKey(newValue)
+                    }
 
                 if perplexityKeyInput.isEmpty {
                     Link(destination: URL(string: "https://www.perplexity.ai/settings/api")!) {
@@ -269,13 +293,32 @@ struct ServicesSettingsView: View {
                         }
                     }
                 }
+
+                SecretInputField(placeholder: "Tavily API Key", text: $tavilyKeyInput)
+                    .onChange(of: tavilyKeyInput) { _, newValue in
+                        Config.setTavilyAPIKey(newValue)
+                    }
+
+                if tavilyKeyInput.isEmpty {
+                    Link(destination: URL(string: "https://app.tavily.com/home")!) {
+                        HStack {
+                            Label("Get API Key", systemImage: "arrow.up.right.square")
+                            Spacer()
+                            Text("tavily.com")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             } header: {
                 Text("Web Search")
             } footer: {
-                if perplexityKeyInput.isEmpty {
-                    Text("Add a Perplexity API key for AI-powered search with cited sources. Without one, DuckDuckGo is used.")
+                if perplexityKeyInput.isEmpty && tavilyKeyInput.isEmpty {
+                    Text("Add a Perplexity or Tavily API key for AI-powered search with cited sources. Without one, DuckDuckGo is used.")
+                } else if !perplexityKeyInput.isEmpty {
+                    Text("Web searches use Perplexity AI with cited sources\(tavilyKeyInput.isEmpty ? "" : ", then Tavily").")
                 } else {
-                    Text("Web searches use Perplexity AI with cited sources.")
+                    Text("Web searches use Tavily with cited sources.")
                 }
             }
 
@@ -356,7 +399,9 @@ struct ServicesSettingsView: View {
                     Text("Custom RTMP").tag("custom")
                 }
                 .onChange(of: broadcastPlatform) { _, platform in
-                    // Pre-fill RTMP ingest URL for known platforms
+                    Config.setBroadcastPlatform(platform)
+                    // Pre-fill RTMP ingest URL for known platforms (persisted via the
+                    // RTMP URL field's own onChange below).
                     switch platform {
                     case "youtube": broadcastRTMPURL = "rtmp://a.rtmp.youtube.com/live2"
                     case "twitch": broadcastRTMPURL = "rtmp://live.twitch.tv/app"
@@ -369,10 +414,14 @@ struct ServicesSettingsView: View {
                 TextField("RTMP URL", text: $broadcastRTMPURL)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
+                    .onChange(of: broadcastRTMPURL) { _, newValue in
+                        Config.setBroadcastRTMPURL(newValue)
+                    }
 
-                SecureField("Stream Key", text: $broadcastStreamKey)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                SecretInputField(placeholder: "Stream Key", text: $broadcastStreamKey)
+                    .onChange(of: broadcastStreamKey) { _, newValue in
+                        Config.setBroadcastStreamKey(newValue)
+                    }
             } header: {
                 Text("Live Streaming")
             } footer: {
@@ -393,9 +442,7 @@ struct ServicesSettingsView: View {
                         Config.setHomeAssistantURL(newValue)
                     }
 
-                SecureField("Long-Lived Access Token", text: $haToken)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                SecretInputField(placeholder: "Long-Lived Access Token", text: $haToken)
                     .onChange(of: haToken) { _, newValue in
                         Config.setHomeAssistantToken(newValue)
                     }

@@ -8,6 +8,9 @@ struct GatewaySettingsView: View {
     @State private var gateways: [GatewayConfig] = Config.savedGateways
     @State private var editingGateway: GatewayConfig?
     @State private var showAddSheet = false
+    @State private var remoteObserve = Config.remoteInvokeObserveEnabled
+    @State private var remoteOutput = Config.remoteInvokeOutputEnabled
+    @State private var remoteCapture = Config.remoteInvokeCaptureEnabled
 
     var body: some View {
         List {
@@ -88,6 +91,9 @@ struct GatewaySettingsView: View {
                     Label("Add Gateway", systemImage: "plus.circle.fill")
                 }
             }
+
+            // Remote invoke (Plan BH): per-class consent for gateway-initiated device commands.
+            remoteInvokeSection
         }
         .navigationTitle("Gateways")
         .sheet(isPresented: $showAddSheet) {
@@ -104,6 +110,37 @@ struct GatewaySettingsView: View {
                     save()
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var remoteInvokeSection: some View {
+        Section {
+            if !Config.agentModeEnabled {
+                Label("Requires Agent Mode", systemImage: "lock.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Toggle("Status & transcript (observe)", isOn: $remoteObserve)
+                .onChange(of: remoteObserve) { _, v in Config.remoteInvokeObserveEnabled = v }
+            Toggle("Speak & display (output)", isOn: $remoteOutput)
+                .onChange(of: remoteOutput) { _, v in Config.remoteInvokeOutputEnabled = v }
+            Toggle("Camera & recording (capture)", isOn: $remoteCapture)
+                .onChange(of: remoteCapture) { _, v in Config.remoteInvokeCaptureEnabled = v }
+            NavigationLink {
+                RemoteInvokeAuditView(service: appState.remoteInvoke)
+            } label: {
+                HStack {
+                    Text("Activity Log")
+                    Spacer()
+                    Text("\(appState.remoteInvoke.auditLog.count)")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Remote Invoke")
+        } footer: {
+            Text("Lets a gateway agent ask the glasses to act (speak, show text, check status — and with capture enabled, take photos or record). Everything is denied while Agent Mode is off; capture always asks for confirmation and announces itself before a sensor starts.")
         }
     }
 
@@ -248,6 +285,8 @@ struct EditGatewaySheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.appAccent) private var accent
     @State private var testStatus: String = ""
+    @State private var setupCodeInput: String = ""
+    @State private var pairingMessage: String = ""
 
     var body: some View {
         NavigationStack {
@@ -268,13 +307,50 @@ struct EditGatewaySheet: View {
                 }
 
                 Section {
-                    SecureField("Token", text: $gateway.token)
-                        .textContentType(.password)
-                        .autocorrectionDisabled()
+                    SecretInputField(placeholder: "Token", text: $gateway.token)
                 } header: {
                     Text("Authentication")
                 } footer: {
-                    Text("The gateway token from your server's config.")
+                    Text("The gateway token from your server's config — or leave blank and pair this device below.")
+                }
+
+                Section {
+                    if let deviceToken = gateway.deviceToken, !deviceToken.isEmpty {
+                        HStack {
+                            Label("Paired", systemImage: "checkmark.seal.fill")
+                                .foregroundStyle(.green)
+                            Spacer()
+                            Text("This device").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Button("Unpair This Device", role: .destructive) {
+                            gateway.deviceToken = nil
+                            gateway.deviceId = nil
+                            gateway.setupCode = nil
+                            pairingMessage = "Unpaired. Save to apply."
+                        }
+                    } else {
+                        TextField("Setup Code", text: $setupCodeInput, axis: .vertical)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .font(.system(.footnote, design: .monospaced))
+                        Button("Pair With Setup Code") {
+                            let trimmed = setupCodeInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if SetupCode.decode(trimmed) != nil {
+                                gateway.setupCode = trimmed
+                                pairingMessage = "Setup code saved. Save the gateway, then approve this device on your gateway to finish pairing."
+                            } else {
+                                pairingMessage = "That setup code isn't valid."
+                            }
+                        }
+                        .disabled(setupCodeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    if !pairingMessage.isEmpty {
+                        Text(pairingMessage).font(.caption).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Device Pairing")
+                } footer: {
+                    Text("Pair with a one-time setup code instead of a shared token. The gateway issues a per-device token you can revoke independently.")
                 }
 
                 Section {

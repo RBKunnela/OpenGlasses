@@ -21,7 +21,9 @@
 - **`AgentHarnessSettingsView`** — default-backend picker + custom endpoint form (URLs, auth, field mapping), surfaced from Agentic Features (Agent-Mode-gated). `AppState.rebuildAgentHarnessRegistry()` re-reads it on save.
 - **Tests:** +17 headless (`AgentCustomHarnessTests`) — config round-trip, `JSONPath`, request building + `start`/`status` over the stub, registry resolution, registry-backed dispatch, and the `switch_harness` action. Full suite 722 green, Debug + Release.
 
-**Still deferred (per the build order):** the gateway-side `agent.*` methods + the rich live event stream (Phase 1's live half — needs a running gateway that exposes them; the adapter is ready and `normalize` maps the schema); the **Codex-cloud / Claude-remote adapters** (Phase 3, pending the Phase 0 trigger verification); and live token-streaming + the HUD confirm view (Phase 4).
+**Phase 3 shipped** (`feat/codex-claude-harness-adapters`) — the **Codex-cloud + Claude Code (remote) adapters**: `CustomAgentHarness` is generalized to carry its `kind` (so dispatched runs are tagged correctly), and pure `AgentHarnessPreset.codexCloud`/`.claudeRemote` pre-fill a `CustomHarnessConfig` with each backend's auth scheme (`Authorization: Bearer` / `x-api-key`), field names, and response paths. Keychain-backed `Config.codexAgentToken`/`claudeRemoteToken` (+ optional base-URL overrides); both wired into `makeAgentRegistry` and exposed in `AgentHarnessSettingsView` (the default-backend picker now enumerates all kinds). 8 tests (`AgentHarnessPresetTests`); the generalization keeps `AgentCustomHarnessTests`/`AgentSessionTests` green (43 total in this run).
+
+**Still deferred (per the build order):** the gateway-side `agent.*` methods + the rich live event stream (Phase 1's live half — needs a running gateway that exposes them; the adapter is ready and `normalize` maps the schema); live **endpoint verification** of the Codex/Claude REST contracts (the adapters + presets are built and tested; the exact paths are confirmed against the real services on the live edge); and live token-streaming + the HUD confirm view (Phase 4).
 
 ---
 

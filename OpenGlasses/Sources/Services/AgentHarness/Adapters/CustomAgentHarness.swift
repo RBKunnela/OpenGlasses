@@ -9,32 +9,47 @@ import Foundation
 /// this adapter is the thin async layer. `session` is injectable so tests exercise the HTTP shape
 /// through a `URLProtocol` stub.
 struct CustomAgentHarness: AgentHarness {
-    let kind: AgentHarnessKind = .custom
+    let kind: AgentHarnessKind
     let config: CustomHarnessConfig
     var session: URLSession = .shared
+    private let displayNameOverride: String?
+    private let isConfiguredOverride: Bool?
 
-    init(config: CustomHarnessConfig, session: URLSession = .shared) {
+    /// - Parameters:
+    ///   - kind: the harness identity. Defaults to `.custom`; the Codex / Claude Code presets pass
+    ///     `.codexCloud` / `.claudeRemote` so dispatched runs are tagged correctly.
+    ///   - displayName / isConfigured: optional overrides for the preset-backed harnesses (whose
+    ///     readiness is gated on a token, not just the start URL).
+    init(kind: AgentHarnessKind = .custom,
+         config: CustomHarnessConfig,
+         displayName: String? = nil,
+         isConfigured: Bool? = nil,
+         session: URLSession = .shared) {
+        self.kind = kind
         self.config = config
+        self.displayNameOverride = displayName
+        self.isConfiguredOverride = isConfigured
         self.session = session
     }
 
     var displayName: String {
-        config.name.trimmingCharacters(in: .whitespaces).isEmpty ? kind.displayName : config.name
+        if let displayNameOverride { return displayNameOverride }
+        return config.name.trimmingCharacters(in: .whitespaces).isEmpty ? kind.displayName : config.name
     }
-    var isConfigured: Bool { config.isConfigured }
+    var isConfigured: Bool { isConfiguredOverride ?? config.isConfigured }
 
     // MARK: - AgentHarness
 
     func start(prompt: String, project: String?) async throws -> AgentRun {
         guard let request = config.startRequest(prompt: prompt, project: project) else {
-            throw AgentHarnessError.notConfigured(.custom)
+            throw AgentHarnessError.notConfigured(kind)
         }
         let json = try await sendJSON(request)
         guard let id = JSONPath.string(at: config.idPath, in: json) else {
             throw AgentHarnessError.transport("Response had no run id at '\(config.idPath)'.")
         }
         let status = AgentRunStatus.parse(JSONPath.string(at: config.statusPath, in: json)) ?? .running
-        return AgentRun(id: id, harness: .custom, prompt: prompt, project: project,
+        return AgentRun(id: id, harness: kind, prompt: prompt, project: project,
                         status: status, startedAt: Date())
     }
 

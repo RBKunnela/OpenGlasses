@@ -46,6 +46,23 @@ struct WatchMainView: View {
         )
     }
 
+    private var videoBinding: Binding<Bool> {
+        Binding(
+            get: { connectivity.isVideoRecording },
+            set: { _ in
+                errorMessage = nil
+                connectivity.sendCommand("toggleVideo") { error in
+                    if let error {
+                        errorMessage = error
+                        errorFeedbackTrigger += 1
+                    } else {
+                        feedbackTrigger += 1
+                    }
+                }
+            }
+        )
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -56,8 +73,14 @@ struct WatchMainView: View {
                     // Listen toggle
                     listenRow
 
-                    // Record toggle
+                    // Record toggle (transcription)
                     recordRow
+
+                    // Take a photo on the glasses
+                    photoRow
+
+                    // Record video on the glasses
+                    videoRow
 
                     Divider()
 
@@ -187,6 +210,48 @@ struct WatchMainView: View {
             }
         }
         .disabled(!connectivity.isReachable)
+        .tint(.red)
+    }
+
+    // MARK: - Glasses Photo
+
+    private var photoRow: some View {
+        Button {
+            errorMessage = nil
+            connectivity.sendCommand("capturePhoto") { error in
+                if let error {
+                    errorMessage = error
+                    errorFeedbackTrigger += 1
+                } else {
+                    feedbackTrigger += 1
+                }
+            }
+        } label: {
+            Label {
+                Text("Photo")
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } icon: {
+                Image(systemName: "camera.fill")
+                    .foregroundStyle(accentColor)
+            }
+        }
+        .disabled(!connectivity.isReachable || !connectivity.isConnected || connectivity.isProcessing)
+    }
+
+    // MARK: - Glasses Video Toggle
+
+    private var videoRow: some View {
+        Toggle(isOn: videoBinding) {
+            Label {
+                Text(connectivity.isVideoRecording ? "Recording Video" : "Video")
+                    .font(.body)
+            } icon: {
+                Image(systemName: connectivity.isVideoRecording ? "video.fill" : "video")
+                    .foregroundStyle(connectivity.isVideoRecording ? .red : .secondary)
+            }
+        }
+        .disabled(!connectivity.isReachable || !connectivity.isConnected)
         .tint(.red)
     }
 

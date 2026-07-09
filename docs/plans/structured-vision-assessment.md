@@ -1,4 +1,4 @@
-# Plan — Structured Vision Assessment (schema-validated `analyzeFrame`)
+# Plan AD — Structured Vision Assessment (schema-validated `analyzeFrame`)
 
 **Status: 🚧 Core shipped on `feat/structured-vision` (Phases 1–3).** Drafted + built 2026-06-19.
 Shipped: the pure core (`AssessmentCard`/`AssessmentTier`/`AssessmentFinding`/`InstrumentReading`,
@@ -7,8 +7,14 @@ Shipped: the pure core (`AssessmentCard`/`AssessmentTier`/`AssessmentFinding`/`I
 `StructuredVisionService` + `vision_assess` tool + `AssessmentCardView`/HUD; and the built-in
 **`instrument_reading`** ("read the instrument") consumer. **46 tests, Debug + Release green.**
 **Deferred to follow-up PRs:** ~~first-aid triage consumer~~ ✅ shipped (`FirstAidTriageSchema` —
-deterministic life-safety tier/action from reported vitals); Gemini `responseSchema` translation,
-CaptureFlow `voice_number` auto-fill still pending.
+deterministic life-safety tier/action from reported vitals); ~~Gemini `responseSchema` translation~~ ✅
+shipped (`GeminiSchemaTranslator` — JSON Schema → Gemini's uppercase-typed `responseSchema`, wired into
+both `analyzeFrameStructured` and `completeStructured` so Gemini gets *enforced* JSON like
+Anthropic/OpenAI forced tool-use); ~~CaptureFlow `voice_number` auto-fill~~ ✅ shipped
+(`CaptureFlowRunner.answer(reading:)` + pure `numberValue` convert-to-step-unit via `UnitNormalizer`,
+range-validated; `CaptureFlowService.fillCurrentStep(with:)`; `vision_assess` routes an
+`instrument_reading` into an active `voice_number` step → read instead of dictate). **AD complete** —
+all follow-ups shipped.
 
 **Strategic fit:** Today every camera-reasoning feature funnels through
 [`LLMService.analyzeFrame`](../../OpenGlasses/Sources/Services/LLMService.swift) (line 848), which returns

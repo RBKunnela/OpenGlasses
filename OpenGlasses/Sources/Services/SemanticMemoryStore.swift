@@ -2,16 +2,17 @@ import Foundation
 import NaturalLanguage
 import SQLite3
 
-/// Semantic memory store — drop-in replacement for UserMemoryStore.
+/// Semantic memory store — the app's persistent user memory (the live `userMemory` instance).
 ///
-/// Upgrades over the flat key-value store:
+/// Supersedes an earlier flat key-value JSON store (whose `user_memories.json` it still migrates on
+/// first run via `migrateFromLegacyJSONIfNeeded`). Upgrades over that flat store:
 /// - SQLite backing with full history (nothing is truly deleted — tombstoned)
 /// - On-device NLEmbedding vectors for semantic search (NLEmbedding, iOS 13+)
 /// - Topics auto-detected from content (health, work, people, places, preferences…)
 /// - Timestamps on every entry; optional expiry
 /// - Agent diary: separate append-only log of agent observations
 ///
-/// Public API is identical to UserMemoryStore so all call sites work unchanged.
+/// Public API mirrors the legacy key-value store it replaced, so all call sites work unchanged.
 /// New capabilities exposed via `semanticSearch()`, `relevantContext()`,
 /// `writeDiary()`, and `readDiary()`.
 @MainActor
@@ -44,7 +45,7 @@ class SemanticMemoryStore: ObservableObject {
         let similarity: Float
     }
 
-    // MARK: - Published (UserMemoryStore compat — in-memory caches)
+    // MARK: - Published (legacy key-value compat — in-memory caches)
 
     @Published var memories: [String: String] = [:]
     @Published var personaMemories: [String: String] = [:]
@@ -66,17 +67,22 @@ class SemanticMemoryStore: ObservableObject {
     // MARK: - Private
 
     private var db: OpaquePointer?
+    private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     private let docsDir: URL
     private let maxGlobalChars = 3000
     private let maxPersonaChars = 1500
     private let maxGatewayResults = 10
 
-    private lazy var wordEmbedding: NLEmbedding? = NLEmbedding.wordEmbedding(for: .english)
+    /// Routed through the shared [[Embedder]] seam (sentence model preferred over the old word-average,
+    /// and the transformer `NLContextualEmbedding` when enabled) instead of a raw `NLEmbedding`. Stored
+    /// vectors carry a version stamp ([[EmbeddingVersion]]) so a model change re-embeds on access.
+    private let embedder = Embedder()
 
     // MARK: - Init
 
-    init() {
-        docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+    /// `directory` is injectable so tests can point at a temp folder instead of the app's documents.
+    init(directory: URL? = nil) {
+        docsDir = directory ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         openDatabase()
         createTables()
         migrateFromLegacyJSONIfNeeded()
@@ -84,48 +90,66 @@ class SemanticMemoryStore: ObservableObject {
         NSLog("[SemanticMemory] Init — %d global memories", memories.count)
     }
 
-    // MARK: - Public API (UserMemoryStore compatible)
+    // MARK: - Public API (legacy key-value compatible)
 
-    func remember(_ key: String, value: String) {
+    /// Returns false when the write did not reach the database — callers at a tool/spoken
+    /// boundary should say so rather than claim the fact was saved.
+    @discardableResult
+    func remember(_ key: String, value: String) -> Bool {
         let k = normalise(key)
-        guard !k.isEmpty, !value.isEmpty else { return }
+        guard !k.isEmpty, !value.isEmpty else { return false }
         let ns = activePersonaId ?? "global"
         if activePersonaId != nil {
-            if personaMemories[k] == value { return }
-            upsert(key: k, value: value, namespace: ns)
+            if personaMemories[k] == value { return true }
+            guard upsert(key: k, value: value, namespace: ns) else {
+                NSLog("[SemanticMemory] FAILED to persist persona memory %@", k)
+                return false
+            }
             refreshPersonaCache()
             trim(namespace: ns, maxChars: maxPersonaChars)
             NSLog("[SemanticMemory] Persona: %@ = %@", k, value)
         } else {
-            if memories[k] == value { return }
-            upsert(key: k, value: value, namespace: "global")
+            if memories[k] == value { return true }
+            guard upsert(key: k, value: value, namespace: "global") else {
+                NSLog("[SemanticMemory] FAILED to persist global memory %@", k)
+                return false
+            }
             refreshGlobalCache()
             trim(namespace: "global", maxChars: maxGlobalChars)
             NSLog("[SemanticMemory] Global: %@ = %@", k, value)
         }
         pushToGateway(key: k, value: value)
+        return true
     }
 
-    func rememberGlobal(_ key: String, value: String) {
+    @discardableResult
+    func rememberGlobal(_ key: String, value: String) -> Bool {
         let k = normalise(key)
-        guard !k.isEmpty, !value.isEmpty else { return }
-        if memories[k] == value { return }
-        upsert(key: k, value: value, namespace: "global")
+        guard !k.isEmpty, !value.isEmpty else { return false }
+        if memories[k] == value { return true }
+        guard upsert(key: k, value: value, namespace: "global") else {
+            NSLog("[SemanticMemory] FAILED to persist global memory %@", k)
+            return false
+        }
         refreshGlobalCache()
         trim(namespace: "global", maxChars: maxGlobalChars)
         NSLog("[SemanticMemory] Global: %@ = %@", k, value)
         pushToGateway(key: k, value: value)
+        return true
     }
 
-    func forget(_ key: String) {
+    @discardableResult
+    func forget(_ key: String) -> Bool {
         let k = normalise(key)
+        let ok: Bool
         if let pid = activePersonaId {
-            deleteMemory(key: k, namespace: pid)
+            ok = deleteMemory(key: k, namespace: pid)
             refreshPersonaCache()
         } else {
-            deleteMemory(key: k, namespace: "global")
+            ok = deleteMemory(key: k, namespace: "global")
             refreshGlobalCache()
         }
+        return ok
     }
 
     func recall(_ key: String) -> String? {
@@ -144,7 +168,7 @@ class SemanticMemoryStore: ObservableObject {
     func clearPersonaMemories() {
         guard let pid = activePersonaId else { return }
         personaMemories.removeAll()
-        exec("DELETE FROM memories WHERE namespace = '\(pid)'")
+        run("DELETE FROM memories WHERE namespace = ?", [.text(pid)])
         NSLog("[SemanticMemory] Cleared persona memories for %@", pid)
     }
 
@@ -167,7 +191,7 @@ class SemanticMemoryStore: ObservableObject {
 
         if hasGlobal {
             let pairs: [(String, String)]
-            if let q = query, !q.isEmpty, wordEmbedding != nil {
+            if let q = query, !q.isEmpty, embedder.isAvailable {
                 let results = semanticSearch(query: q, limit: 8, namespace: "global")
                 pairs = results.isEmpty
                     ? memories.sorted { $0.key < $1.key }
@@ -197,11 +221,24 @@ class SemanticMemoryStore: ObservableObject {
     /// Search memories by meaning. Falls back to keyword scoring if no embedding model.
     func semanticSearch(query: String, limit: Int = 5, namespace: String? = nil) -> [SearchResult] {
         let queryVec = embed(query)
+        let current = embedder.version
         let rows = fetchAllMemories(namespace: namespace)
 
         let scored: [(MemoryEntry, Float)] = rows.map { row in
-            if let qv = queryVec, let rv = fetchEmbedding(key: row.keyName, namespace: row.namespace) {
-                return (row, cosineSimilarity(qv, rv))
+            if let qv = queryVec, let stored = fetchEmbedding(key: row.keyName, namespace: row.namespace) {
+                // Re-embed a memory left by an older model (or unstamped legacy word-average) and
+                // persist the result, so memory recall self-heals after a model swap.
+                let vec: [Float]?
+                switch EmbeddingMigrationPolicy.action(stored: EmbeddingVersion(tag: stored.version), current: current) {
+                case .reuse:
+                    vec = stored.vec
+                case .reembed:
+                    if let fresh = embed("\(row.keyName) \(row.value)") {
+                        writeMemoryEmbedding(id: row.id, vec: fresh)
+                        vec = fresh
+                    } else { vec = nil }
+                }
+                if let v = vec { return (row, cosineSimilarity(qv, v)) }
             }
             // Keyword fallback
             let text = "\(row.keyName) \(row.value)".lowercased()
@@ -224,12 +261,11 @@ class SemanticMemoryStore: ObservableObject {
         guard !text.isEmpty else { return }
         let id = UUID().uuidString
         let now = Date().timeIntervalSince1970
-        let t = escapedSQL(text)
-        exec("INSERT INTO diary (id, text, created_at) VALUES ('\(id)', '\(t)', \(now))")
-        // Store embedding for later search
+        run("INSERT INTO diary (id, text, created_at) VALUES (?, ?, ?)",
+            [.text(id), .text(text), .real(now)])
+        // Store embedding (+ version stamp) for later search
         if let vec = embed(text) {
-            let data = vecToData(vec)
-            updateDiaryEmbedding(id: id, data: data)
+            writeDiaryEmbedding(id: id, vec: vec)
         }
         NSLog("[SemanticMemory] Diary: %@", String(text.prefix(80)))
     }
@@ -253,28 +289,42 @@ class SemanticMemoryStore: ObservableObject {
         guard let qv = embed(query) else {
             return readDiary(limit: limit)
         }
+        let current = embedder.version
         var all: [(DiaryEntry, Float)] = []
+        var pending: [(id: String, vec: [Float])] = []   // re-embeds to persist after the read finalizes
         var stmt: OpaquePointer?
-        let sql = "SELECT id, text, created_at, embedding FROM diary ORDER BY created_at DESC LIMIT 200"
+        let sql = "SELECT id, text, created_at, embedding, embedding_version FROM diary ORDER BY created_at DESC LIMIT 200"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
-        defer { sqlite3_finalize(stmt) }
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = String(cString: sqlite3_column_text(stmt, 0))
             let text = String(cString: sqlite3_column_text(stmt, 1))
             let ts = sqlite3_column_double(stmt, 2)
             let entry = DiaryEntry(id: id, text: text, createdAt: Date(timeIntervalSince1970: ts))
+            let storedVersion = sqlite3_column_type(stmt, 4) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 4)) : nil
             var sim: Float = 0
             if let ptr = sqlite3_column_blob(stmt, 3) {
                 let len = sqlite3_column_bytes(stmt, 3)
                 let data = Data(bytes: ptr, count: Int(len))
-                sim = cosineSimilarity(qv, dataToVec(data))
+                switch EmbeddingMigrationPolicy.action(stored: EmbeddingVersion(tag: storedVersion), current: current) {
+                case .reuse:
+                    sim = cosineSimilarity(qv, dataToVec(data))
+                case .reembed:
+                    // Recompute against the active model; defer the write-back until the read statement
+                    // is finalized (don't mutate the table while iterating this cursor).
+                    if let fresh = embed(text) {
+                        sim = cosineSimilarity(qv, fresh)
+                        pending.append((id, fresh))
+                    }
+                }
             }
             all.append((entry, sim))
         }
+        sqlite3_finalize(stmt)
+        for p in pending { writeDiaryEmbedding(id: p.id, vec: p.vec) }
         return all.sorted { $0.1 > $1.1 }.prefix(limit).map { $0.0 }
     }
 
-    // MARK: - AI Response Parsing (UserMemoryStore compat)
+    // MARK: - AI Response Parsing (legacy key-value compat)
 
     func parseAndExecuteCommands(in response: String) -> String {
         var cleaned = response
@@ -346,7 +396,7 @@ class SemanticMemoryStore: ObservableObject {
     If nothing is worth recording, do nothing — do NOT mention this review to the user.]
     """
 
-    // MARK: - Gateway Sync (UserMemoryStore compat)
+    // MARK: - Gateway Sync (legacy key-value compat)
 
     private func pushToGateway(key: String, value: String) {
         guard !Config.hipaaMode else { return }
@@ -372,7 +422,7 @@ class SemanticMemoryStore: ObservableObject {
         }
     }
 
-    // MARK: - Char Usage (UserMemoryStore compat)
+    // MARK: - Char Usage (legacy key-value compat)
 
     var globalCharUsage: Int { memories.reduce(0) { $0 + $1.key.count + $1.value.count } }
     var personaCharUsage: Int { personaMemories.reduce(0) { $0 + $1.key.count + $1.value.count } }
@@ -413,46 +463,57 @@ class SemanticMemoryStore: ObservableObject {
         )
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_diary_ts ON diary(created_at)")
+        // Embedding version stamp (see [[EmbeddingVersion]]). Deliberately NOT backfilled: existing
+        // vectors were produced by the old raw word-average `NLEmbedding`, which differs from the
+        // `Embedder` seam now in use — so they read as outdated (NULL) and re-embed on next access.
+        exec("ALTER TABLE memories ADD COLUMN embedding_version TEXT")
+        exec("ALTER TABLE diary ADD COLUMN embedding_version TEXT")
     }
 
     // MARK: - Private: CRUD
 
-    private func upsert(key: String, value: String, namespace: String) {
+    @discardableResult
+    private func upsert(key: String, value: String, namespace: String) -> Bool {
         let id = "\(namespace):\(key)"
         let topic = detectTopic(key: key, value: value)
         let now = Date().timeIntervalSince1970
-        let v = escapedSQL(value)
-        exec("""
+        let ok = run("""
         INSERT INTO memories (id, key_name, value, topic, namespace, created_at)
-        VALUES ('\(id)', '\(key)', '\(v)', '\(topic)', '\(namespace)', \(now))
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(key_name, namespace) DO UPDATE SET
             value = excluded.value,
             topic = excluded.topic,
             created_at = excluded.created_at,
             embedding = NULL
-        """)
-        // Compute and store embedding synchronously (fast for short texts)
+        """, [.text(id), .text(key), .text(value), .text(topic), .text(namespace), .real(now)])
+        guard ok else { return false }
+        // Compute and store embedding (+ version stamp) synchronously (fast for short texts).
         if let vec = embed("\(key) \(value)") {
-            let data = vecToData(vec)
-            exec("UPDATE memories SET embedding = ? WHERE id = '\(id)'", blob: data)
+            writeMemoryEmbedding(id: id, vec: vec)
         }
+        return true
     }
 
-    private func deleteMemory(key: String, namespace: String) {
-        exec("DELETE FROM memories WHERE key_name = '\(key)' AND namespace = '\(namespace)'")
+    @discardableResult
+    private func deleteMemory(key: String, namespace: String) -> Bool {
+        run("DELETE FROM memories WHERE key_name = ? AND namespace = ?",
+            [.text(key), .text(namespace)])
     }
 
     private func fetchAllMemories(namespace: String? = nil) -> [MemoryEntry] {
         var entries: [MemoryEntry] = []
         var stmt: OpaquePointer?
         let sql: String
-        if let ns = namespace {
-            sql = "SELECT id, key_name, value, topic, namespace, created_at, expires_at FROM memories WHERE namespace = '\(ns)'"
+        if namespace != nil {
+            sql = "SELECT id, key_name, value, topic, namespace, created_at, expires_at FROM memories WHERE namespace = ?"
         } else {
             sql = "SELECT id, key_name, value, topic, namespace, created_at, expires_at FROM memories"
         }
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return entries }
         defer { sqlite3_finalize(stmt) }
+        if let ns = namespace {
+            sqlite3_bind_text(stmt, 1, ns, -1, SQLITE_TRANSIENT)
+        }
         let now = Date().timeIntervalSince1970
         while sqlite3_step(stmt) == SQLITE_ROW {
             let expiresAt = sqlite3_column_type(stmt, 6) != SQLITE_NULL ? sqlite3_column_double(stmt, 6) : nil
@@ -470,20 +531,71 @@ class SemanticMemoryStore: ObservableObject {
         return entries
     }
 
-    private func fetchEmbedding(key: String, namespace: String) -> [Float]? {
+    private func fetchEmbedding(key: String, namespace: String) -> (vec: [Float], version: String?)? {
         var stmt: OpaquePointer?
-        let sql = "SELECT embedding FROM memories WHERE key_name = '\(key)' AND namespace = '\(namespace)'"
+        let sql = "SELECT embedding, embedding_version FROM memories WHERE key_name = ? AND namespace = ?"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, namespace, -1, SQLITE_TRANSIENT)
         guard sqlite3_step(stmt) == SQLITE_ROW,
               sqlite3_column_type(stmt, 0) != SQLITE_NULL,
               let ptr = sqlite3_column_blob(stmt, 0) else { return nil }
         let len = sqlite3_column_bytes(stmt, 0)
-        return dataToVec(Data(bytes: ptr, count: Int(len)))
+        let version = sqlite3_column_type(stmt, 1) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 1)) : nil
+        return (dataToVec(Data(bytes: ptr, count: Int(len))), version)
     }
 
-    private func updateDiaryEmbedding(id: String, data: Data) {
-        exec("UPDATE diary SET embedding = ? WHERE id = '\(id)'", blob: data)
+    /// Persist a memory's embedding + current version stamp (initial write or lazy re-embed).
+    private func writeMemoryEmbedding(id: String, vec: [Float]) {
+        let sql = "UPDATE memories SET embedding = ?, embedding_version = ? WHERE id = ?"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        let data = vecToData(vec)
+        _ = data.withUnsafeBytes { sqlite3_bind_blob(stmt, 1, $0.baseAddress, Int32(data.count), SQLITE_TRANSIENT) }
+        sqlite3_bind_text(stmt, 2, embedder.version.tag, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, id, -1, SQLITE_TRANSIENT)
+        _ = sqlite3_step(stmt)
+    }
+
+    /// Persist a diary entry's embedding + current version stamp.
+    private func writeDiaryEmbedding(id: String, vec: [Float]) {
+        let sql = "UPDATE diary SET embedding = ?, embedding_version = ? WHERE id = ?"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        let data = vecToData(vec)
+        _ = data.withUnsafeBytes { sqlite3_bind_blob(stmt, 1, $0.baseAddress, Int32(data.count), SQLITE_TRANSIENT) }
+        sqlite3_bind_text(stmt, 2, embedder.version.tag, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, id, -1, SQLITE_TRANSIENT)
+        _ = sqlite3_step(stmt)
+    }
+
+    // MARK: - Embedding migration
+
+    /// Stored memories embedded by a model other than the active one (or unstamped legacy
+    /// word-average vectors). They re-embed on next search; this is for diagnostics / tests.
+    var outdatedMemoryCount: Int {
+        let current = embedder.version
+        var stmt: OpaquePointer?
+        let sql = "SELECT embedding_version FROM memories WHERE embedding IS NOT NULL"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        var n = 0
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let v = sqlite3_column_type(stmt, 0) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 0)) : nil
+            if EmbeddingMigrationPolicy.action(stored: EmbeddingVersion(tag: v), current: current) == .reembed { n += 1 }
+        }
+        return n
+    }
+
+    /// Force every stored vector (memories + diary) to be treated as outdated by clearing its stamp,
+    /// so the next search re-embeds it with the active model. The honest way to invalidate after a
+    /// model change.
+    func invalidateEmbeddings() {
+        exec("UPDATE memories SET embedding_version = NULL")
+        exec("UPDATE diary SET embedding_version = NULL")
     }
 
     // MARK: - Private: Cache Refresh
@@ -522,34 +634,32 @@ class SemanticMemoryStore: ObservableObject {
         let legacyURL = docsDir.appendingPathComponent("user_memories.json")
         guard FileManager.default.fileExists(atPath: legacyURL.path) else { return }
         guard let data = try? Data(contentsOf: legacyURL),
-              let dict = try? JSONDecoder().decode([String: String].self, from: data),
-              !dict.isEmpty else { return }
+              let dict = try? JSONDecoder().decode([String: String].self, from: data) else {
+            // Transient read/decode failure — leave the file for a later attempt.
+            return
+        }
 
-        // Only migrate if semantic DB is empty
-        guard fetchAllMemories(namespace: "global").isEmpty else { return }
-        NSLog("[SemanticMemory] Migrating %d legacy memories", dict.count)
-        for (key, value) in dict { upsert(key: key, value: value, namespace: "global") }
-        refreshGlobalCache()
+        // Migrate only into an empty semantic DB; either way, retire the legacy file so it can
+        // never re-import. (It used to linger forever: `clearAll()` + relaunch resurrected every
+        // "forgotten" memory from it.)
+        if !dict.isEmpty, fetchAllMemories(namespace: "global").isEmpty {
+            NSLog("[SemanticMemory] Migrating %d legacy memories", dict.count)
+            for (key, value) in dict { upsert(key: key, value: value, namespace: "global") }
+            refreshGlobalCache()
+        }
+        let retired = legacyURL.appendingPathExtension("migrated")
+        try? FileManager.default.removeItem(at: retired)
+        do {
+            try FileManager.default.moveItem(at: legacyURL, to: retired)
+            NSLog("[SemanticMemory] Retired legacy memory file")
+        } catch {
+            NSLog("[SemanticMemory] Could not retire legacy memory file: %@", error.localizedDescription)
+        }
     }
 
     // MARK: - Private: Embedding
 
-    private func embed(_ text: String) -> [Float]? {
-        guard let model = wordEmbedding else { return nil }
-        let words = text.lowercased()
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-        var sum = [Double](repeating: 0, count: model.dimension)
-        var count = 0
-        for word in words {
-            guard let vec = model.vector(for: word) else { continue }
-            for i in 0..<min(vec.count, sum.count) { sum[i] += vec[i] }
-            count += 1
-        }
-        guard count > 0 else { return nil }
-        let avg = sum.map { $0 / Double(count) }
-        return avg.map { Float($0) }
-    }
+    private func embed(_ text: String) -> [Float]? { embedder.embed(text) }
 
     private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
         guard a.count == b.count, !a.isEmpty else { return 0 }
@@ -609,11 +719,38 @@ class SemanticMemoryStore: ObservableObject {
         return sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK
     }
 
-    private func normalise(_ key: String) -> String {
-        key.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    /// A value bound into a parameterized statement — the only safe way to put user/LLM text
+    /// into SQL. (Interpolating escaped strings broke on apostrophes in memory *keys*, which
+    /// were never escaped: `[REMEMBER: daughter's birthday = …]` silently failed to save.)
+    private enum SQLValue {
+        case text(String)
+        case real(Double)
     }
 
-    private func escapedSQL(_ s: String) -> String {
-        s.replacingOccurrences(of: "'", with: "''")
+    /// Run a parameterized (non-query) statement with positional `?` binds.
+    @discardableResult
+    private func run(_ sql: String, _ binds: [SQLValue]) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            NSLog("[SemanticMemory] prepare failed: %@", String(cString: sqlite3_errmsg(db)))
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        for (i, bind) in binds.enumerated() {
+            let idx = Int32(i + 1)
+            switch bind {
+            case .text(let s): sqlite3_bind_text(stmt, idx, s, -1, SQLITE_TRANSIENT)
+            case .real(let d): sqlite3_bind_double(stmt, idx, d)
+            }
+        }
+        let ok = sqlite3_step(stmt) == SQLITE_DONE
+        if !ok {
+            NSLog("[SemanticMemory] step failed: %@", String(cString: sqlite3_errmsg(db)))
+        }
+        return ok
+    }
+
+    private func normalise(_ key: String) -> String {
+        key.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

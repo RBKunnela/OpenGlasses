@@ -14,7 +14,8 @@ final class NativeToolRegistry {
          audioRecorder: AudioRecordingService? = nil,
          medicalExportService: MedicalExportService? = nil,
          semanticMemory: SemanticMemoryStore? = nil,
-         documentStore: DocumentStore? = nil) {
+         documentStore: DocumentStore? = nil,
+         activeNamespace: (() -> String)? = nil) {
         let weatherTool = WeatherTool(locationService: locationService)
         let newsTool = NewsTool()
         let dateTimeTool = DateTimeTool()
@@ -133,6 +134,7 @@ final class NativeToolRegistry {
         // disables them and users see a clear message.
         if Config.fieldAssistActive {
             register(FieldSessionTool())
+            register(ProjectNoteTool())
             register(ProcedureRunnerTool())
             register(CaptureFlowTool())
             register(DomainCalcTool())
@@ -160,6 +162,9 @@ final class NativeToolRegistry {
         // Personal Health Vault (Plan B) — always registered; the tool checks the Medical
         // Compliance unlock at execution time.
         register(HealthVaultTool())
+        // Personal Health-Safety Advisor (Plan AB) — "is this safe for me?" over the vault,
+        // backstopped by a deterministic interaction rubric. Same Medical Compliance gate.
+        register(HealthSafetyTool())
         // Personal Notes Vault — free second-brain over VaultStore.
         register(NotesVaultTool())
         // Medication Identifier (Plan I) — OCR a label, cross-check the Health Vault. Needs camera.
@@ -203,6 +208,7 @@ final class NativeToolRegistry {
             var ragTool = DocumentRAGTool()
             ragTool.documentStore = docStore
             ragTool.cameraService = cameraService
+            ragTool.activeNamespace = activeNamespace   // Project scoping (Plan AN)
             register(ragTool)
             // Study Mode — flashcards + quizzes over the same documents (via StudyService.shared).
             register(StudyTool())
@@ -246,6 +252,16 @@ final class NativeToolRegistry {
             if Config.hipaaMode, Config.hipaaDisabledTools.contains(name) { return false }
             return true
         }.sorted()
+    }
+
+    /// Enabled (name, description) pairs for the given names, in the order provided — the single
+    /// source for the system-prompt tool list (Plan BG P1). Skips any name the registry doesn't
+    /// own so callers can pass a pre-filtered `toolNames` slice safely.
+    func toolDescriptions(for names: [String]) -> [(name: String, description: String)] {
+        names.compactMap { name in
+            guard let tool = tools[name] else { return nil }
+            return (name, tool.description)
+        }
     }
 
     /// Context-aware tool names — filters out tools that aren't relevant to the current state.

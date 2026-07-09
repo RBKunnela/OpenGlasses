@@ -10,7 +10,7 @@ import AppIntents
 struct AddTeleprompterScriptIntent: AppIntent {
     static var title: LocalizedStringResource = "Add Teleprompter Script"
     static var description = IntentDescription(
-        "Save text (e.g. from an Apple Note, Reminder, or file) as a teleprompter script in OpenGlasses."
+        "Save text — for example from a note, a reminder, or a file — as a teleprompter script in OpenGlasses."
     )
 
     static var openAppWhenRun: Bool { false }

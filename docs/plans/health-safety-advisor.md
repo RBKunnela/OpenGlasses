@@ -1,7 +1,15 @@
-# Plan — Personal Health-Safety Advisor
+# Plan AB — Personal Health-Safety Advisor
 
-**Status: 📋 Planned (not built).** Grounds in our existing **Health Vault** ("can I take ibuprofen?" →
-checks meds + PGx + contraindications). Extends the **Medical Compliance** IAP line.
+**Status: 🚧 Core shipped.** The deterministic core is built and tested: pure `SubstanceCatalog`
+(drug-class / food-tag / condition synonyms), `VaultGrounding` (selects the relevant vault meds /
+conditions / allergies), `InteractionRubric` (curated **high-severity** interactions — authoritative,
+the LLM can't downgrade a hit), and `HealthSafetyResponseBuilder` (cite + mandatory disclaimer). The
+`@MainActor HealthSafetyAdvisor` reads the Medical-Compliance-gated Health Vault, runs the rubric, and
+grounds the LLM long-tail via `completeStateless`; `HealthSafetyTool` (`health_check` —
+`can_i_take`/`can_i_eat`) is registered + advertised in both prompt builders. 14 tests green in
+Release. Deferred: the OCR-a-label `can_i_eat` photo path (device-gated) and broader rubric coverage.
+
+Original plan below.
 
 **Strategic fit:** Turns the **Health Vault** (Plan B) from passive storage into an *active* "is this safe
 for **me**?" advisor: a hands-free, vault-grounded check for **drug interactions, contraindications, and
