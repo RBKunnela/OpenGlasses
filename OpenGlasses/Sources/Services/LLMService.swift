@@ -149,6 +149,10 @@ class LLMService: ObservableObject {
     /// Local on-device LLM service (MLX Swift)
     var localLLMService: LocalLLMService?
 
+    /// Session the SSE streaming helpers use. Injectable purely so tests can stub `URLProtocol`
+    /// and exercise the stream parsing/error paths headlessly (BM P9); production uses `.shared`.
+    var streamingSession: URLSession = .shared
+
 
     #if canImport(FoundationModels)
     private var _appleSession: Any?
@@ -179,10 +183,17 @@ class LLMService: ObservableObject {
     /// of the heavy optional contexts (playbook/shortcuts/OpenClaw). `sendLocal` appends its own
     /// reduced tool block, so the model still has usable tools. Used by every on-device path
     /// (active-model `sendMessage` and fast-tier `sendViaLocalAgent`) so they can't diverge.
-    static func leanOnDevicePrompt(locationContext: String?, memoryContext: String?, hasImage: Bool, turn: String) async -> String {
-        await buildSystemPrompt(
+    static func leanOnDevicePrompt(locationContext: String?, memoryContext: String?, hasImage: Bool, turn: String, weatherContext: String? = nil) async -> String {
+        var prompt = await buildSystemPrompt(
             locationContext: locationContext, includeTools: false, includeOpenClaw: false,
             hasImage: hasImage, memoryContext: memoryContext, turn: turn)
+        if let weatherContext {
+            prompt += "\n\nCURRENT WEATHER (fetched just now — answer from this; do NOT call get_weather and do NOT say you will check): \(weatherContext)"
+        }
+        // Gemma-style templates have no separate system channel — this whole prompt is merged
+        // into the model's first *user* turn, and a small model can flip roles and reply to
+        // "OpenGlasses" instead of the wearer. Pin the speaker identity explicitly.
+        return prompt + "\n\nThe person speaking to you is the user wearing the glasses. Address them directly as \"you\". Never address OpenGlasses — that is your own name."
     }
 
     private static func buildSystemPrompt(locationContext: String?, includeTools: Bool, includeOpenClaw: Bool, hasImage: Bool, nativeToolNames: [String] = [], nativeToolDescriptions: [(name: String, description: String)] = [], gatewayToolNames: [String] = [], memoryContext: String? = nil, agentContext: String? = nil, playbookContext: String? = nil, nowPlayingContext: String? = nil, shortcutsContext: String? = nil, promptSections: ConversationClassifier.PromptSections? = nil, turn: String? = nil) async -> String {
@@ -228,6 +239,11 @@ class LLMService: ObservableObject {
                 // list can't drift from the real tool set or from the Gemini Live prompt.
                 if !nativeToolDescriptions.isEmpty {
                     toolSection += "\n\n" + SystemPromptBuilder.toolLines(nativeToolDescriptions)
+                }
+                // Plan BM P4: domains the model must route through a tool, never self-answer.
+                let routingRules = SystemPromptBuilder.routingRules(toolNames: nativeToolNames)
+                if !routingRules.isEmpty {
+                    toolSection += "\n\nMANDATORY ROUTING:\n" + routingRules
                 }
 
                 // Inject user-defined custom tool descriptions
@@ -337,6 +353,11 @@ class LLMService: ObservableObject {
         if let playbook = playbookContext {
             prompt += "\n\n\(playbook)"
         }
+        // Models have no clock — without this one ~15-token line they answer date/time
+        // reasoning from their training cutoff, confidently wrong ("local LLM doesn't
+        // know day or time"). Unconditional: cheap enough for every turn, both paths.
+        prompt += "\n\nCURRENT DATE & TIME: \(Self.currentDateTimeLine())"
+
         if let location = locationContext {
             prompt += "\n\nUSER LOCATION: \(location)"
         }
@@ -355,6 +376,15 @@ class LLMService: ObservableObject {
         // Inject the active project's knowledge-base grounding when it has documents (Plan AN).
         if let projectContext = ProjectContextService.shared.promptContext() {
             prompt += "\n\n\(projectContext)"
+        }
+        // Inject the pages read so far when a reading session is live (Plan BT). Ungated by the
+        // classifier on purpose: mid-book questions ("who is she?") match no keyword list, so the
+        // live session is the signal — same call the playbook context makes. Here rather than as a
+        // threaded parameter because this function is on every path (the lean on-device prompt
+        // included), so local, cloud and cloud-agent all get it from this one line. The turn lets
+        // the P4 catch-up retrieval pick which confirmed-read earlier passages ride along.
+        if let readingContext = ReadingCompanionService.shared.promptContext(turn: turn) {
+            prompt += "\n\n\(readingContext)"
         }
         // Inject project-scoped notes for the active job (what the user is mid-way through).
         if Config.projectMemoryEnabled,
@@ -399,7 +429,7 @@ class LLMService: ObservableObject {
                 guard let self else { return .failure("Service unavailable") }
                 if let router = self.nativeToolRouter {
                     return await router.handleToolCall(name: name, args: args)
-                } else if let bridge = self.openClawBridge {
+                } else if let bridge = self.openClawBridge, Config.isOpenClawAgentActive {
                     let taskDesc = args["task"] as? String ?? (rawArgs ?? String(describing: args))
                     return await bridge.delegateTask(task: taskDesc, toolName: name)
                 }
@@ -409,10 +439,12 @@ class LLMService: ObservableObject {
         )
     }
 
-    /// - Parameter onToken: optional per-token callback for streaming the final assistant reply
-    ///   into the UI as it's generated. Currently honoured by the on-device (`local`) provider;
-    ///   cloud providers ignore it and return the full reply on completion.
-    func sendMessage(_ text: String, locationContext: String? = nil, imageData: Data? = nil, memoryContext: String? = nil, agentContext: String? = nil, playbookContext: String? = nil, nowPlayingContext: String? = nil, shortcutsContext: String? = nil, promptSections: ConversationClassifier.PromptSections? = nil, onToken: ((String) -> Void)? = nil) async throws -> String {
+    /// - Parameter onToken: optional per-token callback for streaming the assistant reply into the
+    ///   UI as it's generated (honoured by the Anthropic, OpenAI-compatible, and local providers).
+    /// - Parameter onStreamReset: invoked at the start of each streamed tool-loop iteration so the
+    ///   caller can clear its accumulated bubble — intermediate tool-turn text must never
+    ///   concatenate with the final reply (BM P9).
+    func sendMessage(_ text: String, locationContext: String? = nil, imageData: Data? = nil, memoryContext: String? = nil, agentContext: String? = nil, playbookContext: String? = nil, nowPlayingContext: String? = nil, shortcutsContext: String? = nil, promptSections: ConversationClassifier.PromptSections? = nil, onToken: ((String) -> Void)? = nil, onStreamReset: (() -> Void)? = nil) async throws -> String {
         isProcessing = true
         defer { isProcessing = false }
 
@@ -431,7 +463,7 @@ class LLMService: ObservableObject {
         let provider = modelConfig.llmProvider
         let isOnDevice = (provider == .local || provider == .appleOnDevice)
         let hasNativeTools = nativeToolRouter != nil
-        let includeOpenClaw = Config.isOpenClawConfigured && openClawBridge != nil
+        let includeOpenClaw = Config.isOpenClawAgentActive && openClawBridge != nil
         let includeTools = hasNativeTools || includeOpenClaw
         let nativeToolNames = nativeToolRouter?.registry.toolNames ?? []   // used by the agent-plan block too
 
@@ -440,6 +472,23 @@ class LLMService: ObservableObject {
         // `sendLocal` appends its own reduced tool block, so the model still has usable tools.
         // Cloud providers get the full tool-laden prompt. (`sendLocal` keeps `includeTools` so it
         // still adds the reduced set — only the PROMPT drops the ~100-tool dump.)
+        // Vision honesty: a non-vision on-device model silently DROPS the image while the
+        // vision prompt block insists "You CAN see images" — the model then invents a scene
+        // (live-traced: described a cup that was never photographed). Refuse instead.
+        // Demotion-aware when the service is in hand: a Gemma whose VLM load fell back to the
+        // text factory would silently drop the image despite its architectural vision claim.
+        if isOnDevice, imageData != nil,
+           provider == .appleOnDevice
+               || !(localLLMService?.isVisionUsable(modelId: modelConfig.model)
+                    ?? LocalLLMService.isVisionCapable(modelId: modelConfig.model)) {
+            // Don't recommend the very model being refused: a demoted Gemma is architecturally
+            // vision-capable but this build's vision weights wouldn't load on this device.
+            if provider != .appleOnDevice, LocalLLMService.isVisionCapable(modelId: modelConfig.model) {
+                return LocalLLMService.visionWeightsUnavailableMessage
+            }
+            return "I can't look at photos with the current on-device model. Switch to a vision-capable local model like SmolVLM2, or a cloud model, and try again."
+        }
+
         let fullPrompt: String
         if isOnDevice {
             fullPrompt = await Self.leanOnDevicePrompt(
@@ -474,7 +523,7 @@ class LLMService: ObservableObject {
         let rawResponse: String
         switch provider {
         case .anthropic:
-            rawResponse = try await sendAnthropic(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData, onToken: onToken)
+            rawResponse = try await sendAnthropic(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData, onToken: onToken, onStreamReset: onStreamReset)
         case .gemini:
             rawResponse = try await sendGemini(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData)
         case .local:
@@ -482,7 +531,7 @@ class LLMService: ObservableObject {
         case .appleOnDevice:
             rawResponse = try await sendAppleOnDevice(text, systemPrompt: fullPrompt)
         case .openai, .groq, .zai, .qwen, .minimax, .xai, .openrouter, .custom:
-            rawResponse = try await sendOpenAICompatible(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData, onToken: onToken)
+            rawResponse = try await sendOpenAICompatible(text, systemPrompt: fullPrompt, config: modelConfig, includeTools: includeTools, imageData: imageData, onToken: onToken, onStreamReset: onStreamReset)
         }
 
         // Strip <think> tags: keep reasoning in history but don't speak it
@@ -497,6 +546,62 @@ class LLMService: ObservableObject {
 
         lastReasoning = nil
         return rawResponse
+    }
+
+    // MARK: - Model Cascade (BK P2b)
+
+    /// `sendMessage` with automatic fall-over to the next model when the active one can't serve the
+    /// turn (`promptTooLong`, `429`/quota, empty completion, …). The active model leads; the user's
+    /// fallback order (then the remaining saved models) follow. Between hops the active model is
+    /// swapped and the conversation history is rewound to its pre-turn snapshot so a failed attempt
+    /// never leaves half a turn (or a duplicated user turn) behind. The active model is always
+    /// restored on exit, so a cascade is transparent to the caller's own switch/restore bookkeeping.
+    ///
+    /// Falls straight through to a single `sendMessage` when the cascade is disabled or there's only
+    /// one candidate. Exhaustion throws the *last real* error (not a generic line) so the caller can
+    /// speak the true reason.
+    func sendMessageCascading(_ text: String, locationContext: String? = nil, imageData: Data? = nil, memoryContext: String? = nil, agentContext: String? = nil, playbookContext: String? = nil, nowPlayingContext: String? = nil, shortcutsContext: String? = nil, promptSections: ConversationClassifier.PromptSections? = nil, backgrounded: Bool = false, onToken: ((String) -> Void)? = nil, onStreamReset: (() -> Void)? = nil, onModelSwitch: ((_ from: ModelConfig?, _ to: ModelConfig?, _ failure: ModelFallbackChain.FailureClass) async -> Void)? = nil) async throws -> String {
+
+        func send() async throws -> String {
+            try await sendMessage(text, locationContext: locationContext, imageData: imageData, memoryContext: memoryContext, agentContext: agentContext, playbookContext: playbookContext, nowPlayingContext: nowPlayingContext, shortcutsContext: shortcutsContext, promptSections: promptSections, onToken: onToken, onStreamReset: onStreamReset)
+        }
+
+        let candidates = ModelFallbackChain.candidates(
+            activeId: Config.activeModelId, saved: Config.savedModels,
+            fallbackOrder: Config.modelFallbackOrder)
+        guard Config.modelCascadeEnabled, candidates.count > 1 else {
+            return try await send()
+        }
+
+        let startId = Config.activeModelId
+        let historySnapshot = conversationHistory
+        let savedById = Dictionary(Config.savedModels.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        defer {
+            Config.setActiveModelId(startId)
+            refreshActiveModel()
+        }
+
+        return try await ModelCascade.run(
+            candidates: candidates,
+            needs: .init(requiresVision: imageData != nil, isBackgrounded: backgrounded),
+            maxAttempts: min(candidates.count, 4),
+            isCancelled: { Task.isCancelled },
+            onSwitch: { from, to, failure in
+                // Rewind the partial UI stream and log the hop; P2c narrates it out loud.
+                onStreamReset?()
+                print("🔀 Model cascade: \(from.id) → \(to.id) (\(failure))")
+                await onModelSwitch?(savedById[from.id], savedById[to.id], failure)
+            },
+            attempt: { [weak self] candidate in
+                guard let self else { throw LLMError.invalidConfiguration("LLM service released") }
+                // Start each attempt from the clean pre-turn history so a failed hop doesn't leave a
+                // dangling/duplicated turn, and point the active model at this candidate.
+                self.conversationHistory = historySnapshot
+                Config.setActiveModelId(candidate.id)
+                self.refreshActiveModel()
+                return try await send()
+            }
+        )
     }
 
     // MARK: - Plan-then-execute (Plan S)
@@ -1148,22 +1253,33 @@ class LLMService: ObservableObject {
     /// the cost tracker (Plan AU). Parsing is pure/synchronous here; only the resulting
     /// integer counts cross to the main actor (the non-Sendable JSON does not). A
     /// missing usage block is a silent no-op — never throws, never blocks the reply.
-    /// Streaming turns (Chat tab `onToken`) don't carry a usage block on this path and
-    /// are not yet captured.
+    /// Streaming turns accumulate their own counts via `StreamingUsageAccumulator` and
+    /// enter through the already-parsed overload below.
     private func recordUsage(provider: LLMProvider, model: String, json: [String: Any]) {
-        guard let tokens = UsageTracker.parseTokens(provider: provider, json: json) else { return }
-        recordUsage(provider: provider, model: model, tokensIn: tokens.tokensIn, tokensOut: tokens.tokensOut)
+        guard let usage = UsageTracker.parseUsage(provider: provider, json: json) else { return }
+        // A usage block that carried none of the expected keys is shape drift, not a
+        // free turn — mark it so it isn't silently lost (Plan BM P3).
+        guard usage.recognized else {
+            Task { @MainActor in UsageTracker.shared.noteUntrackedTurn() }
+            return
+        }
+        recordUsage(provider: provider, model: model, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut,
+                    cacheWriteTokens: usage.cacheWriteTokens, cacheReadTokens: usage.cacheReadTokens)
     }
 
     /// Record already-parsed token counts (the streaming paths accumulate their own).
-    private func recordUsage(provider: LLMProvider, model: String, tokensIn: Int, tokensOut: Int) {
-        guard tokensIn + tokensOut > 0 else { return }
+    private func recordUsage(provider: LLMProvider, model: String, tokensIn: Int, tokensOut: Int,
+                             cacheWriteTokens: Int = 0, cacheReadTokens: Int = 0) {
+        guard tokensIn + tokensOut + cacheWriteTokens + cacheReadTokens > 0 else { return }
         Task { @MainActor in
-            UsageTracker.shared.record(provider: provider, model: model, tokensIn: tokensIn, tokensOut: tokensOut)
+            UsageTracker.shared.record(provider: provider, model: model, tokensIn: tokensIn, tokensOut: tokensOut,
+                                       cacheWriteTokens: cacheWriteTokens, cacheReadTokens: cacheReadTokens)
         }
     }
 
-    private func sendAnthropic(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data?, onToken: ((String) -> Void)? = nil) async throws -> String {
+    // Internal (not private) so the BM P9 fixture tests can drive the full streamed tool loop
+    // through a stubbed `streamingSession`.
+    func sendAnthropic(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data?, onToken: ((String) -> Void)? = nil, onStreamReset: (() -> Void)? = nil) async throws -> String {
         // An explicit API key wins; otherwise fall back to a connected Claude account (OAuth).
         let apiKey = await AnthropicAuth.resolveCredential(apiKey: config.apiKey)
         guard !apiKey.isEmpty else {
@@ -1232,7 +1348,7 @@ class LLMService: ObservableObject {
                 ]
 
                 if includeTools {
-                    let includeOpenClaw = Config.isOpenClawConfigured && self.openClawBridge != nil
+                    let includeOpenClaw = Config.isOpenClawAgentActive && self.openClawBridge != nil
                     let toolsData: Data = await MainActor.run {
                         let tools = ToolDeclarations.anthropicTools(registry: self.nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: self.nativeToolRouter?.mcpClient)
                         return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
@@ -1253,7 +1369,16 @@ class LLMService: ObservableObject {
                 let content: [[String: Any]]
                 let stopReason: String?
                 if let onToken {
-                    (content, stopReason) = try await self.streamAnthropicContent(request: request, model: config.model, onToken: onToken)
+                    // New tool-loop iteration: clear the caller's accumulated bubble first, so an
+                    // intermediate tool turn's text never concatenates with the final reply (BM P9).
+                    onStreamReset?()
+                    let flag = TokenDeliveryFlag()
+                    (content, stopReason) = try await self.withTransientSSERetries(tokenFlag: flag) {
+                        try await self.streamAnthropicContent(request: request, model: config.model) { token in
+                            flag.mark()
+                            onToken(token)
+                        }
+                    }
                 } else {
                     let (data, response) = try await URLSession.shared.data(for: request)
 
@@ -1337,12 +1462,21 @@ class LLMService: ObservableObject {
 
     // MARK: - OpenAI-compatible
 
-    private func sendOpenAICompatible(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data?, onToken: ((String) -> Void)? = nil) async throws -> String {
-        let provider = config.llmProvider
-        let apiKey = config.apiKey
-        guard !apiKey.isEmpty else {
+    /// Authorization header value for an OpenAI-compatible request, or nil for a keyless
+    /// `.custom` endpoint (self-hosted Ollama/LM Studio/bridge — the save/list paths already
+    /// allow an empty key for `.custom`, so the send path must too).
+    nonisolated static func openAICompatibleAuthorization(provider: LLMProvider, apiKey: String) throws -> String? {
+        guard apiKey.isEmpty else { return "Bearer \(apiKey)" }
+        guard provider == .custom else {
             throw LLMError.missingAPIKey("\(provider.displayName) API key not configured")
         }
+        return nil
+    }
+
+    private func sendOpenAICompatible(_ text: String, systemPrompt: String, config: ModelConfig, includeTools: Bool, imageData: Data?, onToken: ((String) -> Void)? = nil, onStreamReset: (() -> Void)? = nil) async throws -> String {
+        let provider = config.llmProvider
+        let apiKey = config.apiKey
+        let authorization = try Self.openAICompatibleAuthorization(provider: provider, apiKey: apiKey)
 
         var baseURL = config.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !baseURL.hasSuffix("/chat/completions") {
@@ -1405,7 +1539,9 @@ class LLMService: ObservableObject {
                 var request = URLRequest(url: url)
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                if let authorization {
+                    request.setValue(authorization, forHTTPHeaderField: "Authorization")
+                }
 
                 // OpenRouter requires additional headers for tracking
                 if provider == .openrouter {
@@ -1432,7 +1568,7 @@ class LLMService: ObservableObject {
                 let providerSupportsTools = provider == .openai || provider == .groq || provider == .zai || provider == .qwen || provider == .openrouter
 
                 if includeTools && providerSupportsTools {
-                    let includeOpenClaw = Config.isOpenClawConfigured && self.openClawBridge != nil
+                    let includeOpenClaw = Config.isOpenClawAgentActive && self.openClawBridge != nil
                     let toolsData: Data = await MainActor.run {
                         let tools = ToolDeclarations.openAITools(registry: self.nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: self.nativeToolRouter?.mcpClient)
                         return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
@@ -1460,7 +1596,16 @@ class LLMService: ObservableObject {
                 // the reconstructed `message` (content + tool_calls) feeds the shared tool loop unchanged.
                 let message: [String: Any]
                 if let onToken {
-                    message = try await self.streamOpenAIMessage(request: request, provider: provider, model: config.model, onToken: onToken)
+                    // New tool-loop iteration: clear the caller's accumulated bubble first, so an
+                    // intermediate tool turn's text never concatenates with the final reply (BM P9).
+                    onStreamReset?()
+                    let flag = TokenDeliveryFlag()
+                    message = try await self.withTransientSSERetries(tokenFlag: flag) {
+                        try await self.streamOpenAIMessage(request: request, provider: provider, model: config.model) { token in
+                            flag.mark()
+                            onToken(token)
+                        }
+                    }
                 } else {
                     let (data, response) = try await URLSession.shared.data(for: request)
 
@@ -1548,12 +1693,60 @@ class LLMService: ObservableObject {
 
     // MARK: - Streaming (SSE) — Chat tab live token delivery
 
+    /// Whether an SSE failure is worth an automatic retry (BM P9) — rate limits (429), server-side
+    /// errors/overload (5xx incl. Anthropic 529), transient network drops, and interrupted streams
+    /// whose reason reads as overload/truncation. Mirrors `RealtimeReconnect`'s
+    /// fatal-vs-recoverable split for the chat path.
+    nonisolated static func isTransientSSEError(_ error: Error) -> Bool {
+        switch error {
+        case LLMError.apiError(_, let status, _):
+            return status == 429 || (500...599).contains(status)
+        case LLMError.streamInterrupted(_, let reason):
+            let r = reason.lowercased()
+            return r.contains("overloaded") || r.contains("rate_limit")
+                || r.contains("server_error") || r.contains("truncated")
+        case let urlError as URLError:
+            return [.timedOut, .networkConnectionLost, .notConnectedToInternet,
+                    .cannotConnectToHost, .dnsLookupFailed].contains(urlError.code)
+        default:
+            return false
+        }
+    }
+
+    /// Reference-typed flag the streaming retry uses to know whether any token already reached the
+    /// UI — a failure after visible partial text must surface as an error, never silently retry
+    /// into duplicated output.
+    final class TokenDeliveryFlag {
+        private(set) var delivered = false
+        func mark() { delivered = true }
+    }
+
+    /// Retry `attempt` on transient SSE failures with `RealtimeReconnect` backoff (BM P9). Retries
+    /// only while no token has been delivered; gives up after the policy's attempts or on the
+    /// first non-transient error.
+    func withTransientSSERetries<T>(policy: RealtimeReconnect.Policy = .init(maxAttempts: 2, maxBackoffSeconds: 4),
+                                    tokenFlag: TokenDeliveryFlag,
+                                    _ attempt: () async throws -> T) async throws -> T {
+        var failures = 0
+        while true {
+            do {
+                return try await attempt()
+            } catch {
+                failures += 1
+                guard !tokenFlag.delivered, Self.isTransientSSEError(error),
+                      let delay = policy.delay(forAttempt: failures) else { throw error }
+                print("🔁 SSE transient failure (attempt \(failures)) — retrying in \(delay)s: \(error.localizedDescription)")
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+    }
+
     /// Stream an OpenAI-compatible chat-completions response, invoking `onToken` for each text
     /// delta, and return a reconstructed `message` dict (same shape as `choices[].message`) so the
     /// caller's tool loop runs identically to the buffered path. Only used when a streaming caller
     /// (the Chat tab) passes `onToken`; every other caller keeps the buffered path.
-    private func streamOpenAIMessage(request: URLRequest, provider: LLMProvider, model: String, onToken: @escaping (String) -> Void) async throws -> [String: Any] {
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+    func streamOpenAIMessage(request: URLRequest, provider: LLMProvider, model: String, onToken: @escaping (String) -> Void) async throws -> [String: Any] {
+        let (bytes, response) = try await streamingSession.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw LLMError.invalidResponse(provider.displayName) }
         guard http.statusCode == 200 else {
             var data = Data()
@@ -1568,13 +1761,22 @@ class LLMService: ObservableObject {
         var fullContent = ""
         var toolAcc: [Int: (id: String, name: String, args: String)] = [:]  // tool_calls accumulate by index
         var usage = StreamingUsageAccumulator()   // from the final include_usage chunk
+        var sawDone = false
 
         for try await line in bytes.lines {
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
             if payload.isEmpty { continue }
-            if payload == "[DONE]" { break }
+            if payload == "[DONE]" { sawDone = true; break }
             guard let obj = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any] else { continue }
+            // A mid-stream error event means the response died — the partial content must never
+            // return as a successful turn (BM P9).
+            if let err = obj["error"] as? [String: Any] {
+                let msg = err["message"] as? String ?? "stream error"
+                let kind = err["type"] as? String
+                throw LLMError.streamInterrupted(provider: provider.displayName,
+                                                 reason: kind.map { "\($0): \(msg)" } ?? msg)
+            }
             usage.consumeOpenAI(obj)   // the usage chunk has empty choices, so parse it before the guard
             guard let choice = (obj["choices"] as? [[String: Any]])?.first,
                   let delta = choice["delta"] as? [String: Any] else { continue }
@@ -1597,7 +1799,14 @@ class LLMService: ObservableObject {
             }
         }
 
-        recordUsage(provider: provider, model: model, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut)
+        // Premature EOF (connection dropped before "[DONE]") is truncation, not success.
+        guard sawDone else {
+            throw LLMError.streamInterrupted(provider: provider.displayName,
+                                             reason: "stream ended before [DONE] — response truncated")
+        }
+
+        recordUsage(provider: provider, model: model, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut,
+                    cacheWriteTokens: usage.cacheWriteTokens, cacheReadTokens: usage.cacheReadTokens)
 
         var message: [String: Any] = ["role": "assistant", "content": fullContent]
         if !toolAcc.isEmpty {
@@ -1611,8 +1820,8 @@ class LLMService: ObservableObject {
     /// Stream an Anthropic Messages response, invoking `onToken` for each text delta, and return
     /// the reconstructed content blocks + stop reason so the caller's tool loop runs identically to
     /// the buffered path. Only used when a streaming caller (the Chat tab) passes `onToken`.
-    private func streamAnthropicContent(request: URLRequest, model: String, onToken: @escaping (String) -> Void) async throws -> (content: [[String: Any]], stopReason: String?) {
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+    func streamAnthropicContent(request: URLRequest, model: String, onToken: @escaping (String) -> Void) async throws -> (content: [[String: Any]], stopReason: String?) {
+        let (bytes, response) = try await streamingSession.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw LLMError.invalidResponse("Anthropic") }
         guard http.statusCode == 200 else {
             var data = Data()
@@ -1626,6 +1835,7 @@ class LLMService: ObservableObject {
         var toolJSON: [Int: String] = [:]         // accumulated input_json per tool_use block
         var stopReason: String?
         var usage = StreamingUsageAccumulator()   // input from message_start, output from message_delta
+        var sawMessageStop = false
 
         for try await line in bytes.lines {
             guard line.hasPrefix("data:") else { continue }
@@ -1658,9 +1868,25 @@ class LLMService: ObservableObject {
                 if let delta = obj["delta"] as? [String: Any], let sr = delta["stop_reason"] as? String {
                     stopReason = sr
                 }
+            case "message_stop":
+                sawMessageStop = true
+            case "error":
+                // A mid-stream error event (e.g. overloaded_error) means the response died — the
+                // partial content must never return as a successful turn (BM P9).
+                let err = obj["error"] as? [String: Any]
+                let msg = err?["message"] as? String ?? "stream error"
+                let kind = err?["type"] as? String
+                throw LLMError.streamInterrupted(provider: "Anthropic",
+                                                 reason: kind.map { "\($0): \(msg)" } ?? msg)
             default:
                 break
             }
+        }
+
+        // Premature EOF (connection dropped before message_stop) is truncation, not success.
+        guard sawMessageStop else {
+            throw LLMError.streamInterrupted(provider: "Anthropic",
+                                             reason: "stream ended before message_stop — response truncated")
         }
 
         // Finalize tool_use blocks: parse the accumulated partial JSON into `input`.
@@ -1670,7 +1896,8 @@ class LLMService: ObservableObject {
             blocks[idx] = b
         }
 
-        recordUsage(provider: .anthropic, model: model, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut)
+        recordUsage(provider: .anthropic, model: model, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut,
+                    cacheWriteTokens: usage.cacheWriteTokens, cacheReadTokens: usage.cacheReadTokens)
 
         let content = blocks.sorted { $0.key < $1.key }.map { $0.value }
         return (content, stopReason)
@@ -1744,7 +1971,7 @@ class LLMService: ObservableObject {
                 ]
 
                 if includeTools {
-                    let includeOpenClaw = Config.isOpenClawConfigured && self.openClawBridge != nil
+                    let includeOpenClaw = Config.isOpenClawAgentActive && self.openClawBridge != nil
                     let toolsData: Data = await MainActor.run {
                         let tools = ToolDeclarations.geminiRESTTools(registry: self.nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw, mcpClient: self.nativeToolRouter?.mcpClient)
                         return (try? JSONSerialization.data(withJSONObject: tools)) ?? Data()
@@ -1874,16 +2101,144 @@ class LLMService: ObservableObject {
         var answer = response.content
         if Config.localWebSearchFallbackEnabled,
            UncertaintyDetector.assess(question: text, answer: answer).shouldSearch {
+            // The Apple session is stateful (it holds its own transcript), so its rewrite is
+            // context-aware without an explicit history block; the shared conversationHistory
+            // still feeds the grounding prompt for cross-answer reconciliation.
+            let recent = recentTupleHistory(6, stripToolMarkup: false)
             answer = await UncertaintyReask.answer(
                 question: text,
                 originalAnswer: answer,
+                history: recent,
                 search: { query in try await WebSearchTool().execute(args: ["query": query]) },
+                rewriteQuery: { q in
+                    try await session.respond(to: "Rewrite this follow-up as ONE self-contained web search query, using our conversation for context. If it already stands alone, output it unchanged. Output only the query, nothing else: \(q)").content
+                },
                 regenerate: { grounding in try await session.respond(to: grounding).content }
             )
         }
         return answer
     }
     #endif
+
+    /// The reduced tool set a local model is offered — only simple, reliable, self-contained tools
+    /// (each resolves its own inputs, e.g. `get_weather`/`where_am_i` read LocationService directly,
+    /// so the 2B model never has to supply coordinates it doesn't have).
+    static let localSafeTools: Set<String> = [
+        "get_weather", "get_datetime", "calculate", "set_timer",
+        "flashlight", "brightness", "calendar", "reminder",
+        "set_alarm", "step_count", "device_info", "music_control",
+        "where_am_i"
+    ]
+
+    /// Record an exchange the LLM didn't produce — tier-0 direct tool answers — so
+    /// follow-up turns can see it. Without this, "what about tomorrow?" after a direct
+    /// weather answer reached the model with no forecast anywhere in its history (the
+    /// direct path bypasses the LLM entirely; it only wrote to the UI transcript).
+    func recordExternalExchange(user: String, assistant: String) {
+        conversationHistory.append(["role": "user", "content": user])
+        conversationHistory.append(["role": "assistant", "content": assistant])
+        trimHistory()
+    }
+
+    /// "Tuesday, 15 July 2026, 6:41 pm (Pacific/Auckland)" — injected into every system
+    /// prompt. Pure and injectable for tests.
+    nonisolated static func currentDateTimeLine(now: Date = Date(), timeZone: TimeZone = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "EEEE, d MMMM yyyy, h:mm a"
+        return "\(formatter.string(from: now)) (\(timeZone.identifier))"
+    }
+
+    /// Parse the local model's `<tool_call>` markup. Extracted (pure) from `sendLocal` so
+    /// the announce-without-action retry can re-parse the corrective generation.
+    nonisolated static func parseLocalToolCall(_ response: String) -> (name: String, args: [String: Any])? {
+        let pattern = #"<tool_call>\s*(\{.*?\})\s*</tool_call>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]),
+              let match = regex.firstMatch(in: response, range: NSRange(response.startIndex..., in: response)),
+              let jsonRange = Range(match.range(at: 1), in: response),
+              let data = String(response[jsonRange]).data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let name = object["name"] as? String,
+              let args = object["arguments"] as? [String: Any] else {
+            return nil
+        }
+        return (name, args)
+    }
+
+    /// True when the reply narrates an intention to fetch/check something without any
+    /// tool markup — the shape a small model produces instead of acting.
+    /// The last `n` history entries as (role, content) tuples — the shape the local paths and
+    /// UncertaintyReask consume. Optionally strips `<tool_call>` markup (local path keeps its
+    /// context clean; the Apple path's transcript never contains markup).
+    private func recentTupleHistory(_ n: Int, stripToolMarkup: Bool) -> [(role: String, content: String)] {
+        conversationHistory.suffix(n).compactMap { turn in
+            guard let role = turn["role"] as? String, var content = turn["content"] as? String else { return nil }
+            if stripToolMarkup {
+                content = content
+                    .replacingOccurrences(of: #"<tool_call>.*?</tool_call>"#, with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return content.isEmpty ? nil : (role: role, content: content)
+        }
+    }
+
+    nonisolated static func announcesToolIntent(_ response: String) -> Bool {
+        let lowered = response.lowercased()
+        guard !lowered.contains("<tool_call>") else { return false }
+        // A promise-instead-of-action reply is SHORT (a sentence or two). A long answer that
+        // merely contains "searching for"/"let me check" mid-prose is an answer, not a stall —
+        // without this gate the never-speak-a-promise net could discard valid replies.
+        guard lowered.count < 280 else { return false }
+        let intentPhrases = [
+            "looking up", "look that up", "look it up", "let me check", "i'll check",
+            "i will check", "checking the", "let me get", "i'll get", "i'm getting",
+            "fetching", "one moment", "just a moment", "i'm looking",
+            // Search-flavoured announcements (live-traced: "I will now search for popular
+            // tourist destinations in Samoa for you" — then silence). Anchored to first-person
+            // intent so an answer that merely mentions searching doesn't match.
+            "i will now search", "i will search", "i'll search", "let me search",
+            "i'm searching", "searching for", "i should have used a tool",
+            "i will use a tool", "using a tool to",
+        ]
+        return intentPhrases.contains { lowered.contains($0) }
+    }
+
+    /// True when the reply asks the user to supply their location — the model has
+    /// where_am_i available and must never ask (live-traced: "If you tell me your current
+    /// location, I can check the forecast for you").
+    nonisolated static func asksUserForLocation(_ response: String) -> Bool {
+        let lowered = response.lowercased()
+        guard !lowered.contains("<tool_call>") else { return false }
+        let askPhrases = [
+            "your location", "your current location", "where you are",
+            "what city", "which city", "your city", "tell me where",
+            "let me know where", "share your location",
+        ]
+        return askPhrases.contains { lowered.contains($0) }
+    }
+
+    /// The reduced tool block appended to the lean on-device prompt. Extracted (and pure)
+    /// so the location nudge is testable: without it, a small model that has no USER
+    /// LOCATION line answers "I can't find your location" instead of calling `where_am_i`.
+    nonisolated static func localToolInstructions(toolNames: [String]) -> String {
+        guard !toolNames.isEmpty else { return "" }
+        var block = """
+
+        \nTOOLS (use sparingly, only when the user clearly needs one):
+        Output exactly: <tool_call>{"name": "tool_name", "arguments": {"key": "value"}}</tool_call>
+        Available: \(toolNames.joined(separator: ", "))
+        Only use a tool if the user explicitly asks for that action. Otherwise just answer directly.
+        """
+        if toolNames.contains("where_am_i") {
+            block += "\nIf you need the user's location and it isn't given above, call where_am_i — never say you lack location access and never ask the user where they are."
+        }
+        if toolNames.contains("calendar") {
+            // Live-traced: without the argument schema the model only ever got the default
+            // ("today"), asked the user for dates it couldn't use, then denied having access.
+            block += "\ncalendar arguments: {\"action\": \"today\" | \"tomorrow\" | \"next\" | \"upcoming\"} — pick the one matching the day asked about. You DO have the user's calendar through this tool; never claim you lack calendar access and never ask for a date when one of these actions fits."
+        }
+        return block
+    }
 
     // Unlike the cloud providers, the on-device path is deliberately NOT on the shared `runToolLoop`
     // driver (Plan BG P3). On-device models don't expose a structured tool-use API — they emit
@@ -1903,38 +2258,14 @@ class LLMService: ObservableObject {
         // Build tool instructions — use minimal set for local models
         var fullPrompt = systemPrompt
         if includeTools, let router = nativeToolRouter {
-            // Local models get a reduced tool set — only simple, reliable tools
-            let localSafeTools: Set<String> = [
-                "get_weather", "get_datetime", "calculate", "set_timer",
-                "flashlight", "brightness", "calendar", "reminder",
-                "set_alarm", "step_count", "device_info", "music_control"
-            ]
-            let toolNames = router.registry.toolNames.filter { localSafeTools.contains($0) }
-            if !toolNames.isEmpty {
-                fullPrompt += """
-
-                \nTOOLS (use sparingly, only when the user clearly needs one):
-                Output exactly: <tool_call>{"name": "tool_name", "arguments": {"key": "value"}}</tool_call>
-                Available: \(toolNames.joined(separator: ", "))
-                Only use a tool if the user explicitly asks for that action. Otherwise just answer directly.
-                """
-            }
+            let toolNames = router.registry.toolNames.filter { Self.localSafeTools.contains($0) }
+            fullPrompt += Self.localToolInstructions(toolNames: toolNames)
         }
 
-        // Build history — keep only last 2 exchanges for local models (context is precious)
-        let recentHistory = conversationHistory.suffix(4)
-        var history: [(role: String, content: String)] = []
-        for turn in recentHistory {
-            if let role = turn["role"] as? String, let content = turn["content"] as? String {
-                // Strip any tool call markup from history to keep context clean
-                let clean = content
-                    .replacingOccurrences(of: #"<tool_call>.*?</tool_call>"#, with: "", options: .regularExpression)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !clean.isEmpty {
-                    history.append((role: role, content: clean))
-                }
-            }
-        }
+        // Build history — last 3 exchanges for local models (context is precious; the
+        // LocalModelBudget cap still guards the ceiling). Was 2 — too short for a
+        // follow-up that references the answer before last.
+        let history = recentTupleHistory(6, stripToolMarkup: true)
 
         // Add user message to history
         conversationHistory.append(["role": "user", "content": text])
@@ -1944,14 +2275,22 @@ class LLMService: ObservableObject {
         // tool prompt says "use sparingly") case where the model emits a <tool_call>, the preview
         // briefly shows the markup before the cleaned final reply replaces it — acceptable for the
         // common no-tool path, which streams cleanly.
-        let response: String
+        var response: String
         do {
+            // The image rides only the FIRST generation of the turn — tool-result follow-up
+            // regenerations below re-answer over text, which is correct and far cheaper.
             response = try await localService.generate(
                 userMessage: text,
                 systemPrompt: fullPrompt,
                 history: history,
+                imageData: imageData,
                 onToken: onToken
             )
+        } catch is CancellationError {
+            // BK P4: a barge-in cancels the local generation. Propagate CancellationError UNWRAPPED
+            // so ConversationTurnRunner maps it to onCancelled (partial reply not spoken) instead
+            // of onError. Wrapping it in LLMError here would speak the generic error line.
+            throw CancellationError()
         } catch let error as LocalLLMError {
             // Propagate .backgrounded unwrapped so callers (e.g. AgentScheduler) can
             // tell "can't run on-device in background" apart from a real failure and
@@ -1963,15 +2302,33 @@ class LLMService: ObservableObject {
             throw LLMError.invalidResponse("Local model error: \(error.localizedDescription)")
         }
 
-        // Try to parse tool calls — but don't crash if the model doesn't support them well
-        let toolCallPattern = #"<tool_call>\s*(\{.*?\})\s*</tool_call>"#
-        if let regex = try? NSRegularExpression(pattern: toolCallPattern, options: [.dotMatchesLineSeparators]),
-           let match = regex.firstMatch(in: response, range: NSRange(response.startIndex..., in: response)),
-           let jsonRange = Range(match.range(at: 1), in: response),
-           let toolCallData = String(response[jsonRange]).data(using: .utf8),
-           let toolCall = try? JSONSerialization.jsonObject(with: toolCallData) as? [String: Any],
-           let toolName = toolCall["name"] as? String,
-           let toolArgs = toolCall["arguments"] as? [String: Any],
+        // Try to parse tool calls — but don't crash if the model doesn't support them well.
+        var parsedCall = Self.parseLocalToolCall(response)
+
+        // Announce-without-action (live-traced failure): the model says "I'm looking that
+        // up" without emitting the tool_call markup, and the single-shot path would accept
+        // the announcement as the answer. One corrective re-generation demanding the call
+        // (or a direct answer) — bounded, never loops.
+        if parsedCall == nil, includeTools, nativeToolRouter != nil,
+           Self.announcesToolIntent(response) || Self.asksUserForLocation(response) {
+            print("🔁 Local model stalled (announcement/location ask-back) — corrective regen")
+            let correction = Self.asksUserForLocation(response)
+                ? "The user's location is already available to you — never ask for it. Call the where_am_i or get_weather tool now via <tool_call> in the exact format, then answer."
+                : "You said you would look that up, but you did not call a tool. Either output the <tool_call> now in the exact format, or answer directly. Never say you will check — act."
+            var correctiveHistory = history
+            correctiveHistory.append((role: "assistant", content: response))
+            correctiveHistory.append((role: "user", content: correction))
+            if let second = try? await localService.generate(
+                userMessage: correction,
+                systemPrompt: fullPrompt,
+                history: correctiveHistory
+            ) {
+                response = second
+                parsedCall = Self.parseLocalToolCall(response)
+            }
+        }
+
+        if let (toolName, toolArgs) = parsedCall,
            let router = nativeToolRouter {
 
             // Execute the tool
@@ -2003,15 +2360,16 @@ class LLMService: ObservableObject {
                     systemPrompt: fullPrompt,
                     history: updatedHistory
                 )
+            } catch is CancellationError {
+                throw CancellationError()   // BK P4: a barge-in during the tool-result regen cancels too
             } catch {
                 // If re-generation fails, just return the tool result directly
                 finalResponse = textBefore.isEmpty ? resultText : "\(textBefore) \(resultText)"
             }
 
-            let cleanFinal = finalResponse
-                .replacingOccurrences(of: #"<tool_call>.*?</tool_call>"#, with: "", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-
+            // BK P3: an all-markup / empty final (e.g. the model answers the tool result with
+            // another <tool_call>) must surface as an error, not silent dead air at the speaker.
+            let cleanFinal = try Self.cleanedNonEmptyLocalAnswer(finalResponse)
             conversationHistory.append(["role": "assistant", "content": cleanFinal])
             trimHistory()
             return cleanFinal
@@ -2025,13 +2383,33 @@ class LLMService: ObservableObject {
         // Uncertainty gate (Plan BI): the local path can't reach `web_search` through a tool
         // loop, so a hedged or freshness-sensitive answer gets one transparent web-grounded
         // re-ask. Off-flag or confident answers pass straight through.
+        //
+        // An intent announcement that survived the corrective regen ("I will now search for…")
+        // is treated as uncertainty too: the promised search actually happens here. And a
+        // promise must NEVER be the spoken answer — if the re-ask can't improve on it (search
+        // failed, flag off), an honest failure line replaces it rather than dead air after
+        // "I'll look that up".
+        let announcedIntent = Self.announcesToolIntent(cleanResponse)
+        // Personal-data questions must never reach the web, even via the announced-intent
+        // branch — "let me check your reminders" + web search = "I don't have access to your
+        // personal reminders", the exact reply the detector's guard exists to prevent.
+        let isPersonalData = UncertaintyDetector.isPersonalDataQuestion(text.lowercased())
         var finalAnswer = cleanResponse
-        if Config.localWebSearchFallbackEnabled,
-           UncertaintyDetector.assess(question: text, answer: cleanResponse).shouldSearch {
+        if Config.localWebSearchFallbackEnabled, !isPersonalData,
+           announcedIntent || UncertaintyDetector.assess(question: text, answer: cleanResponse).shouldSearch {
             finalAnswer = await UncertaintyReask.answer(
                 question: text,
                 originalAnswer: cleanResponse,
+                history: history,
                 search: { query in try await WebSearchTool().execute(args: ["query": query]) },
+                rewriteQuery: { q in
+                    // A follow-up leaning on the conversation ("the other semi final?") is a
+                    // junk literal query — one tiny generation makes it self-contained.
+                    try await localService.generate(
+                        userMessage: "Conversation:\n\(UncertaintyReask.conversationBlock(history: history))\n\nRewrite this follow-up as ONE self-contained web search query. If it already stands alone, output it unchanged. Output only the query, nothing else: \(q)",
+                        systemPrompt: "You rewrite follow-up questions into standalone web search queries. Output only the query."
+                    )
+                },
                 regenerate: { grounding in
                     try await localService.generate(
                         userMessage: grounding,
@@ -2042,9 +2420,18 @@ class LLMService: ObservableObject {
             )
         }
 
-        conversationHistory.append(["role": "assistant", "content": finalAnswer])
+        // The never-speak-a-promise net: if the answer still announces an action (re-ask failed
+        // or the fallback flag is off), replace it with an honest miss.
+        if announcedIntent && finalAnswer == cleanResponse {
+            finalAnswer = "I couldn't get that information just now — please ask me again."
+        }
+
+        // BK P3: reject an empty local completion (immediate EOS / all-markup) instead of
+        // speaking silence — matches the Anthropic/Gemini empty-completion guards.
+        let validated = try Self.cleanedNonEmptyLocalAnswer(finalAnswer)
+        conversationHistory.append(["role": "assistant", "content": validated])
         trimHistory()
-        return finalAnswer
+        return validated
     }
 
     // MARK: - Local Agent Model
@@ -2052,7 +2439,7 @@ class LLMService: ObservableObject {
     /// Send a message through the on-device agent model (Gemma 4 via MLX).
     /// Used for fast-tier queries when agentic mode is enabled.
     /// Builds its own lightweight prompt and routes through sendLocal().
-    func sendViaLocalAgent(_ text: String, locationContext: String? = nil, memoryContext: String? = nil) async throws -> String {
+    func sendViaLocalAgent(_ text: String, locationContext: String? = nil, memoryContext: String? = nil, weatherContext: String? = nil) async throws -> String {
         let agentModelId = Config.agentModelId
         let hasNativeTools = nativeToolRouter != nil
 
@@ -2082,7 +2469,8 @@ class LLMService: ObservableObject {
             throw LLMError.missingAPIKey("Local LLM service not initialized")
         }
         let leanPrompt = await Self.leanOnDevicePrompt(
-            locationContext: locationContext, memoryContext: memoryContext, hasImage: false, turn: text)
+            locationContext: locationContext, memoryContext: memoryContext, hasImage: false, turn: text,
+            weatherContext: weatherContext)
         if !localService.isModelLoaded || localService.loadedModelId != agentModelId {
             try await localService.loadModel(agentModelId)
         }
@@ -2127,6 +2515,24 @@ extension ToolResult {
 extension LLMService {
     /// Strip `<think>...</think>` blocks from LLM output.
     /// Returns the spoken text (without think tags) and the extracted reasoning (if any).
+    /// Strip `<tool_call>` markup + trim, then require a non-empty result (BK P3). A sub-1B local
+    /// model can emit only `<tool_call>` markup (stripped to nothing) or an immediate EOS —
+    /// `TextToSpeechService.speak` drops an empty string silently, so the turn is total dead air:
+    /// no TTS, no tone, no HUD, no error. Anthropic and Gemini already reject an empty completion;
+    /// the local path must too. Throws `invalidResponse("Local")` on empty so the turn surfaces as
+    /// an error (which the P2b cascade can later act on) instead of silence. Pure + headless.
+    nonisolated static func cleanedNonEmptyLocalAnswer(_ raw: String) throws -> String {
+        let cleaned = raw
+            .replacingOccurrences(of: #"<tool_call>.*?</tool_call>"#, with: "", options: .regularExpression)
+            // A small model fed a merged (no-system-role) prompt can answer in transcript
+            // style — "OpenGlasses: ..." / "Assistant: ..." — and TTS would speak the label.
+            .replacingOccurrences(of: #"^\s*(OpenGlasses|Assistant|AI|Model)\s*:\s*"#,
+                                  with: "", options: [.regularExpression, .caseInsensitive])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { throw LLMError.invalidResponse("Local") }
+        return cleaned
+    }
+
     static func stripThinkTags(_ text: String) -> (spoken: String, reasoning: String?) {
         let pattern = "<think>[\\s\\S]*?</think>"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
@@ -2160,6 +2566,10 @@ enum LLMError: LocalizedError {
     case invalidResponse(String)
     case invalidConfiguration(String)
     case apiError(provider: String, statusCode: Int, message: String?)
+    /// A streaming response died mid-flight — a mid-stream `error` event or a connection that
+    /// ended before the terminator (`[DONE]` / `message_stop`). Partial content must never be
+    /// returned as a successful turn (BM P9).
+    case streamInterrupted(provider: String, reason: String)
 
     var errorDescription: String? {
         switch self {
@@ -2169,6 +2579,8 @@ enum LLMError: LocalizedError {
         case .apiError(let provider, let code, let msg):
             if let msg { return "\(provider) error \(code): \(msg)" }
             return "\(provider) error: \(code)"
+        case .streamInterrupted(let provider, let reason):
+            return "\(provider) stream interrupted: \(reason)"
         }
     }
 }

@@ -31,10 +31,30 @@ class HIPAAComplianceService: ObservableObject {
     private let auditLogURL: URL
     private let maxAuditEntries = 1000
 
+    /// Invoked right after `hipaaMode` is toggled so live services (cloud diarization, ambient
+    /// captions) can tear down/restart deterministically rather than waiting for a natural
+    /// restart. Wired by AppState; nil in tests and headless contexts.
+    var onModeChanged: (() -> Void)?
+
     init() {
         let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         auditLogURL = docsDir.appendingPathComponent("hipaa_audit_log.json")
         loadAuditLog()
+    }
+
+    /// Single entry point for toggling compliance mode: writes the flag, audit-logs the change,
+    /// and fires `onModeChanged` so dependent live sessions reconfigure at once. Callers must use
+    /// this rather than setting `Config.hipaaMode` directly, so the teardown never gets skipped.
+    func setMode(_ enabled: Bool) {
+        Config.hipaaMode = enabled
+        log(action: enabled ? "COMPLIANCE_ENABLED" : "COMPLIANCE_DISABLED",
+            detail: enabled ? "Medical compliance mode enabled" : "Medical compliance mode disabled")
+        if enabled {
+            // Plan BQ P2: compliance mode hard-disables Spotlight donation — purge
+            // everything previously donated. (Refreshes while enabled donate nothing.)
+            Task { @MainActor in await SpotlightIndexService.shared.purgeAll() }
+        }
+        onModeChanged?()
     }
 
     // MARK: - File Protection

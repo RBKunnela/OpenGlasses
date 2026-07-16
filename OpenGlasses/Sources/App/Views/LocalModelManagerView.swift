@@ -13,6 +13,7 @@ struct LocalModelManagerView: View {
     @State private var loadingModelId: String?
     @State private var loadedLocalModelId: String?   // mirrors the in-memory loaded model for the UI
     @State private var loadError: String?
+    @State private var failedLoadModelId: String?    // enables Try again after e.g. a headroom refusal
 
     private var localService: LocalLLMService? {
         appState.llmService.localLLMService
@@ -31,8 +32,20 @@ struct LocalModelManagerView: View {
                         .font(.footnote)
                         .foregroundStyle(.orange)
                 }
+                // Live memory readout: refreshes while visible so the user can watch a
+                // model load/unload. Sandboxing limits this to the app's own numbers —
+                // other apps' memory isn't visible from inside an iOS app.
+                TimelineView(.periodic(from: .now, by: 2)) { _ in
+                    LabeledContent("App memory", value: formatBytes(MemoryHeadroom.appFootprintBytes()))
+                }
+                TimelineView(.periodic(from: .now, by: 2)) { _ in
+                    let available = MemoryHeadroom.availableBytes()
+                    LabeledContent("Headroom", value: available > 0 ? formatBytes(available) : "—")
+                }
             } header: {
                 Text("Device")
+            } footer: {
+                Text("Headroom is how much more memory the app can use before iOS terminates it. A model won't load unless it fits in the current headroom with room to generate.")
             }
 
             // MARK: Downloaded Models
@@ -79,9 +92,30 @@ struct LocalModelManagerView: View {
                     }
                 }
                 if let loadError {
-                    Label(loadError, systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.red)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label(loadError, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                        if let failedLoadModelId {
+                            // Retry seam for the headroom gate: the user swipes other apps
+                            // away, watches headroom recover, and retries without leaving
+                            // the screen.
+                            HStack(spacing: 12) {
+                                Button("Try again") { loadLocalModel(failedLoadModelId) }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                    .disabled(loadingModelId != nil)
+                                TimelineView(.periodic(from: .now, by: 2)) { _ in
+                                    let available = MemoryHeadroom.availableBytes()
+                                    if available > 0 {
+                                        Text("Headroom now: \(formatBytes(available))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             } header: {
                 Text("Downloaded Models")
@@ -118,11 +152,18 @@ struct LocalModelManagerView: View {
                             if downloadedIds.contains(model.id) {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundStyle(.green)
-                            } else if downloadingModelId == model.id {
-                                ProgressView(value: localService?.downloadProgress ?? 0)
-                                    .frame(width: 60)
+                            } else if downloadingModelId == model.id, let service = localService {
+                                // Own subview so the service's @Published progress actually
+                                // re-renders it — read through the computed optional above,
+                                // nothing observed the service and the bar never moved.
+                                DownloadProgressRow(service: service) {
+                                    service.cancelDownload()
+                                    downloadingModelId = nil
+                                }
                             } else if !model.isCompatibleWithDevice {
-                                Label("Needs 8 GB", systemImage: "memorychip")
+                                // The model's OWN requirement — this badge was hardcoded
+                                // "Needs 8 GB" and misreported every other tier.
+                                Label("Needs \(Int(model.minimumRAMGB)) GB", systemImage: "memorychip")
                                     .font(.caption)
                                     .foregroundStyle(.orange)
                             } else {
@@ -144,7 +185,7 @@ struct LocalModelManagerView: View {
             } header: {
                 Text("Recommended")
             } footer: {
-                Text("These models are tested on iPhone and optimized for size. Larger models need more RAM.")
+                Text("These models are tested on iPhone and optimized for size. Larger models need more RAM. Keep the app open while downloading — the screen stays awake automatically.")
             }
 
             // MARK: Custom Model
@@ -204,6 +245,8 @@ struct LocalModelManagerView: View {
                 try await localService?.downloadModel(modelId)
                 refreshDownloaded()
                 downloadingModelId = nil
+            } catch is CancellationError {
+                downloadingModelId = nil   // BK P5: user cancelled — not an error to surface
             } catch {
                 downloadError = error.localizedDescription
                 downloadingModelId = nil
@@ -256,12 +299,14 @@ struct LocalModelManagerView: View {
     private func loadLocalModel(_ modelId: String) {
         loadingModelId = modelId
         loadError = nil
+        failedLoadModelId = nil
         Task {
             do {
                 try await localService?.loadModel(modelId)
                 loadedLocalModelId = modelId
             } catch {
                 loadError = error.localizedDescription
+                failedLoadModelId = modelId
             }
             loadingModelId = nil
         }
@@ -285,5 +330,34 @@ struct LocalModelManagerView: View {
         if bytes < 1024 * 1024 { return String(format: "%.0f KB", Double(bytes) / 1024) }
         if bytes < 1024 * 1024 * 1024 { return String(format: "%.1f MB", Double(bytes) / (1024 * 1024)) }
         return String(format: "%.1f GB", Double(bytes) / (1024 * 1024 * 1024))
+    }
+}
+
+/// Observes the service so the download progress actually updates — with a live percentage,
+/// because a multi-GB pull with no numbers reads as a hang. A compact spinner + percent, not a
+/// linear bar: the bar-plus-Cancel cluster was wide enough to crush the model name and its
+/// Vision/Tools badges in the same row.
+private struct DownloadProgressRow: View {
+    @ObservedObject var service: LocalLLMService
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.small)
+            if service.downloadProgress > 0 {
+                Text("\(Int(service.downloadProgress * 100))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            // BK P5: a real Cancel — routes through the service so the in-flight
+            // download is actually stopped, not just hidden.
+            Button(action: onCancel) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Cancel download")
+        }
     }
 }

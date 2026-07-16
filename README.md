@@ -25,7 +25,7 @@ A source-available voice-powered AI assistant for Ray-Ban and Oakley Meta smart 
 2. **Build on your iPhone** from Xcode (⌘R) — set signing team if prompted
 3. Add an AI model in **Settings → AI Models** (Anthropic, OpenAI, Gemini, or a local model)
 4. Pair your Ray-Ban or Oakley Meta glasses via the Meta AI app
-5. Say **"Hey OpenGlasses"** and ask anything
+5. Say **"OpenGlasses"** and ask anything
 
 ---
 
@@ -58,6 +58,24 @@ Beyond the pre-made phrases above, **Capture Glasses Photo** (a silent capture s
 
 The first time, iOS surfaces these in the **Shortcuts** app and the Siri phrase picker (you can rename the phrase to anything you like). A **persona name** can ride in the phrase ("ask Claude…") because it's a fixed, resolvable choice; the **question** can't (iOS only lets App Shortcut phrases embed fixed choices, not free-form text), so it's asked **two-step** — Siri prompts and awaits your spoken reply. Consecutive asks within a few minutes continue the **same conversation thread**, and Siri shows the answer in a result card. The intent runs in the background and speaks the result — no need to bring the app forward. If Siri ever says OpenGlasses isn't running, enable **Settings → Voice → Open App for Siri Questions** to have it launch the app first.
 
+#### Choose What Siri Can Run — and Add Your Own Actions
+
+**Settings → Siri & Search** is the control panel for the whole Siri surface:
+
+- **Built-in actions** — photo, recording, live modes, listening, **daily briefing**, **memory rewind** ("what did they just say?"), **teleprompter**, **meeting summary**, **save this location**, **broadcast** — each individually toggleable. Anything you turn off, Siri politely refuses.
+- **Your capabilities** — capture flows, procedures, playbooks, and custom tools you've authored appear automatically as candidates (off by default). Turn one on and **"Run *pump inspection* on OpenGlasses"** works by voice — no extra setup.
+- **Custom actions** — invent your own: a spoken name (plus synonyms) bound to a canned instruction for the assistant or a single tool call. "Run *morning rundown* on OpenGlasses."
+
+#### Your Content in Spotlight
+
+Notes, meeting summaries, saved locations, teleprompter scripts, playbooks, and study decks appear in **Spotlight and Siri search** — "the compressor job from Tuesday" finds the field session, and opening a result deep-links into the app. Privacy-tiered: **conversations** (titles only) and **Field Assist sessions** (metadata only, opted in per vault) are off until you enable them; health data, recognized people, and audio are **never indexed**; Medical Compliance Mode disables all donation and purges the index.
+
+#### Pre-Trained Siri Phrasing (App Schemas)
+
+OpenGlasses adopts Apple's **camera** and **assistant** App Intent schemas, so Apple-trained phrasing works with no custom shortcut: "take a photo", "start recording a video". Siri can also resolve **"this"** against the open chat thread — "summarize this" just works.
+
+The assistant schema additionally registers OpenGlasses for the **side-button voice-assistant slot** (replace Siri with OpenGlasses) — currently a **Japan-only** surface (iOS 26.2+, Apple Account region set to Japan, required by Japan's Mobile Software Competition Act; expected to reach more regions as regulation spreads). Everywhere else, the Action button route via **Settings → Action Button → Shortcut → "Ask OpenGlasses"** works today.
+
 ### On-Device Local LLM
 
 Run AI models entirely on your iPhone — no internet, no cloud, no API keys.
@@ -70,13 +88,15 @@ Run AI models entirely on your iPhone — no internet, no cloud, no API keys.
 
 | Model | Size | Best For |
 |-------|------|----------|
-| **Gemma 4 E2B** (default agent) | 3.6 GB | Best on-device agent — vision, tool calling, 140+ languages (needs 8 GB RAM) |
+| **Gemma 4 E2B** (default agent) | 3.6 GB | Best on-device agent — vision, tool calling, 140+ languages (8 GB RAM minimum, 12 GB recommended — uses ~4 GB while running) |
 | SmolVLM2 2.2B | 1.5 GB | Vision — sees photos + video |
 | Qwen 2.5 3B | 1.8 GB | Strong text reasoning + tool use |
 | Gemma 2 2B | 1.5 GB | Lightweight general purpose |
 | Qwen 2.5 0.5B | 0.4 GB | Ultra-light, basic |
 
 **Gemma 4 E2B** is the default on-device agent — it runs automatically when no cloud model is configured. Models are stored persistently and work fully offline after download. Toggle **Offline Mode** in Settings → Tools to disable internet-dependent tools.
+
+**Memory:** a loaded model occupies its full weight size in RAM plus working memory while generating — Gemma 4 E2B uses ~4 GB, a real load even on a 12 GB iPhone with other apps open. OpenGlasses checks available headroom before loading: if the model won't fit it tells you how much to free (swipe apps away in the app switcher) instead of letting iOS silently kill the app, and voice requests automatically fall over to a cloud model if one is configured. **Settings → AI Models → Download & Manage Models** shows the app's live memory use and remaining headroom.
 
 ### Self-Hosted Local Server (Ollama, llama.cpp, vLLM…)
 
@@ -481,7 +501,7 @@ All settings are in-app — no source code editing needed.
 | No audio through glasses | Verify Bluetooth connection in iOS Settings |
 | Glasses not connecting | Tap "Connect to Glasses"; enable Developer Mode in Meta AI app |
 | HomeKit not finding devices | HomeKit initializes on first tool call — say "list smart home devices" and wait 10s |
-| Local model crashes | Gemma 4 E2B needs ~8 GB RAM; on 6 GB devices use a smaller model (0.5B–2B) |
+| Local model won't load ("not enough memory") | Close other apps in the app switcher and use **Try again** in Download & Manage Models (live headroom shown there), or switch to a smaller model (0.5B–2B) |
 | Model download stuck | Keep app in foreground; downloads continue if briefly backgrounded |
 | "Untrusted Developer" | Settings → General → VPN & Device Management → Verify (requires internet) |
 

@@ -24,8 +24,11 @@ class OpenClawEventClient {
     private var challengeNonce: String?
 
     func connect() {
-        guard Config.isOpenClawConfigured else {
-            NSLog("[OpenClawWS] Not configured, skipping")
+        // BK P0: listening for inbound gateway events and feeding them to the triage LLM is itself
+        // an autonomous background action on untrusted content — gate the whole loop on Agent Mode,
+        // not just the outbound `delegateTask` leg it can reach.
+        guard Config.isOpenClawAgentActive else {
+            NSLog("[OpenClawWS] Not an active agentic gateway (configured + Agent Mode), skipping")
             return
         }
         shouldReconnect = true
@@ -79,7 +82,10 @@ class OpenClawEventClient {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         session = URLSession(configuration: config)
-        webSocketTask = session?.webSocketTask(with: url)
+        // BR P4: same channel classification as the bridge socket.
+        var request = URLRequest(url: url)
+        request.setValue(OpenClawBridge.messageChannel, forHTTPHeaderField: "x-openclaw-message-channel")
+        webSocketTask = session?.webSocketTask(with: request)
         webSocketTask?.resume()
 
         NSLog("[OpenClawWS] Connecting to %@ (gateway: %@)", LogRedaction.redact(url.absoluteString), gateway.name)

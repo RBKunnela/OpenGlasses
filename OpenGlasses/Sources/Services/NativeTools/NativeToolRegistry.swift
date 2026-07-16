@@ -78,9 +78,19 @@ final class NativeToolRegistry {
         }
 
         // Tier 3 tools
-        register(FitnessCoachingTool())
+        var fitnessTool = FitnessCoachingTool()
+        if let camera = cameraService {
+            // BK P6: feed check_form the latest camera frame so it actually runs PoseAnalyzer,
+            // making the tool's "check form via camera" claim true.
+            fitnessTool.frameProvider = { camera.latestFrame }
+        }
+        register(fitnessTool)
         register(FirstAidTool())
-        if let bridge = openClawBridge, Config.isOpenClawConfigured {
+        // BK P0: register the gateway-skills tool only when the gateway is an active agentic
+        // capability (configured AND Agent Mode on). Registering on `isOpenClawConfigured` alone
+        // would list `openclaw_skills` in the generated tool prompt/schema while Agent Mode is off
+        // — a capability the model can't actually use (a P6-style honesty violation).
+        if let bridge = openClawBridge, Config.isOpenClawAgentActive {
             var skillsTool = OpenClawSkillsTool()
             skillsTool.openClawBridge = bridge
             register(skillsTool)
@@ -191,12 +201,14 @@ final class NativeToolRegistry {
         var brainTool = BrainTool()
         brainTool.memoryStore = semanticMemory
         brainTool.documentStore = documentStore
+        brainTool.activeNamespace = activeNamespace   // Project scoping (Plan AN / BM P8)
         register(brainTool)
 
         // Semantic memory tools — only available when memory is enabled
         if let memory = semanticMemory {
             var searchTool = MemorySearchTool()
             searchTool.memoryStore = memory
+            searchTool.activeNamespace = activeNamespace   // Project scoping (Plan AN / BM P8)
             register(searchTool)
             var diaryTool = AgentDiaryTool()
             diaryTool.memoryStore = memory
@@ -213,6 +225,9 @@ final class NativeToolRegistry {
             // Study Mode — flashcards + quizzes over the same documents (via StudyService.shared).
             register(StudyTool())
         }
+        // Reading companion — session lifecycle only; the book Q&A rides the context block
+        // ReadingCompanionService injects into the prompt (Plan BT).
+        register(ReadingSessionTool())
 
         // LiveTranslationTool is registered separately after the service is created
 

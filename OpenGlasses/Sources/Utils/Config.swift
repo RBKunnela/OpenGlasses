@@ -108,7 +108,9 @@ struct Config {
         if let phrase = UserDefaults.standard.string(forKey: "wakePhrase"), !phrase.isEmpty {
             return phrase.lowercased()
         }
-        return "hey openglasses"
+        // No "hey" prefix: matching is substring-based, so the bare name also catches anyone
+        // who still says "hey openglasses" — one default covers both habits.
+        return "openglasses"
     }
 
     static func setWakePhrase(_ phrase: String) {
@@ -142,6 +144,11 @@ struct Config {
             return ["hey ray ban", "hey ray-ban", "hey raven", "hey rayben", "hey ray band"]
         case "hey openglasses":
             return ["hey open glasses", "hey open glass", "hey openclass", "hey open class", "hey openglass"]
+        case "openglasses":
+            // Hey-less default. Alternates cover the recognizer splitting the compound; the
+            // riskier "open class(es)" misrecognitions are NOT included here — without the
+            // "hey" anchor they'd false-trigger on ordinary speech.
+            return ["open glasses", "openglass", "open glass"]
         default:
             return []
         }
@@ -282,6 +289,31 @@ struct Config {
     @UserDefaultsBacked("autoModelRoutingEnabled", default: false) static var autoModelRoutingEnabled: Bool
 
     static func setAutoModelRoutingEnabled(_ enabled: Bool) { autoModelRoutingEnabled = enabled }
+
+    /// Whether a failed turn cascades to the next model instead of erroring (BK P2b). When on, a
+    /// `promptTooLong`/`429`/quota/empty-completion failure spills to the next candidate — the
+    /// stated cost preference: prefer the active (often local) model, fall over to cloud only when
+    /// it can't handle the turn. Default on.
+    @UserDefaultsBacked("modelCascadeEnabled", default: true) static var modelCascadeEnabled: Bool
+
+    static func setModelCascadeEnabled(_ enabled: Bool) { modelCascadeEnabled = enabled }
+
+    /// Whether the app speaks a one-line notice when it switches models (BK P2c) — a fallback hop
+    /// or an auto-routing switch. Keeps the user informed that the model (and its cost/latency)
+    /// changed under them. Default on, matching the "tell the user what it's doing" preference.
+    @UserDefaultsBacked("narrateModelSwitchesEnabled", default: true) static var narrateModelSwitchesEnabled: Bool
+
+    static func setNarrateModelSwitchesEnabled(_ enabled: Bool) { narrateModelSwitchesEnabled = enabled }
+
+    private static let modelFallbackOrderKey = "modelFallbackOrder"
+
+    /// User-ordered fallback model ids the cascade tries after the active model (cost preference:
+    /// local first, then progressively more capable/expensive cloud). Empty ⇒ the cascade falls
+    /// back on the remaining saved models in their existing order.
+    static var modelFallbackOrder: [String] {
+        get { UserDefaults.standard.stringArray(forKey: modelFallbackOrderKey) ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: modelFallbackOrderKey) }
+    }
 
     /// Get the model explicitly assigned to a tier by the user.
     /// Falls back to keyword-based auto-detection if no model is assigned.
@@ -446,7 +478,7 @@ struct Config {
     // MARK: - Custom System Prompt
 
     static let defaultSystemPrompt = """
-    You are OpenGlasses, a voice assistant running on Ray-Ban Meta smart glasses. Your responses will be spoken aloud via text-to-speech. Your name is OpenGlasses and the user activates you by saying "Hey OpenGlasses".
+    You are OpenGlasses, a voice assistant running on Ray-Ban Meta smart glasses. Your responses will be spoken aloud via text-to-speech. Your name is OpenGlasses and the user activates you by saying "OpenGlasses".
 
     RESPONSE STYLE:
     - Keep responses CONCISE but COMPLETE — typically 2-4 sentences, longer for complex topics.
@@ -1252,6 +1284,41 @@ struct Config {
         }
     }
 
+    // MARK: - Siri Exposure (Plan BQ)
+
+    /// Which actions the user exposes to Siri (built-in toggles + harvested capabilities +
+    /// hand-made actions). Built-ins default on, everything else off — see
+    /// `SiriExposureConfig`.
+    static var siriExposure: SiriExposureConfig {
+        guard let data = UserDefaults.standard.data(forKey: "siriExposureConfig"),
+              let config = try? JSONDecoder().decode(SiriExposureConfig.self, from: data) else {
+            return SiriExposureConfig()
+        }
+        return config
+    }
+
+    static func setSiriExposure(_ config: SiriExposureConfig) {
+        if let data = try? JSONEncoder().encode(config) {
+            UserDefaults.standard.set(data, forKey: "siriExposureConfig")
+        }
+    }
+
+    /// Which content types the user donates to Spotlight (Plan BQ P2). Separate key from
+    /// the action config so neither needs migrating when the other grows.
+    static var siriContentIndex: SiriContentIndexConfig {
+        guard let data = UserDefaults.standard.data(forKey: "siriContentIndexConfig"),
+              let config = try? JSONDecoder().decode(SiriContentIndexConfig.self, from: data) else {
+            return SiriContentIndexConfig()
+        }
+        return config
+    }
+
+    static func setSiriContentIndex(_ config: SiriContentIndexConfig) {
+        if let data = try? JSONEncoder().encode(config) {
+            UserDefaults.standard.set(data, forKey: "siriContentIndexConfig")
+        }
+    }
+
     // MARK: - ElevenLabs TTS
 
     /// ElevenLabs API key for natural TTS voices. Stored in the Keychain (see `KeychainService`).
@@ -1423,6 +1490,10 @@ struct Config {
     /// Pure UI gating: nothing about routing or behavior changes. Default off.
     @UserDefaultsBacked("simpleModeEnabled", default: false) static var simpleModeEnabled: Bool
 
+    /// Require device-owner auth (Face ID / passcode) to open Settings at all (BM P10). Exiting
+    /// Simple Mode always asks regardless of this flag. Default off.
+    @UserDefaultsBacked("settingsOwnerGateEnabled", default: false) static var settingsOwnerGateEnabled: Bool
+
     // MARK: - Uncertainty Web Search (Plan BI)
 
     /// Local backends (MLX, Apple Foundation) can't tool-call `web_search`; when on, a hedged or
@@ -1508,6 +1579,14 @@ struct Config {
     static var isOpenClawConfigured: Bool {
         // True if legacy single-gateway is configured OR any multi-gateway is configured
         (openClawEnabled && !openClawGatewayToken.isEmpty) || !enabledGateways.isEmpty
+    }
+
+    /// The gateway is an autonomous/agentic capability, so exposing or invoking it requires BOTH a
+    /// configured gateway AND Agent Mode on (BK P0 — the house rule that all gateway/autonomous
+    /// features sit behind `agentModeEnabled`). Every `execute`/`openclaw_skills` exposure and
+    /// delegation gate reads this, so the surface can never advertise or run while Agent Mode is off.
+    static var isOpenClawAgentActive: Bool {
+        isOpenClawConfigured && agentModeEnabled
     }
 
     // MARK: - Multi-Gateway Configuration
@@ -1731,6 +1810,7 @@ struct Config {
         "send_message",         // Block uncontrolled messaging of PHI
         "send_via",             // Block multi-channel messaging of PHI
         "openclaw_skills",      // No gateway skill execution with PHI
+        "reading_session",      // No passive camera OCR of documents — a "book" can be a chart
     ]
 
     // MARK: - Medical Export
@@ -1795,6 +1875,30 @@ struct Config {
 
     static func setBroadcastPlatform(_ platform: String) {
         UserDefaults.standard.set(platform, forKey: "broadcastPlatform")
+    }
+
+    /// BS P2: broadcast output orientation ("portrait" | "landscape").
+    static var broadcastOrientation: String {
+        UserDefaults.standard.string(forKey: "broadcastOrientation") ?? "portrait"
+    }
+    static func setBroadcastOrientation(_ value: String) {
+        UserDefaults.standard.set(value, forKey: "broadcastOrientation")
+    }
+
+    /// BS P3: starting video source for a broadcast (BroadcastVideoSource rawValue).
+    static var broadcastDefaultSource: String {
+        UserDefaults.standard.string(forKey: "broadcastDefaultSource") ?? "glasses"
+    }
+    static func setBroadcastDefaultSource(_ value: String) {
+        UserDefaults.standard.set(value, forKey: "broadcastDefaultSource")
+    }
+
+    /// BS P3: picture-in-picture dual capture (phone inset over the main source).
+    static var broadcastDualCapture: Bool {
+        UserDefaults.standard.bool(forKey: "broadcastDualCapture")
+    }
+    static func setBroadcastDualCapture(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: "broadcastDualCapture")
     }
 
     static var broadcastRTMPURL: String {
@@ -2253,6 +2357,42 @@ struct Config {
 
     static func setFrameDedupHeartbeatSeconds(_ value: TimeInterval) {
         UserDefaults.standard.set(value, forKey: "frameDedupHeartbeatSeconds")
+    }
+
+    // MARK: - Reading Companion detector tuning (Plan BT P3)
+    //
+    // Config-backed so the P3 device pass (curved paperbacks, e-reader glare) is data-only —
+    // retune without a build. Code-only knobs, same posture as frameDedup* above.
+
+    /// dHash Hamming distance (of 64) at/below which the page detector treats two frames as the
+    /// same view. Deliberately tighter than frameDedup's default: a book on a table is static.
+    static var readingHammingThreshold: Int {
+        let v = UserDefaults.standard.object(forKey: "readingHammingThreshold") as? Int
+        return v ?? 3
+    }
+
+    static func setReadingHammingThreshold(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "readingHammingThreshold")
+    }
+
+    /// Seconds a page candidate must hold still before it's settled and sent to OCR.
+    static var readingStabilityWindowSeconds: TimeInterval {
+        let v = UserDefaults.standard.object(forKey: "readingStabilityWindowSeconds") as? Double
+        return v ?? 1.0
+    }
+
+    static func setReadingStabilityWindowSeconds(_ value: TimeInterval) {
+        UserDefaults.standard.set(value, forKey: "readingStabilityWindowSeconds")
+    }
+
+    /// Floor on the gap between two evaluated reading frames — the battery lever.
+    static var readingMinimumFrameInterval: TimeInterval {
+        let v = UserDefaults.standard.object(forKey: "readingMinimumFrameInterval") as? Double
+        return v ?? 0.5
+    }
+
+    static func setReadingMinimumFrameInterval(_ value: TimeInterval) {
+        UserDefaults.standard.set(value, forKey: "readingMinimumFrameInterval")
     }
 
     // MARK: - Visual State Memory (Plan AV)

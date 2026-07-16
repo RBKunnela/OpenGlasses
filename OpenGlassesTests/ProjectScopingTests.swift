@@ -116,4 +116,106 @@ final class ProjectScopingTests: XCTestCase {
         let projB = store.query("how do I reset the thermostat", limit: 3, namespace: "projB")
         XCTAssertTrue(projB.isEmpty, "An empty namespace returns no passages")
     }
+
+    // MARK: - Cross-store isolation (Plan BM P8): global never sees project docs
+
+    /// The teleprompter reaches a document by name; that lookup must not cross into another
+    /// project's namespace. Deterministic (name resolution only — no embedder needed).
+    @MainActor
+    func testDocumentByNameHonoursNamespaceScope() async throws {
+        let store = makeStore()
+        _ = await store.ingest(name: "Keynote", text: body, namespace: "projA")
+
+        // A global (or projB) chat cannot resolve projA's document by name…
+        XCTAssertNil(store.document(named: "Keynote", namespaces: ["global"]))
+        XCTAssertNil(store.document(named: "Keynote", namespaces: ["global", "projB"]))
+        // …but its own project (plus shared global) can.
+        XCTAssertEqual(store.document(named: "Keynote", namespaces: ["global", "projA"])?.name, "Keynote")
+    }
+
+    /// Semantic memory search restricted to an explicit namespace set must never return a memory
+    /// from a namespace outside that set (persona isolation). Keyword fallback ⇒ no embedder needed.
+    @MainActor
+    func testMemorySearchNeverCrossesPersonas() {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let memory = SemanticMemoryStore(directory: dir)
+
+        memory.activePersonaId = nil
+        _ = memory.remember("shared fact", value: "the office coffee is excellent")
+        memory.activePersonaId = "personaA"
+        _ = memory.remember("alpha fact", value: "alpha widget schematic")
+        memory.activePersonaId = "personaB"
+        _ = memory.remember("beta fact", value: "beta gadget blueprint")
+        memory.activePersonaId = nil
+
+        // personaA's scope (global + personaA) sees global + its own, never personaB.
+        let scoped = memory.semanticSearch(query: "gadget blueprint coffee widget", limit: 10,
+                                           namespaces: ["global", "personaA"])
+        let values = scoped.map(\.value)
+        XCTAssertTrue(values.contains("the office coffee is excellent"), "projects see global memory")
+        XCTAssertTrue(values.contains("alpha widget schematic"), "a persona sees its own memory")
+        XCTAssertFalse(values.contains("beta gadget blueprint"), "must not cross into another persona")
+
+        // personaB's scope reaches personaB's memory — proving isolation, not disappearance.
+        let bScope = memory.semanticSearch(query: "gadget blueprint", limit: 10,
+                                           namespaces: ["global", "personaB"])
+        XCTAssertTrue(bScope.map(\.value).contains("beta gadget blueprint"))
+    }
+
+    /// End-to-end through BrainTool: an unscoped/global `brain ask` must not surface a project's
+    /// remembered fact, while the same ask inside that project does. Guards the tool wiring, not
+    /// just the store seam. Keyword fallback ⇒ deterministic without an embedder.
+    @MainActor
+    func testBrainAskMemoryIsProjectScoped() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let memory = SemanticMemoryStore(directory: dir)
+        memory.activePersonaId = "projA"
+        // Assert on "quokka" — a token in the stored VALUE only, never in the query, so the
+        // empty-result message (which echoes the query) can't produce a false positive.
+        _ = memory.remember("launch plan", value: "the launch is codenamed quokka")
+        memory.activePersonaId = nil
+
+        var globalBrain = BrainTool()
+        globalBrain.memoryStore = memory
+        globalBrain.activeNamespace = { "global" }
+        let globalAnswer = try await globalBrain.execute(args: ["action": "query", "question": "launch"])
+        XCTAssertFalse(globalAnswer.contains("quokka"),
+                       "a global brain ask must not see projA's remembered fact")
+
+        var projectBrain = BrainTool()
+        projectBrain.memoryStore = memory
+        projectBrain.activeNamespace = { "projA" }
+        let projectAnswer = try await projectBrain.execute(args: ["action": "query", "question": "launch"])
+        XCTAssertTrue(projectAnswer.contains("quokka"),
+                      "inside projA the same fact is visible")
+    }
+
+    /// The standalone `memory_search` tool must honour the same project scope as `brain` — a
+    /// global chat can't read another persona's memory through it.
+    @MainActor
+    func testMemorySearchToolIsProjectScoped() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let memory = SemanticMemoryStore(directory: dir)
+        memory.activePersonaId = "projA"
+        // "quokka" lives only in the stored value, not the query — so the no-results message
+        // (which echoes the query) can't trip the absence assertion.
+        _ = memory.remember("mascot", value: "the flagship mascot is a quokka")
+        memory.activePersonaId = nil
+
+        var globalSearch = MemorySearchTool()
+        globalSearch.memoryStore = memory
+        globalSearch.activeNamespace = { "global" }
+        let globalResult = try await globalSearch.execute(args: ["query": "mascot"])
+        XCTAssertFalse(globalResult.contains("quokka"),
+                       "memory_search in a global chat must not surface projA's memory")
+
+        var projectSearch = MemorySearchTool()
+        projectSearch.memoryStore = memory
+        projectSearch.activeNamespace = { "projA" }
+        let projectResult = try await projectSearch.execute(args: ["query": "mascot"])
+        XCTAssertTrue(projectResult.contains("quokka"), "inside projA the memory is searchable")
+    }
 }

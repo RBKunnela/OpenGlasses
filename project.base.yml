@@ -13,9 +13,9 @@ options:
   deploymentTarget:
     iOS: "26.0"
     watchOS: "26.0"
-  # Sets LastUpgradeCheck (26.5 -> 2650). Keep in step with the project's Xcode
+  # Sets LastUpgradeCheck (27.0 -> 2700). Keep in step with the project's Xcode
   # baseline so Xcode's "Update to recommended settings" validation stays quiet.
-  xcodeVersion: "26.5"
+  xcodeVersion: "27.0"
   generateEmptyDirectories: true
   developmentLanguage: en
   knownRegions:
@@ -64,7 +64,7 @@ packages:
     from: "2.2.5"
   mlx-swift-lm:
     url: https://github.com/ml-explore/mlx-swift-lm.git
-    version: "3.31.3"
+    version: "3.31.4"
   swift-huggingface:
     url: https://github.com/huggingface/swift-huggingface.git
     from: "0.1.0"
@@ -107,8 +107,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openglasses.app
-        MARKETING_VERSION: "2.2.0"
-        CURRENT_PROJECT_VERSION: "11"
+        MARKETING_VERSION: "2026.7"
+        CURRENT_PROJECT_VERSION: "316"
         SWIFT_VERSION: "5.9"
         CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION: "YES"
         CODE_SIGN_STYLE: Automatic
@@ -175,8 +175,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openglasses.app.GlassesActivityWidget
-        MARKETING_VERSION: "2.2.0"
-        CURRENT_PROJECT_VERSION: "11"
+        MARKETING_VERSION: "2026.7"
+        CURRENT_PROJECT_VERSION: "316"
         SWIFT_VERSION: "5.9"
         SKIP_INSTALL: "YES"
         CODE_SIGN_STYLE: Automatic
@@ -213,8 +213,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openglasses.app.ShareExtension
-        MARKETING_VERSION: "2.2.0"
-        CURRENT_PROJECT_VERSION: "11"
+        MARKETING_VERSION: "2026.7"
+        CURRENT_PROJECT_VERSION: "316"
         SWIFT_VERSION: "5.9"
         SKIP_INSTALL: "YES"
         CODE_SIGN_STYLE: Automatic

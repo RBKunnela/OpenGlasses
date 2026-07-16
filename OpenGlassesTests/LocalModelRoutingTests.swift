@@ -8,28 +8,30 @@ import XCTest
 @MainActor
 final class LocalModelRoutingTests: XCTestCase {
 
-    func testAgentModelDoesNotLoadThroughTheVisionFactory() {
-        XCTAssertFalse(
-            LocalLLMService.visionModelIds.contains(Config.defaultAgentModelId),
-            "the on-device agent model must load as text; listing it as a vision model routes it "
-            + "to the crashing MLXVLM.Gemma4 forward pass")
+    /// Attempt-and-demote (2026-07-16): Gemma 4 models ATTEMPT the VLM factory (they are
+    /// architecturally VLMs) and demote to the text factory at runtime if the checkpoint's
+    /// vision weights fail mapping. The old crash this test feared (wrong token shape through
+    /// the VLM forward pass) is prevented by keying the shape off `loadedViaVLMFactory` — the
+    /// factory that ACTUALLY loaded — not off nominal membership in `visionModelIds`.
+    func testGemma4AttemptsVisionFactoryWithRuntimeDemotion() {
+        XCTAssertTrue(LocalLLMService.visionModelIds.contains { $0.contains("gemma-4") },
+                      "Gemma 4 must attempt the VLM factory so vision self-enables on a fixed runtime")
+        XCTAssertTrue(LocalLLMService.visionModelIds.contains { $0.contains("SmolVLM") },
+                      "the proven vision models stay on the VLM route")
     }
 
-    func testGemma4IsTreatedAsTextNotVision() {
-        // Any gemma-4 id is a text/agentic model here; the vision set is SmolVLM only.
-        XCTAssertFalse(LocalLLMService.visionModelIds.contains { $0.contains("gemma-4") })
-        XCTAssertTrue(LocalLLMService.visionModelIds.allSatisfy { $0.contains("SmolVLM") },
-                      "only genuine VLMs belong in the vision factory route")
-    }
-
-    /// The on-device prompt guard must sit below the observed OOM point (an ~8.2k-token prompt
-    /// Jetsam-killed the app) yet well above the lean agent prompt, so it only trips on a
-    /// pathological input — where a catchable throw beats an uncatchable memory kill.
-    func testOnDevicePromptGuardIsBelowTheObservedOOMPoint() {
-        XCTAssertLessThan(LocalLLMService.maxPromptTokens, 8241,
-                          "must reject before the size that actually OOM-killed the app")
-        XCTAssertGreaterThanOrEqual(LocalLLMService.maxPromptTokens, 2048,
-                          "but leave headroom for a normal lean prompt + some history")
+    /// The on-device prompt budget (BK P2) must sit below the observed OOM point (an ~8.2k-token
+    /// prompt Jetsam-killed the app) yet leave headroom for a normal lean prompt + some history —
+    /// for every recommended model and for an unknown/user-typed id.
+    func testOnDevicePromptBudgetIsBelowTheObservedOOMPoint() {
+        let ids = LocalLLMService.recommendedModels.map(\.id) + [nil, "some/unknown-model"]
+        for id in ids {
+            let budget = LocalModelBudget.promptBudget(for: id)
+            XCTAssertLessThan(budget, 8241,
+                              "budget for \(id ?? "nil") must sit below the OOM point")
+            XCTAssertGreaterThanOrEqual(budget, 2048,
+                              "budget for \(id ?? "nil") must leave headroom for a lean prompt + history")
+        }
     }
 
     func testPromptTooLongErrorIsDescriptive() {

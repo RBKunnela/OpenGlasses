@@ -4,608 +4,124 @@ import AVFoundation
 struct SettingsView: View {
     @ObservedObject var appState: AppState
     @Environment(\.appAccent) private var accent
-    @AppStorage("accentColorName") private var accentColorName: String = "violet"
 
-    // Model configs editing
     @State private var simpleModeEnabled = Config.simpleModeEnabled
-    @State private var modelConfigs: [ModelConfig] = Config.savedModels
-    @State private var editingModel: ModelConfig? = nil
-    @State private var showAddModel = false
 
-    // Intelligence settings
-    @State private var intentClassifierEnabled = Config.intentClassifierEnabled
-    @State private var userMemoryEnabled = Config.userMemoryEnabled
-    @State private var memoryNudgesEnabled = Config.memoryNudgesEnabled
-    @State private var conversationPersistenceEnabled = Config.conversationPersistenceEnabled
-    @State private var autoModelRoutingEnabled = Config.autoModelRoutingEnabled
+    // Owner gate (BM P10): Simple-Mode exit always asks; Settings entry asks when the flag is on.
+    @State private var settingsOwnerGateEnabled = Config.settingsOwnerGateEnabled
+    @State private var settingsLocked = Config.settingsOwnerGateEnabled
+    @State private var exitGate = OwnerGateMachine()
+    @State private var entryGate = OwnerGateMachine()
 
-    // Privacy filter
-    @State private var privacyFilterEnabled = Config.privacyFilterEnabled
-    @State private var useGlassesMicForWakeWord = Config.useGlassesMicForWakeWord
-
-    // Security
-    @State private var conversationEncryptionEnabled = Config.conversationEncryptionEnabled
-    @State private var isTogglingEncryption = false
-
-    // Service settings (owned here, bound to ServicesSettingsView)
-    // ElevenLabs / TTS voice, web-search keys, and live-streaming config are owned
-    // by ServicesSettingsView (self-contained, persists to Config on change).
+    // The individual settings sections live in per-category screens (SettingsScreens.swift);
+    // this view is the hub: a short list of categories plus the always-visible
+    // Simple Mode and About sections.
 
     var body: some View {
         Form {
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // MARK: — Core
+            // MARK: — Categories (hub)
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-            // MARK: Wake Word
-            Section {
-                Picker("Wake Phrase", selection: Binding(
-                    get: { Config.wakePhrase },
-                    set: { newValue in
-                        Config.setWakePhrase(newValue)
-                        Config.setAlternativeWakePhrases(Config.defaultAlternativesForPhrase(newValue))
-                    }
-                )) {
-                    Text("Hey OpenGlasses").tag("hey openglasses")
-                    Text("Hey Claude").tag("hey claude")
-                    Text("Hey Jarvis").tag("hey jarvis")
-                    Text("Hey Computer").tag("hey computer")
-                    Text("Hey Assistant").tag("hey assistant")
-                    Text("Hey Rayban").tag("hey rayban")
-                }
-
-                InfoToggle(
-                    title: "Push-to-Talk Mode",
-                    isOn: Binding(
-                        get: { Config.silentMode },
-                        set: { newValue in
-                            Config.setSilentMode(newValue)
-                            if newValue {
-                                appState.wakeWordService.stopListening()
-                                appState.isListening = false
-                            } else {
-                                Task { try? await appState.wakeWordService.startListening() }
-                            }
-                        }
-                    ),
-                    info: "Turns off the always-on wake-word listener so the mic isn't held in the background — fixes conflicts with music/podcasts playing at the same time. Start a conversation on demand instead: the iPhone Action Button (\"Ask OpenGlasses\"), Siri, the home screen widget, the Apple Watch, or a manual mic tap."
-                )
-
-                InfoToggle(
-                    title: "Open App for Siri Questions",
-                    isOn: Binding(
-                        get: { Config.siriAskOpensApp },
-                        set: { Config.setSiriAskOpensApp($0) }
-                    ),
-                    info: "When you say \"Hey Siri, ask OpenGlasses…\", the answer is normally spoken hands-free without opening the app. Turn this on if Siri says OpenGlasses isn't running — it launches the app first so the question always goes through, at the cost of bringing the app to the foreground."
-                )
-            } header: {
-                Text("Voice")
-            } footer: {
-                Text("The phrase that starts a conversation. Push-to-Talk Mode stops the always-listening mic (so it won't fight other audio) — trigger on demand via the Action Button, Siri, widget, or watch.")
-            }
-
-            // MARK: Hands-Free Triggers
-            Section {
-                ForEach(AlternativeTrigger.allCases) { trigger in
-                    InfoToggle(
-                        title: trigger.displayName,
-                        isOn: Binding(
-                            get: { Config.alternativeTriggerEnabled(trigger) },
-                            set: { newValue in
-                                Config.setAlternativeTriggerEnabled(trigger, newValue)
-                                appState.alternativeTriggers.refresh()
-                            }
-                        ),
-                        info: trigger.detail
-                    )
-                }
-            } header: {
-                Text("Hands-Free Triggers")
-            } footer: {
-                Text("Alternative ways to start the assistant without the wake word — for noisy, silent, or no-speech situations. All are off by default. The Volume Button trigger can interfere with normal volume control.")
-            }
-
+            // Each row pushes a screen in SettingsScreens.swift holding the full sections.
             // Simple Mode hides the owner-only configuration surface (models, personas,
             // behavior, tools, integrations, advanced) — the device keeps working exactly
-            // as configured; the sections below just stop being visible/editable.
-            if !simpleModeEnabled {
-            // MARK: AI Models
-            Section {
-                ForEach(modelConfigs) { model in
-                    Button {
-                        editingModel = model
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(model.name)
-                                    .foregroundStyle(Color(.label))
-                                    .lineLimit(1)
-                                HStack(spacing: 4) {
-                                    Text(model.llmProvider.displayName)
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                    if model.visionEnabled {
-                                        Image(systemName: "eye")
-                                            .font(.caption2)
-                                            .foregroundStyle(Color(.label))
-                                            .accessibilityLabel("Vision enabled")
-                                    }
-                                    if !model.apiKey.isEmpty {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .font(.caption2)
-                                            .foregroundStyle(.green)
-                                            .accessibilityLabel("API key set")
-                                    } else {
-                                        Image(systemName: "exclamationmark.circle")
-                                            .font(.caption2)
-                                            .foregroundStyle(.orange)
-                                            .accessibilityLabel("API key missing")
-                                    }
-                                }
-                            }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .accessibilityHidden(true)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel("\(model.name), \(model.llmProvider.displayName)\(!model.apiKey.isEmpty ? "" : ", API key missing")\(model.visionEnabled ? ", vision enabled" : "")")
-                    .accessibilityHint("Double-tap to edit")
-                }
-                .onDelete { indexSet in
-                    modelConfigs.remove(atOffsets: indexSet)
-                }
-
-                Button {
-                    showAddModel = true
-                } label: {
-                    Label("Add Model", systemImage: "plus.circle.fill")
-                }
-            } header: {
-                Text("AI Models")
-            } footer: {
-                Text("Models are the AI you talk to. Add a key for any provider you want — you can switch between them anytime from the main screen.")
-            }
-
-            // MARK: Personality
-            Section {
-                NavigationLink {
-                    PersonasView()
-                } label: {
-                    HStack {
-                        Label("Personas", systemImage: "person.2")
-                        Spacer()
-                        Text("\(Config.enabledPersonas.count) active")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                NavigationLink {
-                    PromptPresetsView()
-                } label: {
-                    HStack {
-                        Label("System Prompt", systemImage: "text.quote")
-                        Spacer()
-                        Text(Config.activePreset?.name ?? "Default")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            } header: {
-                Text("Personality")
-            } footer: {
-                Text("Personas are different characters with their own model + prompt (e.g. a museum docent, a fitness coach). System Prompt tweaks the default voice and behaviour.")
-            }
-
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // MARK: — Intelligence
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            // as configured; those categories just stop being visible/editable.
 
             Section {
-                InfoToggle(
-                    title: "Intent Classifier",
-                    isOn: $intentClassifierEnabled,
-                    info: "Uses a lightweight on-device model to determine if speech is directed at the assistant or is just background conversation. Prevents the AI from responding to nearby chatter, TV audio, or other people talking."
-                )
-                InfoToggle(
-                    title: "User Memory",
-                    isOn: $userMemoryEnabled,
-                    info: "Remembers facts you share across conversations — your name, preferences, routines, dietary needs, etc. This context is included in future conversations so the AI can personalise responses. Memory is stored locally on your device."
-                )
-                InfoToggle(
-                    title: "Conversation History",
-                    isOn: $conversationPersistenceEnabled,
-                    info: "Saves conversation transcripts so you can review them later in the History tab. Also provides context for follow-up questions within a session. When off, conversations are ephemeral and discarded after each session."
-                )
-                InfoToggle(
-                    title: "Memory Suggestions",
-                    isOn: $memoryNudgesEnabled,
-                    info: "After you state a durable fact (\"my daughter's name is Mia\") or repeat a multi-step request, the assistant offers a spoken nudge to remember it or save it as a skill — you confirm by voice. With Agentic Features on, these are saved automatically instead of nudged. Off by default."
-                )
-
                 NavigationLink {
-                    SmartRoutingView(
-                        autoModelRoutingEnabled: $autoModelRoutingEnabled,
-                        modelConfigs: modelConfigs
+                    VoiceTriggersSettingsScreen(appState: appState)
+                } label: {
+                    categoryRow(
+                        "Voice & Triggers",
+                        systemImage: "waveform",
+                        description: "Wake phrase, push-to-talk, hands-free triggers"
                     )
-                } label: {
-                    HStack {
-                        Label("Smart Routing", systemImage: "arrow.triangle.branch")
-                        Spacer()
-                        Text(autoModelRoutingEnabled ? "On" : "Off")
-                            .foregroundStyle(.secondary)
-                    }
                 }
 
-                NavigationLink {
-                    AgenticFeaturesView(agentDocs: appState.agentDocs, localLLM: appState.localLLMService)
-                        .environmentObject(appState)
-                } label: {
-                    HStack {
-                        Label("Agentic Features", systemImage: "bolt.badge.automatic")
-                        Spacer()
-                        if Config.agentModeEnabled {
-                            Text("On")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            } header: {
-                Text("How It Behaves")
-            } footer: {
-                Text("Intent Classifier ignores nearby chatter so the AI only responds when you're talking to it. Memory and History let the AI remember who you are across sessions. Smart Routing picks the right model for the task; Agentic Features let the AI take multi-step actions on its own.")
-            }
-
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // MARK: — Privacy & Compliance
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-            // (Medical Compliance moved into "Glasses & Privacy" below.)
-
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // MARK: — Tools & Actions
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-            Section {
-                NavigationLink {
-                    QuickActionsSettingsView()
-                } label: {
-                    Label("Quick Actions", systemImage: "dial.high")
-                }
-
-                NavigationLink {
-                    ToolsSettingsView(appState: appState)
-                } label: {
-                    Label("Tools", systemImage: "wrench.and.screwdriver")
-                }
-
-                NavigationLink {
-                    FieldAssistSettingsView()
-                } label: {
-                    HStack {
-                        Label("Field Assist", systemImage: "wrench.adjustable")
-                        Spacer()
-                        if Config.fieldAssistEnabled {
-                            Text("On").foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                NavigationLink {
-                    VaultManagerView()
-                } label: {
-                    Label("Custom Vaults", systemImage: "tray.full")
-                }
-
-                NavigationLink {
-                    VaultFilesEditorView(vaultId: "notes", title: "Personal Notes")
-                } label: {
-                    Label("Personal Notes", systemImage: "note.text")
-                }
-
-                NavigationLink {
-                    DeckListView()
-                } label: {
-                    Label("Study Mode", systemImage: "graduationcap")
-                }
-
-                NavigationLink {
-                    HealthVaultEditorView()
-                } label: {
-                    HStack {
-                        Label("Health Vault", systemImage: "heart.text.square")
-                        Spacer()
-                        if VaultRegistry.shared.isUnlocked("health") {
-                            Text("Unlocked").foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                NavigationLink {
-                    AccessibilitySettingsView()
-                        .environmentObject(appState)
-                } label: {
-                    HStack {
-                        Label("Accessibility", systemImage: "accessibility")
-                        Spacer()
-                        if Config.accessibilityModeEnabled {
-                            Text("On").foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                NavigationLink {
-                    CustomToolsView()
-                        .environmentObject(appState)
-                } label: {
-                    Label("Custom Tools", systemImage: "hammer")
-                }
-
-                if Config.agentModeEnabled {
+                if !simpleModeEnabled {
                     NavigationLink {
-                        MCPServerSettingsView()
-                            .environmentObject(appState)
+                        AIPersonalitySettingsScreen(appState: appState)
                     } label: {
-                        HStack {
-                            Label("MCP Server", systemImage: "macbook.and.iphone")
-                            Spacer()
-                            if MCPGlassesServer.shared.isRunning {
-                                Text("Running").foregroundStyle(.secondary)
-                            }
-                        }
+                        categoryRow(
+                            "AI & Personality",
+                            systemImage: "brain.head.profile",
+                            description: "Models, personas, prompt, and behaviour"
+                        )
                     }
-                }
 
-                NavigationLink {
-                    PlaybooksSettingsView(store: appState.playbookStore)
-                } label: {
-                    Label("Playbooks", systemImage: "list.clipboard")
-                }
-
-                NavigationLink {
-                    ClawHubBrowserView()
-                } label: {
-                    HStack {
-                        Label("Skill Store", systemImage: "square.grid.3x3.square")
-                        Spacer()
-                        let count = InstalledSkillStore.shared.installedSkills.filter(\.enabled).count
-                        if count > 0 {
-                            Text("\(count) active")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                NavigationLink {
-                    VoiceSkillsManagerView()
-                } label: {
-                    Label("Voice Skills", systemImage: "waveform")
-                }
-
-                if Config.agentModeEnabled {
                     NavigationLink {
-                        SuggestedSkillsView()
+                        ToolsActionsSettingsScreen(appState: appState)
                     } label: {
-                        HStack {
-                            Label("Suggested Skills", systemImage: "lightbulb.max")
-                            Spacer()
-                            let count = EvolvedSkillStore.shared.pending().count
-                            if count > 0 {
-                                Text("\(count)")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 7).padding(.vertical, 2)
-                                    .background(Capsule().fill(.red))
-                            }
-                        }
+                        categoryRow(
+                            "Tools & Actions",
+                            systemImage: "wrench.and.screwdriver",
+                            description: "Quick actions, tools, skills, and playbooks"
+                        )
                     }
-                }
-            } header: {
-                Text("Tools the AI Can Use")
-            } footer: {
-                Text("Quick Actions are shortcuts you can tap from the widget. Tools are built-in capabilities (camera, search, HomeKit, music…). Custom Tools and Playbooks let you script your own. The Skill Store adds community-built skills.")
-            }
 
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // MARK: — Connections
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-            Section {
-                NavigationLink {
-                    ServicesSettingsView(appState: appState)
-                } label: {
-                    Label("Services & Integrations", systemImage: "square.grid.2x2")
-                }
-
-                NavigationLink {
-                    GatewaySettingsView(appState: appState)
-                } label: {
-                    HStack {
-                        Label("Gateways", systemImage: "server.rack")
-                        Spacer()
-                        let count = Config.enabledGateways.count
-                        if count > 0 {
-                            Text("\(count) active")
-                                .foregroundStyle(.secondary)
-                        }
+                    NavigationLink {
+                        ConnectionsSettingsScreen(appState: appState)
+                    } label: {
+                        categoryRow(
+                            "Connections",
+                            systemImage: "point.3.connected.trianglepath.dotted",
+                            description: "Services, gateways, and MCP servers"
+                        )
                     }
                 }
 
                 NavigationLink {
-                    MCPServersView()
-                        .environmentObject(appState)
+                    GlassesPrivacySettingsScreen(appState: appState)
                 } label: {
-                    Label("MCP Servers", systemImage: "point.3.connected.trianglepath.dotted")
-                }
-            } header: {
-                Text("Connected Apps & Services")
-            } footer: {
-                Text("ElevenLabs voices, Perplexity search, broadcast targets, and live-streaming live under Services. Gateways are OpenClaw bridges to your devices (smart home, automations). MCP Servers expose external tool servers the AI can call.")
-            }
-
-            }
-
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // MARK: — Glasses & Privacy
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-            Section {
-                NavigationLink {
-                    HardwarePrivacyView(
-                        appState: appState,
-                        useGlassesMicForWakeWord: $useGlassesMicForWakeWord,
-                        privacyFilterEnabled: $privacyFilterEnabled,
-                        conversationEncryptionEnabled: $conversationEncryptionEnabled,
-                        isTogglingEncryption: $isTogglingEncryption
+                    categoryRow(
+                        "Glasses & Privacy",
+                        systemImage: "lock.shield",
+                        description: "Hardware, privacy, and medical compliance"
                     )
-                } label: {
-                    Label("Hardware & Privacy", systemImage: "lock.shield")
                 }
 
                 NavigationLink {
-                    MedicalCompliancePaywallView(
-                        hipaaService: appState.hipaaService,
-                        exportService: appState.medicalExportService
-                    )
+                    LookFeelSettingsScreen()
                 } label: {
-                    HStack {
-                        Label("Medical Compliance", systemImage: "cross.case.fill")
-                        Spacer()
-                        if StoreKitService.shared.canAccessMedicalCompliance && Config.hipaaMode {
-                            Image(systemName: "cross.case.fill")
-                                .font(.caption)
-                                .foregroundStyle(AppAccent.aiCoral)
-                                .accessibilityHidden(true)
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.green)
-                                .accessibilityLabel("Active")
-                        } else if !StoreKitService.shared.canAccessMedicalCompliance {
-                            Image(systemName: "cross.case.fill")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .accessibilityHidden(true)
-                        }
+                    categoryRow(
+                        "Look & Feel",
+                        systemImage: "paintbrush",
+                        description: "Theme, accent colour, and languages"
+                    )
+                }
+
+                if !simpleModeEnabled {
+                    NavigationLink {
+                        AdvancedSettingsScreen(appState: appState)
+                    } label: {
+                        categoryRow(
+                            "Advanced",
+                            systemImage: "gearshape.2",
+                            description: "Diagnostics and power-user tools"
+                        )
                     }
                 }
-            } header: {
-                Text("Glasses & Privacy")
-            } footer: {
-                Text("Mic source, on-device bystander-face blurring, and encrypted conversations live in Hardware & Privacy. Medical Compliance enables HIPAA-grade encryption and exports for clinical use (separate subscription).")
             }
 
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // MARK: — Appearance
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+            // MARK: Simple Mode (always visible so the owner can leave it — behind the owner gate)
             Section {
-                Picker("Theme", selection: Binding(
-                    get: { UserDefaults.standard.string(forKey: "appAppearance") ?? "dark" },
-                    set: { UserDefaults.standard.set($0, forKey: "appAppearance") }
+                Toggle(isOn: Binding(
+                    get: { simpleModeEnabled },
+                    set: { requestSimpleModeChange(to: $0) }
                 )) {
-                    Text("Dark").tag("dark")
-                    Text("Light").tag("light")
-                    Text("System").tag("system")
-                }
-                .pickerStyle(.segmented)
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Accent Colour")
-                        .font(.subheadline)
-                    HStack(spacing: 12) {
-                        ForEach(AppAccent.presets) { preset in
-                            Button {
-                                accentColorName = preset.id
-                                Config.setAccentColorName(preset.id)
-                            } label: {
-                                Circle()
-                                    .fill(preset.color)
-                                    .frame(width: 30, height: 30)
-                                    .overlay(
-                                        Circle()
-                                            .strokeBorder(.white, lineWidth: accentColorName == preset.id ? 2.5 : 0)
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("\(preset.name) accent colour\(accentColorName == preset.id ? ", selected" : "")")
-                        }
-                    }
-                }
-                .padding(.vertical, 4)
-
-                NavigationLink {
-                    LanguageSettingsView()
-                } label: {
-                    HStack {
-                        Label("Languages", systemImage: "globe")
-                        Spacer()
-                        let downloaded = LocalizationManager.shared.downloadableLanguages.filter(\.isDownloaded).count
-                        let bundled = LocalizationManager.bundledLanguages.count
-                        Text("\(bundled + downloaded) available")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            } header: {
-                Text("Look & Feel")
-            } footer: {
-                Text("Theme, accent colour, and which languages the assistant speaks and understands.")
-            }
-
-            if !simpleModeEnabled {
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // MARK: — Advanced
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-            Section {
-                NavigationLink {
-                    PromptInspectorView(appState: appState)
-                } label: {
-                    Label("Prompt Inspector", systemImage: "doc.text.magnifyingglass")
-                }
-
-                NavigationLink {
-                    NetworkMonitorView()
-                } label: {
-                    Label("Network Activity", systemImage: "antenna.radiowaves.left.and.right")
-                }
-
-                NavigationLink {
-                    LiveVisionSettingsView()
-                } label: {
-                    Label("Live Vision", systemImage: "camera.metering.matrix")
-                }
-
-                NavigationLink {
-                    DocumentsView()
-                } label: {
-                    Label("Documents", systemImage: "doc.text.magnifyingglass")
-                }
-
-                NavigationLink {
-                    CaptureFlowAuthorView()
-                } label: {
-                    Label("Author Capture-Flow", systemImage: "list.bullet.rectangle")
-                }
-            } header: {
-                Text("Advanced")
-            } footer: {
-                Text("Diagnostic tools for power users — inspect the prompts being sent to the AI and watch live network requests. Useful for debugging or building your own integrations.")
-            }
-
-            }
-
-            // MARK: Simple Mode (always visible so the owner can leave it)
-            Section {
-                Toggle(isOn: $simpleModeEnabled) {
                     Label("Simple Mode", systemImage: "dial.low")
                 }
-                .onChange(of: simpleModeEnabled) { _, v in Config.simpleModeEnabled = v }
+                Toggle(isOn: $settingsOwnerGateEnabled) {
+                    Label("Lock Settings", systemImage: "faceid")
+                }
+                .onChange(of: settingsOwnerGateEnabled) { _, v in Config.settingsOwnerGateEnabled = v }
+                if exitGate.lastFailed {
+                    Label("Couldn't verify it's you — Simple Mode stays on.", systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
             } footer: {
-                Text("Hides model, persona, behavior, tool, integration, and advanced settings — for handing the device to someone who just needs it to work. Everything keeps running exactly as configured.")
+                Text("Simple Mode hides model, persona, behavior, tool, integration, and advanced settings — for handing the device to someone who just needs it to work. Leaving it asks for Face ID or your passcode. Lock Settings asks every time Settings opens.")
             }
 
             // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -645,27 +161,91 @@ struct SettingsView: View {
             } header: {
                 Text("About")
             } footer: {
-                Text("OpenGlasses is an open-source community project. Join the Discord for help, ideas, and to share what you've built.")
+                Text("OpenGlasses © 2026 Skunkworks NZ Ltd. All rights reserved. Free for personal, non-commercial use — commercial use requires a licence.\n\nJoin the Discord for help, ideas, and to share what you've built.")
             }
         }
         .navigationTitle("Settings")
         .tint(accent)
-        .sheet(item: $editingModel) { model in
-            ModelEditorView(model: model) { updated in
-                if let idx = modelConfigs.firstIndex(where: { $0.id == updated.id }) {
-                    modelConfigs[idx] = updated
-                    Config.setSavedModels(modelConfigs)
+        // Owner gate on Settings entry (BM P10, opt-in): an opaque cover — never a blur that
+        // leaks decrypted key fields — until device-owner auth grants entry.
+        .overlay {
+            if settingsLocked { settingsLockCover }
+        }
+        .onAppear {
+            if settingsLocked { authenticateSettingsEntry() }
+        }
+    }
+
+    // MARK: - Category Row
+
+    /// A hub row: category label plus a one-line description of what lives inside.
+    /// The description lives INSIDE the Label's title so it aligns with the title text —
+    /// as a sibling of the Label it started at the leading edge, colliding with the icon.
+    private func categoryRow(_ title: String, systemImage: String, description: String) -> some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(description)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        } icon: {
+            Image(systemName: systemImage)
+        }
+        .padding(.vertical, 2)
+    }
+
+    // MARK: - Owner gate (BM P10)
+
+    private var settingsLockCover: some View {
+        ZStack {
+            Color(.systemGroupedBackground).ignoresSafeArea()
+            VStack(spacing: 16) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.secondary)
+                Text("Settings are locked")
+                    .font(.headline)
+                if entryGate.lastFailed {
+                    Text("Authentication failed. Try again.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
+                Button {
+                    authenticateSettingsEntry()
+                } label: {
+                    Label("Unlock", systemImage: "faceid")
+                }
+                .buttonStyle(.borderedProminent)
             }
         }
-        .sheet(isPresented: $showAddModel) {
-            AddModelView { newModel in
-                modelConfigs.append(newModel)
-                Config.setSavedModels(modelConfigs)
+    }
+
+    private func authenticateSettingsEntry() {
+        guard entryGate.begin() else { return }
+        OwnerGateAuth.authenticate(reason: "Unlock OpenGlasses Settings") { granted in
+            entryGate.finish(success: granted)
+            if entryGate.consume() {
+                withAnimation(.easeOut(duration: 0.2)) { settingsLocked = false }
             }
         }
-        .onDisappear {
-            saveSettings()
+    }
+
+    /// Simple-Mode toggle path: turning it ON is immediate; turning it OFF (re-exposing the owner
+    /// surface, incl. decrypted API-key fields) needs a fresh device-owner grant every time.
+    private func requestSimpleModeChange(to newValue: Bool) {
+        guard OwnerGatePolicy.requiresGate(togglingSimpleModeTo: newValue, currentlyEnabled: simpleModeEnabled) else {
+            simpleModeEnabled = newValue
+            Config.simpleModeEnabled = newValue
+            return
+        }
+        guard exitGate.begin() else { return }
+        OwnerGateAuth.authenticate(reason: "Verify it's you to leave Simple Mode") { granted in
+            exitGate.finish(success: granted)
+            if exitGate.consume() {
+                simpleModeEnabled = false
+                Config.simpleModeEnabled = false
+            }
         }
     }
 
@@ -687,36 +267,6 @@ struct SettingsView: View {
 
     private static var buildNumber: String {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "–"
-    }
-
-    // MARK: - Save Settings
-
-    private func saveSettings() {
-        Config.setSavedModels(modelConfigs)
-
-        if !modelConfigs.contains(where: { $0.id == Config.activeModelId }) {
-            if let first = modelConfigs.first {
-                Config.setActiveModelId(first.id)
-            }
-        }
-        appState.llmService.refreshActiveModel()
-
-        Config.setPrivacyFilterEnabled(privacyFilterEnabled)
-        appState.privacyFilter.isEnabled = privacyFilterEnabled
-        Config.setUseGlassesMicForWakeWord(useGlassesMicForWakeWord)
-
-        Config.setIntentClassifierEnabled(intentClassifierEnabled)
-        Config.setUserMemoryEnabled(userMemoryEnabled)
-        Config.setMemoryNudgesEnabled(memoryNudgesEnabled)
-        Config.setConversationPersistenceEnabled(conversationPersistenceEnabled)
-
-        if appState.currentMode == .direct {
-            Task {
-                appState.wakeWordService.stopListening()
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                try? await appState.wakeWordService.startListening()
-            }
-        }
     }
 }
 
@@ -981,6 +531,29 @@ struct SmartRoutingView: View {
                 } footer: {
                     Text("Assign any model to each tier. Simple queries use Fast, most use Balanced, complex reasoning uses Best.")
                 }
+            }
+
+            Section {
+                InfoToggle(
+                    title: "Model Fallback",
+                    isOn: Binding(
+                        get: { Config.modelCascadeEnabled },
+                        set: { Config.setModelCascadeEnabled($0) }
+                    ),
+                    info: "If a model can't handle a request — the prompt is too long, it's rate-limited, or it returns nothing — the assistant automatically tries the next model instead of failing. It prefers your active (often on-device) model and only falls over to cloud when needed."
+                )
+                InfoToggle(
+                    title: "Narrate Model Switches",
+                    isOn: Binding(
+                        get: { Config.narrateModelSwitchesEnabled },
+                        set: { Config.setNarrateModelSwitchesEnabled($0) }
+                    ),
+                    info: "Speaks a short notice when the assistant changes models mid-request (for example, \"That's a bit much for the on-device model — switching to Claude\"), so you know the model — and its cost — changed. Turn off for silent switching."
+                )
+            } header: {
+                Text("Fallback")
+            } footer: {
+                Text("Fallback keeps a turn alive across model limits; narration keeps you informed when it happens.")
             }
         }
         .navigationTitle("Smart Routing")

@@ -58,6 +58,17 @@ class CameraService: ObservableObject {
     private var isRecoveringFromStall = false
     /// Number of consecutive stall recoveries (for diagnostics).
     private var stallRecoveryCount = 0
+    /// BR P2: consecutive FAILED recoveries — drives the rebuild-stream-vs-reset-session
+    /// tiering in `StreamRecoveryPolicy`. Reset on any successful recovery.
+    private var consecutiveRecoveryFailures = 0
+    /// BR P2: listener on the DeviceSession's error stream (update-required and terminal
+    /// device errors surface here, not on the camera Stream's errorPublisher).
+    private var sessionErrorTask: Task<Void, Never>?
+
+    /// BR P2: actionable compatibility copy ("update the Meta AI app…") when the DAT layer
+    /// reports an update requirement. Nil when compatible. Observed by AppState for a
+    /// one-time announcement.
+    @Published private(set) var compatibilityNotice: String?
 
     /// iPhone back-camera fallback, used when the glasses camera is unavailable.
     private let phoneSource = PhoneCameraSource()
@@ -79,7 +90,18 @@ class CameraService: ObservableObject {
     }
 
     func ensurePermission() async throws {
-        if permissionGranted { return }
+        // The cached flag is only a fast path PAST the iOS prompt + registration wait — the
+        // Meta permission itself is re-verified live every time. Live-traced: the user revoked
+        // the app in the Meta AI app mid-session, and the stale flag sailed straight past the
+        // permission step instead of re-asking.
+        if permissionGranted {
+            if let status = try? await Wearables.shared.checkPermissionStatus(.camera),
+               status == .granted {
+                return
+            }
+            NSLog("[Camera] Cached permission no longer granted — re-running the permission flow")
+            permissionGranted = false
+        }
 
         let regState = Wearables.shared.registrationState
         NSLog("[Camera] SDK state: %d (need 3 for camera permissions)", regState.rawValue)
@@ -140,9 +162,24 @@ class CameraService: ObservableObject {
 
     // MARK: - Persistent Session
 
+    /// Last device id seen on the SDK's devices stream — lets the session bind to THE known
+    /// device (`SpecificDeviceSelector`) instead of asking `AutoDeviceSelector` for any
+    /// "eligible" device, which throws `noEligibleDevice` during the discovery/wake window.
+    private var knownDeviceId: String?
+    private var devicesListenerToken: Any?
+
     /// Ensure the persistent stream session exists. Creates it on first call.
     private func ensureSession() async throws {
         guard streamSession == nil else { return }
+
+        // First call: start tracking the devices list, and give the listener a beat to
+        // deliver the current snapshot before we pick a selector.
+        if devicesListenerToken == nil {
+            devicesListenerToken = Wearables.shared.addDevicesListener { [weak self] deviceIds in
+                Task { @MainActor in self?.knownDeviceId = deviceIds.first }
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
 
         // DAT 0.7: DeviceSession owns the connection; Streams hang off it.
         if deviceSession?.state == .stopped {
@@ -150,22 +187,50 @@ class CameraService: ObservableObject {
         }
 
         if deviceSession == nil {
-            deviceSession = try Wearables.shared.createSession(deviceSelector: deviceSelector)
+            // Bind to the specific discovered device when we know it — field-proven more
+            // reliable than AutoDeviceSelector for a device whose link is mid-wake.
+            if let id = knownDeviceId {
+                NSLog("[Camera] Creating session bound to device %@", id)
+                deviceSession = try Wearables.shared.createSession(
+                    deviceSelector: SpecificDeviceSelector(device: id))
+            } else {
+                deviceSession = try Wearables.shared.createSession(deviceSelector: deviceSelector)
+            }
         }
 
         guard let deviceSession else { throw CameraError.captureFailed }
 
+        // Watch the session's error stream BEFORE starting it — the reason a session dies
+        // during startup (update-required refusal, device drop) arrives there, and attaching
+        // after the state check meant every early stop was an unexplained "stream not ready".
+        watchSessionErrors(on: deviceSession)
+
         if deviceSession.state != .started {
-            try deviceSession.start()
+            do {
+                try deviceSession.start()
+            } catch {
+                // BR P2: an update-required refusal must read as "go update", not a
+                // generic failure.
+                if let notice = DATCompatibilityMessage.message(for: error) {
+                    compatibilityNotice = notice
+                    onDebugEvent?(notice)
+                }
+                throw error
+            }
             let deadline = ContinuousClock.now + .seconds(20)
+            let stoppedGraceEnd = ContinuousClock.now + .seconds(2)
             while ContinuousClock.now < deadline {
                 if deviceSession.state == .started { break }
-                if deviceSession.state == .stopped { break }
+                // .stopped inside the first moments can be the pre-transition resting state;
+                // only treat it as terminal once the state machine has had time to move.
+                if deviceSession.state == .stopped && ContinuousClock.now > stoppedGraceEnd { break }
                 try await Task.sleep(nanoseconds: 300_000_000)
             }
         }
 
         guard deviceSession.state == .started else {
+            NSLog("[Camera] Session never reached .started (state: %@)",
+                  String(describing: deviceSession.state))
             throw CameraError.streamNotReady
         }
 
@@ -188,7 +253,24 @@ class CameraService: ObservableObject {
         }
         streamSession = stream
         attachListeners(to: stream)
+        // (session error watcher already attached above, before start)
         NSLog("[Camera] Created persistent Stream (.\(Config.cameraResolution), \(fps)fps)")
+    }
+
+    /// BR P2: device-level errors (incl. `.datAppOnTheGlassesUpdateRequired`) arrive on the
+    /// DeviceSession's error stream — the camera Stream's errorPublisher never carries them.
+    private func watchSessionErrors(on session: DeviceSession) {
+        sessionErrorTask?.cancel()
+        sessionErrorTask = Task { [weak self] in
+            for await error in session.errorStream() {
+                guard let self, !Task.isCancelled else { return }
+                NSLog("[Camera] DeviceSession error: %@", String(describing: error))
+                if let notice = DATCompatibilityMessage.message(for: error) {
+                    self.compatibilityNotice = notice
+                    self.onDebugEvent?(notice)
+                }
+            }
+        }
     }
 
     /// Attach all publishers to the session (state, video frames, photo data, errors).
@@ -302,22 +384,35 @@ class CameraService: ObservableObject {
 
     /// Capture a photo from the glasses camera. Returns JPEG data.
     /// Reuses the persistent session — starts it if needed, does NOT stop it after capture.
+    /// EVERY captured image is saved to the photo library ("Glasses" album) for later review —
+    /// centralized here so no capture path can forget it.
     func capturePhoto() async throws -> Data {
         // Glasses are usable for the camera only once fully registered (state 3). When
         // they're offline / not connected / not registered, capture from the iPhone back
         // camera instead so the vision tools keep working without glasses.
+        //
+        // But when glasses ARE registered, a failed glasses capture must FAIL — not silently
+        // swap to the phone camera. Live-traced: the phone was on the desk, every "photo"
+        // showed the desk, and the assistant confidently described it while the user pointed
+        // their glasses at something else. A wrong-camera photo is worse than an error.
+        let data: Data
         if Wearables.shared.registrationState.rawValue < 3 {
             NSLog("[Camera] Glasses not registered (state < 3) — capturing from iPhone back camera")
-            return try await phoneSource.capturePhoto()
+            data = try await phoneSource.capturePhoto()
+            lastCaptureSource = .phone
+        } else {
+            data = try await captureFromGlasses()
+            lastCaptureSource = .glasses
         }
-        do {
-            return try await captureFromGlasses()
-        } catch {
-            NSLog("[Camera] Glasses capture failed (%@) — falling back to iPhone back camera",
-                  error.localizedDescription)
-            return try await phoneSource.capturePhoto()
-        }
+        saveToPhotoLibrary(data)
+        return data
     }
+
+    /// Which camera actually served the last successful `capturePhoto()`. Callers use this to
+    /// ANNOUNCE a phone-camera capture — a silently swapped camera made the assistant describe
+    /// the desk the phone was lying on while the user pointed their glasses elsewhere.
+    enum CaptureSource { case glasses, phone }
+    private(set) var lastCaptureSource: CaptureSource = .glasses
 
     /// Capture a photo from the glasses camera. Returns JPEG data.
     private func captureFromGlasses() async throws -> Data {
@@ -325,7 +420,28 @@ class CameraService: ObservableObject {
         defer { isCaptureInProgress = false }
 
         try await ensurePermission()
-        try await ensureSession()
+
+        // The DAT link drops when the glasses idle (battery saving) and discovery lags app
+        // launch by seconds — a session created in that window throws noEligibleDevice
+        // ("all discovered devices are powered off or disconnected") even though the glasses
+        // are registered and on the user's face. Live-traced: discovery failed at +0.3s after
+        // launch, link up at +4.7s. Retry with backoff (~12s window) while the link returns.
+        var sessionError: Error?
+        for attempt in 1...4 {
+            do {
+                try await ensureSession()
+                sessionError = nil
+                break
+            } catch {
+                sessionError = error
+                NSLog("[Camera] ensureSession attempt %d/4 failed: %@", attempt, error.localizedDescription)
+                await resetSession()
+                if attempt < 4 {
+                    try? await Task.sleep(nanoseconds: UInt64(attempt) * 2_000_000_000)
+                }
+            }
+        }
+        if let sessionError { throw sessionError }
 
         // Wait for stream to be ready (start if needed)
         var lastError: Error?
@@ -406,9 +522,23 @@ class CameraService: ObservableObject {
         continuation.resume(returning: photoData.data)
     }
 
-    /// Convert the latest video frame to JPEG data for use as a photo fallback.
+    /// How old a video frame may be and still stand in for a failed photo capture. Beyond
+    /// this, the frame shows where the camera pointed SECONDS AGO — live-traced: repeated
+    /// capture failures kept donating one stale frame, and the assistant confidently
+    /// described the same scene while the user pointed the glasses at different things.
+    private static let frameFallbackMaxAge: TimeInterval = 10
+
+    /// Convert the latest video frame to JPEG data for use as a photo fallback — but ONLY if
+    /// it's fresh. A stale frame is worse than an honest failure: it hallucinates a scene.
     private func latestFrameAsJPEG(quality: CGFloat = 0.85) -> Data? {
-        guard let frame = latestFrame else { return nil }
+        guard let frame = latestFrame,
+              Date().timeIntervalSince(lastFrameTime) < Self.frameFallbackMaxAge else {
+            if latestFrame != nil {
+                NSLog("[Camera] Latest frame is stale (%.0fs old) — refusing frame fallback",
+                      Date().timeIntervalSince(lastFrameTime))
+            }
+            return nil
+        }
         return frame.jpegData(compressionQuality: quality)
     }
 
@@ -470,28 +600,57 @@ class CameraService: ObservableObject {
         stallDetectionTask = nil
     }
 
-    /// Tear down and recreate the stream session to recover from a decoder stall.
+    /// Recover from a decoder stall. BR P2: tiered — rebuild only the Stream on the
+    /// retained DeviceSession first (the session is the expensive half: BT connection +
+    /// permission state); escalate to a full session reset only after repeated failures.
     private func recoverFromStall() async {
-        NSLog("[Camera] Stall recovery #%d — resetting session", stallRecoveryCount)
-        onDebugEvent?("Camera stall recovery #\(stallRecoveryCount)")
+        let action = StreamRecoveryPolicy.action(consecutiveFailures: consecutiveRecoveryFailures)
+        NSLog("[Camera] Stall recovery #%d (%@)", stallRecoveryCount, String(describing: action))
+        onDebugEvent?("Camera stall recovery #\(stallRecoveryCount) (\(action))")
 
-        // Tear down the current session
-        await resetSession()
+        switch action {
+        case .rebuildStream:
+            teardownStreamOnly()
+        case .resetSession:
+            await resetSession()
+        }
 
-        // Recreate
         do {
             try await ensureSession()
             try await waitForStreaming()
             lastFrameTime = Date()
+            consecutiveRecoveryFailures = 0
             NSLog("[Camera] Stall recovery successful — streaming resumed")
         } catch {
-            NSLog("[Camera] Stall recovery failed: %@", error.localizedDescription)
+            consecutiveRecoveryFailures += 1
+            NSLog("[Camera] Stall recovery failed (%d consecutive): %@",
+                  consecutiveRecoveryFailures, error.localizedDescription)
+            if case .rebuildStream = action {
+                // Stream-only rebuild failed — make the next attempt (or the next stall
+                // tick) escalate rather than looping at the cheap tier.
+                await resetSession()
+            }
             isStreaming = false
         }
     }
 
+    /// BR P2: drop the Stream and its listeners but keep the DeviceSession alive — a failed
+    /// stream must not strand a half-open session (`ensureSession` re-adds the stream on
+    /// the retained session).
+    private func teardownStreamOnly() {
+        streamSession?.stop()
+        stateListenerToken = nil
+        videoFrameListenerToken = nil
+        photoListenerToken = nil
+        errorListenerToken = nil
+        streamSession = nil
+        NSLog("[Camera] Stream torn down (session retained)")
+    }
+
     /// Reset the session completely (for error recovery).
     private func resetSession() async {
+        sessionErrorTask?.cancel()
+        sessionErrorTask = nil
         if let session = streamSession {
             session.stop()
         }
@@ -502,6 +661,10 @@ class CameraService: ObservableObject {
         errorListenerToken = nil
         streamSession = nil
         deviceSession = nil
+        // A torn-down session's frames must not survive to serve as "photos" for the next
+        // capture — the staleness gate is belt, this is braces.
+        latestFrame = nil
+        lastFrameTime = .distantPast
         latestFrame = nil
         NSLog("[Camera] Session reset")
     }

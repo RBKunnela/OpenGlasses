@@ -131,8 +131,11 @@ class GeminiLiveSessionManager: ObservableObject {
         NSLog("[Session] System instruction built — length: %d chars, camera streaming: %@",
               systemInstruction.count, isCameraStreaming ? "YES" : "NO")
         let openClawConnected = openClawBridge?.connectionState == .connected
-        let includeOpenClaw = Config.isOpenClawConfigured && openClawConnected
-        if Config.isOpenClawConfigured && !openClawConnected {
+        // BK P0: expose the gateway `execute` tool only when it's an active agentic capability
+        // (configured AND Agent Mode on) — Gemini Live had the same isOpenClawConfigured-only gap
+        // as Direct mode, handing the model an execute schema + full-machine-access prompt.
+        let includeOpenClaw = Config.isOpenClawAgentActive && openClawConnected
+        if Config.isOpenClawAgentActive && !openClawConnected {
             NSLog("[Session] OpenClaw configured but not connected — omitting execute tool declaration")
         }
         let toolDefs = ToolDeclarations.allDeclarations(registry: nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw)
@@ -175,6 +178,8 @@ class GeminiLiveSessionManager: ObservableObject {
             Task { @MainActor in
                 self.userTranscript += text
                 self.aiTranscript = ""
+                // BR P1: a user turn resets the runaway-tool-call window.
+                self.toolCallRouter?.noteUserTurn()
             }
         }
 
@@ -216,8 +221,16 @@ class GeminiLiveSessionManager: ObservableObject {
             Task { @MainActor in
                 NSLog("[Session] Reconnected — re-configuring session")
                 // Re-configure with current settings (including fresh location)
-                let includeOpenClaw = Config.isOpenClawConfigured
-                let toolDefs = ToolDeclarations.allDeclarations(registry: self.nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw)
+                let includeOpenClaw = Config.isOpenClawAgentActive   // BK P0: gate on Agent Mode too
+                var toolDefs = ToolDeclarations.allDeclarations(registry: self.nativeToolRouter?.registry, includeOpenClaw: includeOpenClaw)
+                // BR P1: breaker-suspended tools stay out of the re-declared list — the new
+                // setup message must not re-offer what this session already tripped on.
+                if let suspended = self.toolCallRouter?.suspendedToolNames, !suspended.isEmpty {
+                    toolDefs = toolDefs.filter { decl in
+                        guard let name = decl["name"] as? String else { return true }
+                        return !suspended.contains(name)
+                    }
+                }
                 self.geminiService.configure(
                     systemInstruction: self.buildSystemInstruction(),
                     toolDeclarations: toolDefs
@@ -233,14 +246,17 @@ class GeminiLiveSessionManager: ObservableObject {
             }
         }
 
-        // Wire tool calls — native tools always available, OpenClaw if configured
+        // Wire tool calls — native tools always available, OpenClaw only as an active agentic
+        // capability (BK P0: configured AND Agent Mode on).
         let hasNativeTools = nativeToolRouter != nil
-        let hasOpenClaw = Config.isOpenClawConfigured && openClawBridge != nil
+        let hasOpenClaw = Config.isOpenClawAgentActive && openClawBridge != nil
 
         if hasNativeTools || hasOpenClaw {
             if let bridge = openClawBridge, hasOpenClaw {
                 await bridge.checkConnection()
-                bridge.resetSession()
+                // BR P4: no resetSession() here — the gateway session key is stable now, so
+                // the OpenClaw-side agent keeps context across Live sessions. Reset is a
+                // deliberate user action, not a side effect of starting a session.
             }
 
             let bridge = openClawBridge ?? OpenClawBridge()
@@ -328,7 +344,7 @@ class GeminiLiveSessionManager: ObservableObject {
         useIPhoneAudioMode = !isCameraStreaming
         NSLog("[Session] Audio mode: %@", useIPhoneAudioMode ? "iPhone (voiceChat)" : "Glasses (videoChat)")
         do {
-            try audioManager.setupAudioSession(useIPhoneMode: useIPhoneAudioMode)
+            try await audioManager.setupAudioSession(useIPhoneMode: useIPhoneAudioMode)
         } catch {
             errorMessage = "Audio setup failed: \(error.localizedDescription)"
             isActive = false
@@ -393,7 +409,7 @@ class GeminiLiveSessionManager: ObservableObject {
                     useIPhoneAudioMode = false
                     NSLog("[Session] Switching to glasses audio mode (videoChat)")
                     do {
-                        try audioManager.setupAudioSession(useIPhoneMode: false)
+                        try await audioManager.setupAudioSession(useIPhoneMode: false)
                     } catch {
                         NSLog("[Session] Audio mode switch failed: %@", error.localizedDescription)
                     }
@@ -469,7 +485,7 @@ class GeminiLiveSessionManager: ObservableObject {
 
         // Add tool instructions
         let hasNativeTools = nativeToolRouter != nil
-        let hasOpenClaw = Config.isOpenClawConfigured
+        let hasOpenClaw = Config.isOpenClawAgentActive   // BK P0: don't advertise the gateway with Agent Mode off
         if hasNativeTools || hasOpenClaw {
             var toolSection = """
 
@@ -486,6 +502,11 @@ class GeminiLiveSessionManager: ObservableObject {
                 let descriptions = router.registry.toolDescriptions(for: names)
                 if !descriptions.isEmpty {
                     toolSection += "\n\n" + SystemPromptBuilder.toolLines(descriptions)
+                }
+                // Plan BM P4: domains the model must route through a tool, never self-answer.
+                let routingRules = SystemPromptBuilder.routingRules(toolNames: names)
+                if !routingRules.isEmpty {
+                    toolSection += "\n\nMANDATORY ROUTING:\n" + routingRules
                 }
 
                 // Inject user-defined custom tool descriptions
@@ -542,6 +563,16 @@ class GeminiLiveSessionManager: ObservableObject {
         // Inject the active project's knowledge-base grounding when it has documents (Plan AN).
         if let projectContext = ProjectContextService.shared.promptContext() {
             prompt += "\n\n\(projectContext)"
+        }
+
+        // Inject the pages read so far when a reading session is live (Plan BT). Without this,
+        // Live mode had the reading_session tool but no corpus or spoiler rule — book questions
+        // were answered from the model's world knowledge, the exact spoiler the feature exists to
+        // prevent. The instruction is rebuilt on connect/reconnect (not per turn), so pages
+        // captured mid-Live-session appear on the next reconnect; the spoiler rule itself is
+        // present from the start, and stale-but-spoiler-safe beats absent.
+        if let readingContext = ReadingCompanionService.shared.promptContext() {
+            prompt += "\n\n\(readingContext)"
         }
 
         // Security baseline: untrusted-content / prompt-injection policy (mirrors Direct Mode).
